@@ -1,8 +1,8 @@
+use super::Provider;
+use crate::error::AppError;
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use tracing::{debug, error};
-use crate::error::AppError;
-use super::Provider;
 
 pub struct AnthropicProvider {
     base_url: String,
@@ -37,7 +37,7 @@ impl Provider for AnthropicProvider {
     fn process_headers(&self, original_headers: &HeaderMap) -> Result<HeaderMap, AppError> {
         debug!("Processing Anthropic request headers");
         let mut headers = HeaderMap::new();
-        
+
         // Add content type
         headers.insert(
             http::header::CONTENT_TYPE,
@@ -51,18 +51,18 @@ impl Provider for AnthropicProvider {
         );
 
         // Process authentication
-        if let Some(auth) = original_headers.get("authorization")
-            .and_then(|h| h.to_str().ok()) 
+        if let Some(auth) = original_headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
         {
             debug!("Converting Bearer token to x-api-key format");
             let api_key = auth.trim_start_matches("Bearer ");
             headers.insert(
                 http::header::HeaderName::from_static("x-api-key"),
-                http::header::HeaderValue::from_str(api_key)
-                    .map_err(|_| {
-                        error!("Failed to process Anthropic authorization header");
-                        AppError::InvalidHeader
-                    })?
+                http::header::HeaderValue::from_str(api_key).map_err(|_| {
+                    error!("Failed to process Anthropic authorization header");
+                    AppError::InvalidHeader
+                })?,
             );
         } else {
             error!("No authorization header found for Anthropic request");
@@ -71,4 +71,4 @@ impl Provider for AnthropicProvider {
 
         Ok(headers)
     }
-} 
+}

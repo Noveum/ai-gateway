@@ -3,33 +3,33 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
-use std::{io, convert::Infallible};
 use http::status::InvalidStatusCode;
+use serde_json::json;
+use std::{convert::Infallible, io};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("Request to provider failed: {0}")]
     ReqwestError(#[from] reqwest::Error),
-    
+
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
-    
+
     #[error("Axum error: {0}")]
     AxumError(#[from] axum::Error),
-    
+
     #[error("Invalid HTTP method")]
     InvalidMethod,
-    
+
     #[error("Invalid status code: {0}")]
     InvalidStatus(#[from] InvalidStatusCode),
-    
+
     #[error("Invalid header value")]
     InvalidHeader,
-    
+
     #[error("Unsupported provider")]
     UnsupportedProvider,
-    
+
     #[error("Missing or invalid API key")]
     MissingApiKey,
 }
@@ -49,18 +49,14 @@ impl IntoResponse for AppError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Server error: {}", e),
             ),
-            AppError::InvalidMethod => (
-                StatusCode::BAD_REQUEST,
-                "Invalid HTTP method".to_string(),
-            ),
+            AppError::InvalidMethod => (StatusCode::BAD_REQUEST, "Invalid HTTP method".to_string()),
             AppError::InvalidStatus(_) => (
                 StatusCode::BAD_GATEWAY,
                 "Invalid status code from provider".to_string(),
             ),
-            AppError::InvalidHeader => (
-                StatusCode::BAD_REQUEST,
-                "Invalid header value".to_string(),
-            ),
+            AppError::InvalidHeader => {
+                (StatusCode::BAD_REQUEST, "Invalid header value".to_string())
+            }
             AppError::UnsupportedProvider => (
                 StatusCode::BAD_REQUEST,
                 "Unsupported AI provider".to_string(),
@@ -86,4 +82,4 @@ impl From<Infallible> for AppError {
     fn from(_: Infallible) -> Self {
         unreachable!("Infallible error cannot occur")
     }
-} 
+}

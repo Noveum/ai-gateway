@@ -4,30 +4,30 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use tracing::{debug, error};
 
-pub struct GroqProvider {
+pub struct TogetherProvider {
     base_url: String,
 }
 
-impl GroqProvider {
+impl TogetherProvider {
     pub fn new() -> Self {
         Self {
-            base_url: "https://api.groq.com/openai".to_string(),
+            base_url: "https://api.together.xyz".to_string(),
         }
     }
 }
 
 #[async_trait]
-impl Provider for GroqProvider {
+impl Provider for TogetherProvider {
     fn base_url(&self) -> &str {
         &self.base_url
     }
 
     fn name(&self) -> &str {
-        "groq"
+        "together"
     }
 
     fn process_headers(&self, original_headers: &HeaderMap) -> Result<HeaderMap, AppError> {
-        debug!("Processing Groq request headers");
+        debug!("Processing Together request headers");
         let mut headers = HeaderMap::new();
 
         // Add content type
@@ -41,16 +41,16 @@ impl Provider for GroqProvider {
             .get("authorization")
             .and_then(|h| h.to_str().ok())
         {
-            debug!("Using provided authorization header for Groq");
+            debug!("Using provided authorization header for Together");
             headers.insert(
                 http::header::AUTHORIZATION,
                 http::header::HeaderValue::from_str(auth).map_err(|_| {
-                    error!("Failed to process Groq authorization header");
+                    error!("Failed to process Together authorization header");
                     AppError::InvalidHeader
                 })?,
             );
         } else {
-            error!("No authorization header found for Groq request");
+            error!("No authorization header found for Together request");
             return Err(AppError::MissingApiKey);
         }
 

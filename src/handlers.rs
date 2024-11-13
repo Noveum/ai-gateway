@@ -1,14 +1,14 @@
+use crate::{config::AppConfig, proxy::proxy_request_to_provider};
 use axum::{
-    extract::State,
-    response::IntoResponse,
-    http::{HeaderMap, Request},
     body::Body,
+    extract::State,
+    http::{HeaderMap, Request},
+    response::IntoResponse,
     Json,
 };
-use std::sync::Arc;
 use serde_json::json;
-use tracing::{info, error};
-use crate::{config::AppConfig, proxy::proxy_request_to_provider};
+use std::sync::Arc;
+use tracing::{error, info};
 
 pub async fn health_check() -> impl IntoResponse {
     Json(json!({
@@ -45,4 +45,4 @@ pub async fn proxy_request(
             e.into_response()
         }
     }
-} 
+}

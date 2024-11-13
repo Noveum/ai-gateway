@@ -1,6 +1,6 @@
 [package]
 name = "magicapi-ai-gateway"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "A high-performance AI Gateway proxy for routing requests to various AI providers, offering seamless integration and management of multiple AI services"
 authors = ["MagicAPI Team <team@magicapi.com>"]
@@ -9,7 +9,7 @@ homepage = "https://magicapi.com"
 repository = "https://github.com/magicapi/ai-gateway"
 documentation = "https://docs.magicapi.com"
 readme = "README.md"
-keywords = ["ai", "gateway", "proxy", "openai", "anthropic"]
+keywords = ["ai", "gateway", "proxy", "openai", "anthropic", "fireworks", "together"]
 categories = ["web-programming", "api-bindings", "asynchronous"]
 exclude = [
     ".cursorrules",

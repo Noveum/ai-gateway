@@ -1,17 +1,17 @@
 use axum::{
-    routing::{get, any},
+    routing::{any, get},
     Router,
 };
 use std::sync::Arc;
-use tower_http::cors::{CorsLayer, Any};
-use tracing::{info, error};
+use tower_http::cors::{Any, CorsLayer};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod handlers;
 mod config;
 mod error;
-mod proxy;
+mod handlers;
 mod providers;
+mod proxy;
 
 use crate::config::AppConfig;
 
@@ -19,24 +19,22 @@ use crate::config::AppConfig;
 async fn main() {
     // Initialize tracing with more detailed format
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::new(
-                std::env::var("RUST_LOG")
-                    .unwrap_or_else(|_| "info,tower_http=debug,axum::rejection=trace".into()),
-            )
-        )
+        .with(tracing_subscriber::EnvFilter::new(
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "info,tower_http=debug,axum::rejection=trace".into()),
+        ))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_file(true)
                 .with_line_number(true)
                 .with_thread_ids(true)
-                .with_thread_names(true)
+                .with_thread_names(true),
         )
         .init();
 
     // Load configuration
     let config = Arc::new(AppConfig::new());
-    
+
     info!(
         host = %config.port,
         port = %config.port,
@@ -66,7 +64,7 @@ async fn main() {
         address = %addr,
         "Starting server"
     );
-    
+
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
             info!("Server successfully bound to address");
@@ -80,4 +78,4 @@ async fn main() {
             std::process::exit(1);
         }
     }
-} 
+}

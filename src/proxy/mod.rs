@@ -1,17 +1,13 @@
 use axum::{
     body::{self, Body, Bytes},
-    http::{Request, Response, HeaderMap, StatusCode, HeaderValue}
+    http::{HeaderMap, HeaderValue, Request, Response, StatusCode},
 };
-use std::sync::Arc;
 use futures_util::StreamExt;
-use tracing::{info, error, debug};
 use reqwest::Method;
+use std::sync::Arc;
+use tracing::{debug, error, info};
 
-use crate::{
-    config::AppConfig,
-    error::AppError,
-    providers::create_provider,
-};
+use crate::{config::AppConfig, error::AppError, providers::create_provider};
 
 mod client;
 pub use client::CLIENT;
@@ -30,13 +26,13 @@ pub async fn proxy_request_to_provider(
 
     // Create provider instance
     let provider = create_provider(provider_name)?;
-    
+
     // Call before request hook
     provider.before_request(&original_request).await?;
 
     let path = original_request.uri().path();
     let modified_path = provider.transform_path(path);
-    
+
     let query = original_request
         .uri()
         .query()
@@ -44,7 +40,7 @@ pub async fn proxy_request_to_provider(
         .unwrap_or_default();
 
     let url = format!("{}{}{}", provider.base_url(), modified_path, query);
-    
+
     debug!(
         provider = provider_name,
         url = %url,
@@ -59,12 +55,13 @@ pub async fn proxy_request_to_provider(
         original_request.method().clone(),
         url,
         headers,
-        original_request.into_body()
-    ).await?;
+        original_request.into_body(),
+    )
+    .await?;
 
     // Process response
     let processed_response = provider.process_response(response).await?;
-    
+
     // Call after request hook
     provider.after_request(&processed_response).await?;
 
@@ -79,10 +76,10 @@ async fn send_provider_request(
     body: Body,
 ) -> Result<Response<Body>, AppError> {
     let body_bytes = body::to_bytes(body, usize::MAX).await?;
-    
+
     let client = &*CLIENT;
-    let method = Method::from_bytes(method.as_str().as_bytes())
-        .map_err(|_| AppError::InvalidMethod)?;
+    let method =
+        Method::from_bytes(method.as_str().as_bytes()).map_err(|_| AppError::InvalidMethod)?;
 
     // Convert http::HeaderMap to reqwest::HeaderMap
     let mut reqwest_headers = reqwest::header::HeaderMap::new();
@@ -97,7 +94,7 @@ async fn send_provider_request(
 
     let response = client
         .request(method, url)
-        .headers(reqwest_headers)  // Now using the converted reqwest::HeaderMap
+        .headers(reqwest_headers) // Now using the converted reqwest::HeaderMap
         .body(body_bytes.to_vec())
         .send()
         .await?;
@@ -109,15 +106,16 @@ async fn send_provider_request(
 
 async fn process_response(response: reqwest::Response) -> Result<Response<Body>, AppError> {
     let status = StatusCode::from_u16(response.status().as_u16())?;
-    
+
     // Check if response is a stream
-    if response.headers()
+    if response
+        .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| ct.contains("text/event-stream")) 
+        .map_or(false, |ct| ct.contains("text/event-stream"))
     {
         debug!("Processing streaming response");
-        
+
         // Convert headers
         let mut response_headers = HeaderMap::new();
         for (name, value) in response.headers() {
@@ -129,19 +127,16 @@ async fn process_response(response: reqwest::Response) -> Result<Response<Body>,
         }
 
         // Set up streaming response
-        let stream = response.bytes_stream()
-            .map(|result| {
-                match result {
-                    Ok(bytes) => {
-                        debug!("Streaming chunk: {} bytes", bytes.len());
-                        Ok(Bytes::from(bytes))
-                    },
-                    Err(e) => {
-                        error!("Stream error: {}", e);
-                        Err(std::io::Error::new(std::io::ErrorKind::Other, e))
-                    }
-                }
-            });
+        let stream = response.bytes_stream().map(|result| match result {
+            Ok(bytes) => {
+                debug!("Streaming chunk: {} bytes", bytes.len());
+                Ok(bytes)
+            }
+            Err(e) => {
+                error!("Stream error: {}", e);
+                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+            }
+        });
 
         Ok(Response::builder()
             .status(status)
@@ -153,7 +148,7 @@ async fn process_response(response: reqwest::Response) -> Result<Response<Body>,
             .unwrap())
     } else {
         debug!("Processing regular response");
-        
+
         // Convert headers
         let mut response_headers = HeaderMap::new();
         for (name, value) in response.headers() {
@@ -166,14 +161,12 @@ async fn process_response(response: reqwest::Response) -> Result<Response<Body>,
 
         // Process regular response body
         let body = response.bytes().await?;
-        
+
         let mut builder = Response::builder().status(status);
         for (name, value) in response_headers.iter() {
             builder = builder.header(name, value);
         }
 
-        Ok(builder
-            .body(Body::from(body))
-            .unwrap())
+        Ok(builder.body(Body::from(body)).unwrap())
     }
-} 
+}

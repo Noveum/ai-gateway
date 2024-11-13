@@ -1,6 +1,6 @@
 # MagicAPI AI Gateway
 
-The world's fastest AI Gateway proxy, written in Rust and optimized for maximum performance. This high-performance API gateway routes requests to various AI providers (OpenAI, Anthropic, GROQ) with streaming support, making it perfect for developers who need reliable and blazing-fast AI API access.
+The world's fastest AI Gateway proxy, written in Rust and optimized for maximum performance. This high-performance API gateway routes requests to various AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together) with streaming support, making it perfect for developers who need reliable and blazing-fast AI API access.
 
 [![Rust](https://github.com/MagicAPI/ai-gateway/actions/workflows/rust.yml/badge.svg)](https://github.com/MagicAPI/ai-gateway/actions/workflows/rust.yml)
 [![Crates.io](https://img.shields.io/crates/v/magicapi-ai-gateway.svg)](https://crates.io/crates/magicapi-ai-gateway)
@@ -9,7 +9,7 @@ The world's fastest AI Gateway proxy, written in Rust and optimized for maximum 
 
 - 🚀 Blazing fast performance - built in Rust with zero-cost abstractions
 - ⚡ Optimized for low latency and high throughput
-- 🔄 Unified API interface for multiple AI providers (OpenAI, Anthropic, GROQ)
+- 🔄 Unified API interface for multiple AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together)
 - 📡 Real-time streaming support with minimal overhead
 - 🔍 Built-in health checking
 - 🛡️ Configurable CORS
@@ -115,6 +115,43 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Write a poem"}],
     "stream": true,
     "max_tokens": 1024
+  }'
+```
+
+#### Example: Fireworks Request
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: fireworks" \
+  -H "Authorization: Bearer your-fireworks-api-key" \
+  -d '{
+    "model": "accounts/fireworks/models/llama-v3p1-8b-instruct",
+    "messages": [{"role": "user", "content": "Write a poem"}],
+    "stream": true,
+    "max_tokens": 300,
+    "temperature": 0.6,
+    "top_p": 1,
+    "top_k": 40
+  }'
+```
+
+#### Example: Together AI Request
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: together" \
+  -H "Authorization: Bearer your-together-api-key" \
+  -d '{
+    "model": "meta-llama/Llama-2-7b-chat-hf",
+    "messages": [{"role": "user", "content": "Write a poem"}],
+    "stream": true,
+    "max_tokens": 512,
+    "temperature": 0.7,
+    "top_p": 0.7,
+    "top_k": 50,
+    "repetition_penalty": 1
   }'
 ```
 
@@ -269,3 +306,68 @@ Then run either option with:
 ```bash
 docker-compose up -d
 ```
+
+## Release Process for magicapi-ai-gateway
+
+### 1. Pre-release Checklist
+- [ ] Update version number in `Cargo.toml`
+- [ ] Update CHANGELOG.md (if you have one)
+- [ ] Ensure all tests pass: `cargo test`
+- [ ] Verify the crate builds locally: `cargo build --release`
+- [ ] Run `cargo clippy` to check for any linting issues
+- [ ] Run `cargo fmt` to ensure consistent formatting
+
+### 2. Git Commands
+```bash
+# Create and switch to a release branch
+git checkout -b release/v0.1.7
+
+# Stage and commit changes
+git add Cargo.toml CHANGELOG.md
+git commit -m "chore: release v0.1.7"
+
+# Create a git tag
+git tag -a v0.1.7 -m "Release v0.1.7"
+
+# Push changes and tag
+git push origin release/v0.1.7
+git push origin v0.1.7
+```
+
+### 3. Publishing to crates.io
+```bash
+# Verify the package contents
+cargo package
+
+# Publish to crates.io (requires authentication)
+cargo publish
+```
+
+### 4. Post-release
+1. Create a GitHub release (if using GitHub)
+   - Go to Releases → Draft a new release
+   - Choose the tag v0.1.7
+   - Add release notes
+   - Publish release
+
+2. Merge the release branch back to main
+```bash
+git checkout main
+git merge release/v0.1.7
+git push origin main
+```
+
+### 5. Version Verification
+After publishing, verify:
+- The new version appears on [crates.io](https://crates.io/crates/magicapi-ai-gateway)
+- Documentation is updated on [docs.rs](https://docs.rs/magicapi-ai-gateway)
+- The GitHub release is visible (if using GitHub)
+```
+
+This process follows Rust community best practices for releasing crates. Remember to:
+- Follow semantic versioning (MAJOR.MINOR.PATCH)
+- Test thoroughly before releasing
+- Document all significant changes
+- Keep your repository and crates.io package in sync
+
+Would you like me to explain any part of this process in more detail?
