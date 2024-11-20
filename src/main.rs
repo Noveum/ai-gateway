@@ -1,7 +1,7 @@
 use axum::{
-    routing::{any, get},
-    Router,
+    middleware, routing::{any, get}, Router
 };
+use interceptors::key_fetcher;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, debug};
@@ -13,6 +13,7 @@ mod error;
 mod handlers;
 mod providers;
 mod proxy;
+mod interceptors;
 
 use crate::config::AppConfig;
 
@@ -49,6 +50,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(handlers::health_check))
         .route("/v1/*path", any(handlers::proxy_request))
+        .route_layer(middleware::map_request_with_state(config.clone(), key_fetcher))
         .with_state(config.clone())
         .layer(cors)
         .into_make_service_with_connect_info::<std::net::SocketAddr>();

@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub tcp_keepalive_interval: u64,
     pub tcp_nodelay: bool,
     pub buffer_size: usize,
+    pub key_fetcher: Option<String>,
 }
 
 impl AppConfig {
@@ -55,6 +56,7 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8 * 1024), // 8KB default
+            key_fetcher: env::var("KEY_FETCHER").ok(),
         };
 
         info!("Configuration loaded: port={}, host={}", config.port, config.host);
