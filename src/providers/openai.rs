@@ -18,8 +18,8 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl Provider for OpenAIProvider {
-    fn base_url(&self) -> &str {
-        &self.base_url
+    fn base_url(&self) -> String {
+        self.base_url.clone()
     }
 
     fn name(&self) -> &str {

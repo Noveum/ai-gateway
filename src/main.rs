@@ -3,12 +3,13 @@ use axum::{
 };
 use interceptors::key_fetcher;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info, debug};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::time::Duration;
+use tower_http::cors::{Any, CorsLayer};
+use tracing::{debug, error, info};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
+mod context;
 mod error;
 mod handlers;
 mod providers;
@@ -31,10 +32,16 @@ async fn main() {
     // Load configuration
     info!("Loading application configuration");
     let config = Arc::new(AppConfig::new());
-    debug!("Configuration loaded: port={}, host={}", config.port, config.host);
+    debug!(
+        "Configuration loaded: port={}, host={}",
+        config.port, config.host
+    );
 
     // Optimize tokio runtime
-    info!("Configuring tokio runtime with {} worker threads", config.worker_threads);
+    info!(
+        "Configuring tokio runtime with {} worker threads",
+        config.worker_threads
+    );
     std::env::set_var("TOKIO_WORKER_THREADS", config.worker_threads.to_string());
     std::env::set_var("TOKIO_THREAD_STACK_SIZE", (2 * 1024 * 1024).to_string());
 
@@ -59,8 +66,10 @@ async fn main() {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.port));
     info!("Setting up TCP listener with non-blocking mode");
     let tcp_listener = std::net::TcpListener::bind(addr).expect("Failed to bind address");
-    tcp_listener.set_nonblocking(true).expect("Failed to set non-blocking");
-    
+    tcp_listener
+        .set_nonblocking(true)
+        .expect("Failed to set non-blocking");
+
     debug!("Converting to tokio TCP listener");
     let listener = tokio::net::TcpListener::from_std(tcp_listener)
         .expect("Failed to create Tokio TCP listener");

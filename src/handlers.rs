@@ -1,14 +1,14 @@
 use crate::{config::AppConfig, proxy::proxy_request_to_provider};
 use axum::{
     body::Body,
-    extract::{State, ConnectInfo},
+    extract::{ConnectInfo, State},
     http::{HeaderMap, Request},
     response::IntoResponse,
     Json,
 };
 use serde_json::json;
-use std::{sync::Arc, net::SocketAddr};
-use tracing::{error, Instrument, debug};
+use std::{net::SocketAddr, sync::Arc};
+use tracing::{debug, error, Instrument};
 
 pub async fn health_check() -> impl IntoResponse {
     debug!("Health check endpoint called");

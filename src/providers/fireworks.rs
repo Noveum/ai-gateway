@@ -18,8 +18,8 @@ impl FireworksProvider {
 
 #[async_trait]
 impl Provider for FireworksProvider {
-    fn base_url(&self) -> &str {
-        &self.base_url
+    fn base_url(&self) -> String {
+        self.base_url.clone()
     }
 
     fn name(&self) -> &str {

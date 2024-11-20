@@ -1,27 +1,49 @@
+<div align="center">
+
 # MagicAPI AI Gateway
 
-The world's fastest AI Gateway proxy, written in Rust and optimized for maximum performance. This high-performance API gateway routes requests to various AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together) with streaming support, making it perfect for developers who need reliable and blazing-fast AI API access.
+🚀 The world's fastest AI Gateway proxy, written in Rust and optimized for maximum performance. This high-performance API gateway routes requests to various AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together, AWS Bedrock) with streaming support, making it perfect for developers who need reliable and blazing-fast AI API access.
 
 [![Rust](https://github.com/MagicAPI/ai-gateway/actions/workflows/rust.yml/badge.svg)](https://github.com/MagicAPI/ai-gateway/actions/workflows/rust.yml)
 [![Crates.io](https://img.shields.io/crates/v/magicapi-ai-gateway.svg)](https://crates.io/crates/magicapi-ai-gateway)
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![Docker Pulls](https://img.shields.io/docker/pulls/magicapi1/magicapi-ai-gateway)](https://hub.docker.com/r/magicapi1/magicapi-ai-gateway)
 
-## Features
+[Quick Start](#quick-start) • 
+[Documentation](docs/) • 
+[Docker](docs/deployment.md) • 
+[Contributing](docs/CONTRIBUTING.md)
 
-- 🚀 Blazing fast performance - built in Rust with zero-cost abstractions
-- ⚡ Optimized for low latency and high throughput
-- 🔄 Unified API interface for multiple AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together)
-- 📡 Real-time streaming support with minimal overhead
-- 🔍 Built-in health checking
-- 🛡️ Configurable CORS
-- 🔀 Smart provider-specific request routing
-- 📊 Efficient request/response proxying
-- 💪 Production-ready and battle-tested
+</div>
 
-## Quick Start
+## ✨ Features
+
+- 🚀 **Blazing fast performance**: Built in Rust with zero-cost abstractions
+- ⚡ **Optimized for low latency and high throughput**
+- 🔄 **Unified API interface for multiple AI providers**:
+  - OpenAI
+  - AWS Bedrock
+  - Anthropic
+  - GROQ
+  - Fireworks
+  - Together AI
+- 📡 **Real-time Streaming**: Optimized for minimal latency
+- 🛡️ **Production Ready**: Battle-tested in high-load environments
+- 🔍 **Health Checking**: Built-in monitoring
+- 🌐 **CORS Support**: Configurable cross-origin resource sharing
+- 🛠️ **SDK Compatibility**: Works with any OpenAI-compatible SDK
+
+## 🚀 Quick Start
 
 ### Installation
 
 You can install MagicAPI Gateway using one of these methods:
+
+### One Line Install & Run (With Cargo Install)
+
+```bash
+curl https://sh.rustup.rs -sSf | sh && cargo install magicapi-ai-gateway && magicapi-ai-gateway
+```
 
 #### Using Cargo Install
 
@@ -69,11 +91,26 @@ magicapi-ai-gateway
 PORT=8080 magicapi-ai-gateway
 ```
 
-## Usage
+## 📚 Usage Examples
 
 ### Making Requests
 
 To make requests through the gateway, use the `/v1/*` endpoint and specify the provider using the `x-provider` header.
+
+#### Example: AWS Bedrock Request
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: bedrock" \
+  -H "x-aws-access-key-id: YOUR_ACCESS_KEY" \
+  -H "x-aws-secret-access-key: YOUR_SECRET_KEY" \
+  -H "x-aws-region: us-east-1" \
+  -d '{
+    "model": "anthropic.claude-3-sonnet-20240229-v1:0",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
 
 #### Example: OpenAI Request
 
@@ -155,11 +192,6 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-Note: When using Anthropic as the provider, the gateway automatically:
-- Routes requests to Anthropic's message API
-- Converts the Authorization Bearer token to the required x-api-key format
-- Adds the required anthropic-version header
-
 ## SDK Compatibility
 
 The MagicAPI AI Gateway is designed to work seamlessly with popular AI SDKs. You can use the official OpenAI SDK to interact with any supported provider by simply configuring the baseURL and adding the appropriate provider header.
@@ -202,6 +234,18 @@ const openaiClient = new OpenAI({
   defaultHeaders: { "x-provider": "openai" },
 });
 
+// For AWS Bedrock
+const bedrockClient = new OpenAI({
+  apiKey: process.env.AWS_ACCESS_KEY_ID, // Use AWS access key
+  baseURL: "http://localhost:3000/v1/",
+  defaultHeaders: {
+    "x-provider": "bedrock",
+    "x-aws-access-key-id": process.env.AWS_ACCESS_KEY_ID,
+    "x-aws-secret-access-key": process.env.AWS_SECRET_ACCESS_KEY,
+    "x-aws-region": process.env.AWS_REGION || "us-east-1"
+  },
+});
+
 // For Anthropic
 const anthropicClient = new OpenAI({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -233,8 +277,33 @@ const togetherClient = new OpenAI({
 
 The gateway automatically handles the necessary transformations to ensure compatibility with each provider's API format while maintaining the familiar OpenAI SDK interface.
 
+### Testing Gateway URL
+```
+https://gateway.magicapi.dev
+```
 
-## Configuration
+### Send Example Request to Testing Gateway
+```bash
+curl --location 'https://gateway.magicapi.dev/v1/chat/completions' \
+  --header 'Authorization: Bearer YOUR_API_KEY' \
+  --header 'Content-Type: application/json' \
+  --header 'x-provider: groq' \
+  --data '{
+    "model": "llama-3.1-8b-instant",
+    "messages": [
+        {
+            "role": "user",
+            "content": "Write a poem"
+        }
+    ],
+    "stream": true,
+    "max_tokens": 300
+}'
+```
+
+> **Note**: This deployment is provided for testing and evaluation purposes only. For production workloads, please deploy your own instance of the gateway or contact us for information about production-ready managed solutions.
+
+## 🔧 Configuration
 
 The gateway can be configured using environment variables:
 
@@ -242,7 +311,17 @@ The gateway can be configured using environment variables:
 RUST_LOG=debug # Logging level (debug, info, warn, error)
 ```
 
-## Performance
+## 🏗️ Architecture
+
+The gateway leverages the best-in-class Rust ecosystem:
+
+- **Axum** - High-performance web framework
+- **Tokio** - Industry-standard async runtime
+- **Tower-HTTP** - Robust HTTP middleware
+- **Reqwest** - Fast and reliable HTTP client
+- **Tracing** - Zero-overhead logging and diagnostics
+
+## 📈 Performance
 
 MagicAPI Developer AI Gateway is designed for maximum performance:
 
@@ -253,28 +332,18 @@ MagicAPI Developer AI Gateway is designed for maximum performance:
 - **Minimal overhead** in the request path
 - **Optimized streaming** response handling
 
-## Architecture
-
-The gateway leverages the best-in-class Rust ecosystem:
-
-- **Axum** - High-performance web framework
-- **Tokio** - Industry-standard async runtime
-- **Tower-HTTP** - Robust HTTP middleware
-- **Reqwest** - Fast and reliable HTTP client
-- **Tracing** - Zero-overhead logging and diagnostics
-
-## Security Notes
+## 🔒 Security Notes
 
 - Always run behind a reverse proxy in production
 - Configure CORS appropriately for your use case
 - Use environment variables for sensitive configuration
 - Consider adding rate limiting for production use
 
-## Contributing
+## 🤝 Contributing
 
 We welcome contributions! Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-### Development Setup
+### 🛠️ Development Setup
 
 ```bash
 # Install development dependencies
@@ -305,17 +374,18 @@ cargo watch -x run
    - Check provider-specific headers are properly set
    - Ensure the provider endpoint exists and is correctly formatted
 
-## Support
+## 💬 Community
 
-For support, please open an issue in the GitHub repository. Our community is active and happy to help!
+- [GitHub Discussions](https://github.com/magicapi/ai-gateway/discussions)
+- [Twitter](https://twitter.com/magicapi)
 
-## License
+## 🙏 Acknowledgments
+
+Special thanks to all [contributors](https://github.com/magicapi/ai-gateway/graphs/contributors) and the Rust community.
+
+## 📄 License
 
 This project is dual-licensed under both the MIT License and the Apache License (Version 2.0). You may choose either license at your option. See the [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) files for details.
-
-## Acknowledgments
-
-Special thanks to all our contributors and the Rust community for making this project possible.
 
 ## Docker Support
 
@@ -348,6 +418,8 @@ docker run -p 3000:3000 \
 ```
 
 ### Docker Compose
+
+For detailed deployment instructions, please refer to the [Deployment Guide](docs/deployment.md).
 
 #### Option 1: Build from Source
 
@@ -444,41 +516,6 @@ After publishing, verify:
 - Documentation is updated on [docs.rs](https://docs.rs/magicapi-ai-gateway)
 - The GitHub release is visible (if using GitHub)
 
-
-This process follows Rust community best practices for releasing crates. Remember to:
-- Follow semantic versioning (MAJOR.MINOR.PATCH)
-- Test thoroughly before releasing
-- Document all significant changes
-- Keep your repository and crates.io package in sync
-
-Would you like me to explain any part of this process in more detail?
-
 ## Testing Deployment
 
 MagicAPI provides a testing deployment of the AI Gateway, hosted in our London data centre. This deployment is intended for testing and evaluation purposes only, and should not be used for production workloads.
-
-### Testing Gateway URL
-```
-https://gateway.magicapi.dev
-```
-
-### Send Example Request to Testing Gateway
-```bash
-curl --location 'https://gateway.magicapi.dev/v1/chat/completions' \
-  --header 'Authorization: Bearer YOUR_API_KEY' \
-  --header 'Content-Type: application/json' \
-  --header 'x-provider: groq' \
-  --data '{
-    "model": "llama-3.1-8b-instant",
-    "messages": [
-        {
-            "role": "user",
-            "content": "Write a poem"
-        }
-    ],
-    "stream": true,
-    "max_tokens": 300
-}'
-```
-
-> **Note**: This deployment is provided for testing and evaluation purposes only. For production workloads, please deploy your own instance of the gateway or contact us for information about production-ready managed solutions.

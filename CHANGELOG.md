@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2024-11-20
+### Added
+- AWS Bedrock models support via the same gateway, allowing access to streaming capabilities through OpenAI-compatible interfaces.
+- AWS request signing functionality in `src/proxy/signing.rs` for secure API requests.
+- Comprehensive documentation for AWS Bedrock Provider integration in `docs/providers/bedrock.md`.
+
+### Enhanced
+- Updated provider documentation to reflect new features and improvements.
+- Significant performance improvements across the codebase, including optimizations in `Cargo.toml`.
+
+### Fixed
+- Various minor bug fixes and improvements in request handling and processing.
+
 ## [0.1.7] - 2024-11-13
 ### Added
 - Managed deployment offering with testing gateway at gateway.magicapi.dev
@@ -78,7 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error handling
 - Basic documentation
 
-[Unreleased]: https://github.com/MagicAPI/ai-gateway/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/MagicAPI/ai-gateway/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MagicAPI/ai-gateway/compare/v0.1.7...v0.2.0
 [0.1.7]: https://github.com/MagicAPI/ai-gateway/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/MagicAPI/ai-gateway/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/MagicAPI/ai-gateway/compare/v0.1.4...v0.1.5

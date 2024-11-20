@@ -18,8 +18,8 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    fn base_url(&self) -> &str {
-        &self.base_url
+    fn base_url(&self) -> String {
+        self.base_url.clone()
     }
 
     fn name(&self) -> &str {

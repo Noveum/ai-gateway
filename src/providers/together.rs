@@ -18,8 +18,8 @@ impl TogetherProvider {
 
 #[async_trait]
 impl Provider for TogetherProvider {
-    fn base_url(&self) -> &str {
-        &self.base_url
+    fn base_url(&self) -> String {
+        self.base_url.clone()
     }
 
     fn name(&self) -> &str {
@@ -43,7 +43,9 @@ impl Provider for TogetherProvider {
         {
             // Validate token format
             if !auth.starts_with("Bearer ") {
-                error!("Invalid authorization format for Together request - must start with 'Bearer '");
+                error!(
+                    "Invalid authorization format for Together request - must start with 'Bearer '"
+                );
                 return Err(AppError::InvalidHeader);
             }
 
