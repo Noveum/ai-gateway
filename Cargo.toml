@@ -51,8 +51,8 @@ aws-credential-types = "1.2.1"
 chrono = { version = "0.4", features = ["serde"] }
 aws_event_stream_parser = "0.1.2"
 parking_lot = "0.12"
+timedmap = "1.0.2"
 
 [dev-dependencies]
 magicapi-ai-gateway = { path = "." }
 hex = "0.4"
-timedmap = "1.0.2"
