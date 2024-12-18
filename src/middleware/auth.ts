@@ -1,6 +1,15 @@
 import { MiddlewareHandler } from 'hono';
 import { Variables, Bindings, Provider } from '../types';
 
+const API_KEY_MAP: Record<Provider, keyof Bindings> = {
+  openai: 'OPENAI_API_KEY',
+  anthropic: 'ANTHROPIC_API_KEY',
+  bedrock: 'AWS_ACCESS_KEY_ID',
+  groq: 'GROQ_API_KEY',
+  fireworks: 'FIREWORKS_API_KEY',
+  together: 'TOGETHER_API_KEY'
+};
+
 export const authMiddleware: MiddlewareHandler<{
   Variables: Variables;
   Bindings: Bindings;
@@ -61,7 +70,7 @@ export const authMiddleware: MiddlewareHandler<{
     case 'fireworks':
     case 'together':
       const apiKey = c.req.header('Authorization')?.replace('Bearer ', '');
-      const envKey = c.env[`${provider.toUpperCase()}_API_KEY`];
+      const envKey = c.env[API_KEY_MAP[provider]];
       
       if (!apiKey && !envKey) {
         return c.json(

@@ -1,6 +1,10 @@
 import { BaseProvider } from './base';
 import { ChatCompletionRequest } from '../types';
 
+interface BedrockErrorResponse {
+  message?: string;
+}
+
 export class BedrockProvider extends BaseProvider {
   private readonly BEDROCK_API_URL = 'https://bedrock-runtime.{region}.amazonaws.com/model/anthropic.claude-3-sonnet-20240229-v1:0/invoke';
 
@@ -59,7 +63,7 @@ export class BedrockProvider extends BaseProvider {
       });
 
       if (!response.ok) {
-        const error = await response.json();
+        const error = await response.json() as BedrockErrorResponse;
         throw {
           message: error.message || 'AWS Bedrock request failed',
           status: response.status,

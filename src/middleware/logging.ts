@@ -18,7 +18,7 @@ export const loggingMiddleware: MiddlewareHandler<{
     headers: Object.fromEntries(c.req.raw.headers.entries())
   };
   
-  console.log('[Request]', JSON.stringify(requestLog));
+//   console.log('[Request]', JSON.stringify(requestLog));
 
   try {
     await next();
@@ -42,5 +42,5 @@ export const loggingMiddleware: MiddlewareHandler<{
     headers: Object.fromEntries(c.res.headers.entries())
   };
 
-  console.log('[Response]', JSON.stringify(responseLog));
+//   console.log('[Response]', JSON.stringify(responseLog));
 }; 

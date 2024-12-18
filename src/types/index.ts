@@ -81,6 +81,8 @@ export type ProviderConfig = {
   awsSecretAccessKey?: string;
   awsRegion?: string;
   organization?: string;
+  inputTokenCost?: number;
+  outputTokenCost?: number;
 };
 
 export type Bindings = {
@@ -105,5 +107,52 @@ export type ErrorResponse = {
     message: string;
     type: string;
     code: number;
+  };
+};
+
+// Metrics types
+export type TokenUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+};
+
+export type ProviderMetricsConfig = {
+  inputTokenCost?: number;
+  outputTokenCost?: number;
+};
+
+export type RequestMetrics = {
+  requestId: string;
+  timestamp: string;
+  method: string;
+  path: string;
+  provider: string;
+  model?: string;
+  status?: number;
+  success: boolean;
+  cached: boolean;
+  performance: {
+    startTime: number;
+    endTime?: number;
+    ttfb?: number;
+    totalLatency?: number;
+  };
+  tokens?: {
+    input: number;
+    output: number;
+    total: number;
+    details?: Record<string, any>;
+  };
+  cost?: {
+    inputCost?: number;
+    outputCost?: number;
+    totalCost?: number;
+  };
+  metadata?: {
+    estimated: boolean;
+    totalChunks: number;
+    streamComplete?: boolean;
+    [key: string]: any;
   };
 }; 

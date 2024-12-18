@@ -19,6 +19,7 @@ export class FireworksProvider extends BaseProvider {
   async chatCompletion(request: ChatCompletionRequest): Promise<Response> {
     try {
       const transformedRequest = await this.transformRequest(request);
+      const metrics = this.initializeMetrics(request);
       const headers = this.createHeaders({
         'Authorization': `Bearer ${this.config.apiKey}`,
       });
@@ -34,18 +35,7 @@ export class FireworksProvider extends BaseProvider {
         throw new Error(error.error?.message || 'Fireworks API request failed');
       }
 
-      if (request.stream) {
-        // For streaming responses, return the stream directly
-        const transformedResponse = new Response(response.body, {
-          headers: this.createStreamHeaders(),
-        });
-        return transformedResponse;
-      }
-
-      // For non-streaming responses, transform the response
-      const responseData = await response.json();
-      const transformedResponse = await this.transformResponse(responseData, request);
-      return new Response(JSON.stringify(transformedResponse), { headers });
+      return this.wrapResponseWithMetrics(response, request, this.extractMetrics);
     } catch (error) {
       return this.handleError(error);
     }
@@ -71,5 +61,25 @@ export class FireworksProvider extends BaseProvider {
   async transformResponse(response: any, request: ChatCompletionRequest): Promise<any> {
     // The response format is already compatible with OpenAI's format
     return response;
+  }
+
+  extractMetrics(data: any) {
+    if (!data) return null;
+
+    // Handle both streaming and non-streaming responses
+    const usage = data.usage || {};
+
+    return {
+      tokens: {
+        inputTokens: usage.prompt_tokens,
+        outputTokens: usage.completion_tokens,
+        totalTokens: usage.total_tokens
+      },
+      metadata: {
+        model: data.model,
+        finishReason: data.choices?.[0]?.finish_reason,
+        requestId: data.id
+      }
+    };
   }
 } 

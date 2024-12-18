@@ -18,7 +18,9 @@ export class TogetherProvider extends BaseProvider {
 
   async chatCompletion(request: ChatCompletionRequest): Promise<Response> {
     try {
+      this.validateConfig();
       const transformedRequest = await this.transformRequest(request);
+      const metrics = this.initializeMetrics(request);
       const headers = this.createHeaders({
         'Authorization': `Bearer ${this.config.apiKey}`,
       });
@@ -34,18 +36,7 @@ export class TogetherProvider extends BaseProvider {
         throw new Error(error.error?.message || 'Together API request failed');
       }
 
-      if (request.stream) {
-        // For streaming responses, return the stream directly
-        const transformedResponse = new Response(response.body, {
-          headers: this.createStreamHeaders(),
-        });
-        return transformedResponse;
-      }
-
-      // For non-streaming responses, transform the response
-      const responseData = await response.json();
-      const transformedResponse = await this.transformResponse(responseData, request);
-      return new Response(JSON.stringify(transformedResponse), { headers });
+      return this.wrapResponseWithMetrics(response, request, this.extractMetrics);
     } catch (error) {
       return this.handleError(error);
     }
@@ -71,5 +62,43 @@ export class TogetherProvider extends BaseProvider {
   async transformResponse(response: any, request: ChatCompletionRequest): Promise<any> {
     // The response format is already compatible with OpenAI's format
     return response;
+  }
+
+  extractMetrics(data: any) {
+    if (!data) return null;
+
+    // Handle streaming response
+    if (data.object === 'chat.completion.chunk') {
+      return {
+        tokens: data.usage ? {
+          inputTokens: data.usage.prompt_tokens,
+          outputTokens: data.usage.completion_tokens,
+          totalTokens: data.usage.total_tokens
+        } : undefined,
+        metadata: {
+          finishReason: data.choices?.[0]?.finish_reason,
+          model: data.model,
+          seed: data.choices?.[0]?.seed
+        }
+      };
+    }
+
+    // Handle regular response
+    if (data.usage) {
+      return {
+        tokens: {
+          inputTokens: data.usage.prompt_tokens,
+          outputTokens: data.usage.completion_tokens,
+          totalTokens: data.usage.total_tokens
+        },
+        metadata: {
+          finishReason: data.choices?.[0]?.finish_reason,
+          model: data.model,
+          seed: data.choices?.[0]?.seed
+        }
+      };
+    }
+
+    return null;
   }
 } 
