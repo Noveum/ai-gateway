@@ -1,157 +1,316 @@
-# Noveum.ai Gateway
+# Noveum AI Gateway
 
-A hyper efficient, lightweight AI Gateway that allows you to use one endpoint to access various AI model providers. Built for edge deployment using Cloudflare Workers.
+<div align="center">
 
-## Features
+[![GitHub license](https://img.shields.io/github/license/Noveum/ai-gateway)](https://github.com/Noveum/ai-gateway/blob/main/LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Noveum/ai-gateway/pulls)
+[![Contributors](https://img.shields.io/github/contributors/Noveum/ai-gateway)](https://github.com/Noveum/ai-gateway/graphs/contributors)
+[![Apache License 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/Noveum/ai-gateway/blob/main/LICENSE)
 
-- Single endpoint for multiple AI providers
-- Edge-optimized performance
-- Provider-agnostic interface
-- Streaming support
-- Extensible middleware system
-- Built-in validation and error handling
-- Automatic request/response transformation
-- Comprehensive logging
-- Type-safe implementation
+</div>
 
-## Supported Providers
+A hyper-efficient, lightweight AI Gateway that provides a unified interface to access various AI model providers through a single endpoint. Built for edge deployment using Cloudflare Workers, it offers seamless integration with popular AI providers while maintaining high performance and low latency.
 
-- OpenAI
-- Anthropic
+## 🌟 Features
+
+- 🚀 **Edge-Optimized Performance**: Built on Cloudflare Workers for minimal latency
+- 🔄 **Universal Interface**: Single endpoint for multiple AI providers
+- 🔌 **Provider Agnostic**: Easily switch between different AI providers
+- 📡 **Streaming Support**: Real-time streaming responses for all supported providers
+- 🛠 **Extensible Middleware**: Customizable request/response pipeline
+- ✅ **Built-in Validation**: Automatic request validation and error handling
+- 🔄 **Auto-Transform**: Automatic request/response transformation
+- 📝 **Comprehensive Logging**: Detailed logging for monitoring and debugging
+- 💪 **Type-Safe**: Built with TypeScript for robust type safety
+
+## 🤖 Supported Providers
+
+- OpenAI (GPT-4, GPT-3.5)
+- Anthropic (Claude 3)
 - AWS Bedrock
 - GROQ (Coming Soon)
 - Fireworks (Coming Soon)
 - Together AI (Coming Soon)
 
-## Quick Start
+## 🚀 Quick Start
 
-1. Clone the repository:
-\`\`\`bash
-git clone https://github.com/yourusername/noveum-ai-gateway.git
-cd noveum-ai-gateway
-\`\`\`
+1. **Clone the repository:**
+```bash
+git clone https://github.com/Noveum/ai-gateway.git
+cd ai-gateway
+```
 
-2. Install dependencies:
-\`\`\`bash
+2. **Install dependencies:**
+```bash
 npm install
-\`\`\`
+```
 
-3. Configure environment variables:
-Create a .dev.vars file in the root directory with your API keys:
-\`\`\`
-OPENAI_API_KEY=your_openai_key
+3. **Configure environment variables:**
+Create a `.dev.vars` file in the root directory:
+```env
+OPENAI_API_KEY=your_openai_api_key
 ANTHROPIC_API_KEY=your_anthropic_key
 AWS_ACCESS_KEY_ID=your_aws_key
 AWS_SECRET_ACCESS_KEY=your_aws_secret
 AWS_REGION=us-east-1
-\`\`\`
+```
 
-4. Run locally:
-\`\`\`bash
+4. **Development:**
+```bash
 npm run dev
-# Server will start at http://localhost:3000
-\`\`\`
+# Server starts at http://localhost:3000
+```
 
-5. Deploy to Cloudflare Workers:
-\`\`\`bash
+5. **Deploy to Cloudflare Workers:**
+```bash
 npm run deploy
-\`\`\`
+```
 
-## Usage
+## 📚 Usage Examples
 
-Make requests through the gateway using the /v1/* endpoint and specify the provider using the x-provider header.
+### OpenAI Integration
 
-### OpenAI Example
-
-\`\`\`bash
-curl -X POST http://localhost:3000/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "x-provider: openai" \\
-  -H "Authorization: Bearer your-openai-api-key" \\
+#### Using cURL
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: openai" \
+  -H "Authorization: Bearer your-openai-api-key" \
   -d '{
     "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "temperature": 0.7,
+    "stream": true
   }'
-\`\`\`
+```
 
-### Anthropic Example
+#### Using TypeScript/JavaScript
+```typescript
+import OpenAI from 'openai';
 
-\`\`\`bash
-curl -X POST http://localhost:3000/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "x-provider: anthropic" \\
-  -H "Authorization: Bearer your-anthropic-api-key" \\
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: "http://localhost:3000/v1/",
+  defaultHeaders: { "x-provider": "openai" }
+});
+
+const response = await openai.chat.completions.create({
+  model: "gpt-4",
+  messages: [{ role: "user", content: "Hello!" }],
+  temperature: 0.7,
+  stream: true
+});
+```
+
+### Anthropic Integration
+
+#### Using cURL
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: anthropic" \
+  -H "Authorization: Bearer your-anthropic-api-key" \
   -d '{
     "model": "claude-3-sonnet-20240229-v1:0",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "temperature": 0.7,
+    "max_tokens": 1000
   }'
-\`\`\`
+```
 
-### AWS Bedrock Example
+### AWS Bedrock Integration
 
-\`\`\`bash
-curl -X POST http://localhost:3000/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -H "x-provider: bedrock" \\
-  -H "x-aws-access-key-id: YOUR_ACCESS_KEY" \\
-  -H "x-aws-secret-access-key: YOUR_SECRET_KEY" \\
-  -H "x-aws-region: us-east-1" \\
+#### Using cURL
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: bedrock" \
+  -H "x-aws-access-key-id: YOUR_ACCESS_KEY" \
+  -H "x-aws-secret-access-key: YOUR_SECRET_KEY" \
+  -H "x-aws-region: us-east-1" \
   -d '{
     "model": "anthropic.claude-3-sonnet-20240229-v1:0",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "temperature": 0.7,
+    "max_tokens": 1000
   }'
-\`\`\`
+```
 
-## Development
+## 🏗 Architecture
 
 ### Project Structure
-
-\`\`\`
+```
 src/
-  ├── providers/     # AI provider implementations
-  ├── middleware/    # Middleware components
-  ├── hooks/         # Request/response transformation hooks
-  ├── handlers/      # Route handlers
-  ├── types/         # TypeScript type definitions
-  └── index.ts      # Main application entry
-\`\`\`
+  ├── providers/          # AI provider implementations
+  │   ├── openai.ts      # OpenAI provider
+  │   ├── anthropic.ts   # Anthropic provider
+  │   └── bedrock.ts     # AWS Bedrock provider
+  ├── middleware/         # Middleware components
+  │   ├── auth.ts        # Authentication middleware
+  │   ├── validation.ts  # Request validation
+  │   └── logging.ts     # Request/response logging
+  ├── hooks/             # Transformation hooks
+  ├── handlers/          # Route handlers
+  ├── types/             # TypeScript definitions
+  └── index.ts          # Application entry
+```
+
+### Key Components
+
+#### Middleware System
+- **Authentication**: Provider-specific API key validation
+- **Validation**: Request payload validation
+- **Logging**: Comprehensive request/response logging
+- **CORS**: Cross-origin resource sharing
+- **Error Handling**: Standardized error responses
+
+#### Provider Interface
+Each provider implements the \`AIProvider\` interface:
+```typescript
+interface AIProvider {
+  chat(request: ChatRequest): Promise<ChatResponse>;
+  stream(request: ChatRequest): ReadableStream;
+  validate(request: ChatRequest): void;
+}
+```
+
+## 🛠 Development Guide
 
 ### Adding a New Provider
 
-1. Create a new provider class in src/providers/
-2. Implement the AIProvider interface
-3. Add the provider to the ProviderFactory
-4. Update the Provider type in src/types/
+1. Create a new provider class in \`src/providers/\`:
+```typescript
+import { AIProvider } from '../types';
 
-### Middleware
+export class NewProvider implements AIProvider {
+  async chat(request: ChatRequest): Promise<ChatResponse> {
+    // Implementation
+  }
 
-The gateway includes several middleware components:
+  stream(request: ChatRequest): ReadableStream {
+    // Implementation
+  }
 
-- Authentication
-- Validation
-- Logging
-- CORS
-- Pretty JSON
+  validate(request: ChatRequest): void {
+    // Implementation
+  }
+}
+```
 
-### Hooks
+2. Register the provider in \`src/providers/index.ts\`
+3. Add provider-specific types in \`src/types/\`
+4. Update the provider factory
 
-The hooks system allows you to transform requests and responses:
+### Custom Middleware
 
-- beforeRequest: Modify the request before it reaches the provider
-- afterResponse: Transform the provider's response
-- onError: Custom error handling
+Create custom middleware in \`src/middleware/\`:
+```typescript
+export const customMiddleware = async (
+  c: Context,
+  next: Next
+) => {
+  // Pre-processing
+  await next();
+  // Post-processing
+};
+```
 
-## Contributing
+## 🤝 Contributing
+
+We love your input! We want to make contributing to Noveum AI Gateway as easy and transparent as possible, whether it's:
+
+- Reporting a bug
+- Discussing the current state of the code
+- Submitting a fix
+- Proposing new features
+- Becoming a maintainer
+
+### Getting Started
 
 1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+2. Create your feature branch:
+   ```bash
+   git checkout -b feature/amazing-feature
+   ```
+3. Commit your changes:
+   ```bash
+   git commit -m 'Add amazing feature'
+   ```
+4. Push to the branch:
+   ```bash
+   git push origin feature/amazing-feature
+   ```
+5. Open a Pull Request
 
-## License
+### Development Process
 
-MIT
+1. Create an issue for any major changes and enhancements
+2. Fork the repo and create your branch from `main`
+3. Make your changes
+4. Add tests for any new functionality
+5. Ensure the test suite passes
+6. Make sure your code lints
+7. Issue that pull request!
+
+For more detailed information about contributing, please see our [CONTRIBUTING.md](CONTRIBUTING.md) file.
+
+### Code Style
+
+- Use TypeScript for all new code
+- Follow the existing code style
+- Use meaningful variable names
+- Add comments for complex logic
+- Keep functions small and focused
+- Write unit tests for new features
+
+### Commit Messages
+
+- Use the present tense ("Add feature" not "Added feature")
+- Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
+- Limit the first line to 72 characters or less
+- Reference issues and pull requests liberally after the first line
+
+### Pull Request Process
+
+1. Update the README.md with details of changes if needed
+2. Update the CHANGELOG.md with details of changes
+3. The PR will be merged once you have the sign-off of at least one maintainer
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+```
+Copyright 2024 Noveum AI
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+## 🙏 Acknowledgments
+
+- Built with [Hono](https://hono.dev/)
+- Deployed on [Cloudflare Workers](https://workers.cloudflare.com/)
+
+## 📬 Contact
+
+- GitHub Issues: [https://github.com/Noveum/ai-gateway/issues](https://github.com/Noveum/ai-gateway/issues)
+- Twitter: [@NoveumAI](https://twitter.com/NoveumAI)
+
+---
+
+<div align="center">
+Made with ❤️ by the Noveum Team
+</div>
 ```
 
 ```
