@@ -4,6 +4,10 @@ import { ProviderFactory } from '../providers/factory';
 import { hooksManager } from '../hooks';
 
 export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bindings: Bindings }>) => {
+  const startTime = Date.now();
+  let success = false;
+  let providerInstance = null;
+  
   try {
     const provider = c.get('provider');
     const config = c.get('config');
@@ -18,7 +22,7 @@ export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bi
     console.debug('[ChatCompletion] Request transformed');
 
     // Get provider instance
-    const providerInstance = ProviderFactory.getProvider(provider, config);
+    providerInstance = ProviderFactory.getProvider(provider, config);
     console.debug('[ChatCompletion] Initialized provider');
 
     // Make the request to the provider
@@ -30,8 +34,10 @@ export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bi
     const transformedResponse = await hooksManager.transformResponse(response, c);
     console.debug('[ChatCompletion] Response transformed');
 
+    success = true;
     return transformedResponse;
   } catch (error) {
+    success = false;
     console.debug('[ChatCompletion] Error occurred');
     // Let hooks try to handle the error first
     try {
@@ -47,5 +53,7 @@ export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bi
         }
       }, 500);
     }
+  } finally {
+    // Remove metrics finalization from finally block since it's now handled above
   }
 }; 

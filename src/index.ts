@@ -2,21 +2,56 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { prettyJSON } from 'hono/pretty-json';
-import { Variables, Bindings } from './types';
+import { Variables, Bindings, Env } from './types';
 import { authMiddleware } from './middleware/auth';
 import { validationMiddleware } from './middleware/validation';
 import { loggingMiddleware } from './middleware/logging';
 import { handleChatCompletion } from './handlers/chat';
 import { hooksManager } from './hooks';
+import { MetricsExportManager, ElasticsearchExporter } from './metrics/exporters';
 
 // Create the application
 const app = new Hono<{ Variables: Variables; Bindings: Bindings }>();
+
+// Initialize metrics exporters with environment variables
+const initializeMetricsExporters = (env: Env) => {
+  const manager = MetricsExportManager.getInstance();
+
+  // Skip if already initialized
+  if (manager.isInitialized()) {
+    return;
+  }
+
+  // Initialize Elasticsearch exporter if configured
+  if (env.ELASTICSEARCH_HOST) {
+    try {
+      const elasticsearchExporter = new ElasticsearchExporter({
+        host: env.ELASTICSEARCH_HOST,
+        port: env.ELASTICSEARCH_PORT || '9200',
+        password: env.ELASTICSEARCH_PASSWORD,
+        index: env.ELASTICSEARCH_INDEX || 'metrics',
+        username: env.ELASTICSEARCH_USERNAME || 'elastic',
+        batchSize: 5, // Smaller batch size for edge
+        flushIntervalMs: 1000 // More frequent flushes
+      });
+      manager.addExporter(elasticsearchExporter);
+    } catch (error) {
+      console.error('[Metrics] Failed to initialize Elasticsearch exporter:', error);
+    }
+  }
+};
 
 // Add global middleware
 app.use('*', cors());
 app.use('*', logger());
 app.use('*', prettyJSON());
 app.use('*', loggingMiddleware);
+
+// Initialize metrics exporters middleware
+app.use('*', (c, next) => {
+  initializeMetricsExporters(c.env);
+  return next();
+});
 
 // Health check endpoint
 app.get('/health', (c) => c.json({ status: 'ok' }));
@@ -27,10 +62,9 @@ const v1 = app.basePath('/v1');
 // Chat completion endpoint
 v1.post('/chat/completions', authMiddleware, validationMiddleware, handleChatCompletion);
 
-// Add some example hooks
+// Add hooks
 hooksManager.addHooks({
   beforeRequest: async (request, context) => {
-    // Example: Add system message if not present
     if (!request.messages.some(m => m.role === 'system')) {
       request.messages.unshift({
         role: 'system',
@@ -40,7 +74,6 @@ hooksManager.addHooks({
     return request;
   },
   afterResponse: async (response, context) => {
-    // Example: Add custom header
     const headers = new Headers(response.headers);
     headers.set('x-gateway-version', '1.0.0');
     return new Response(response.body, {
@@ -83,4 +116,9 @@ app.onError((err, c) => {
   }, 500);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(MetricsExportManager.getInstance().cleanup());
+  }
+};

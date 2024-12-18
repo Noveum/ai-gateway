@@ -1,0 +1,11 @@
+# Elasticsearch Configuration
+ELASTICSEARCH_HOST="https://es.magicapi.dev"
+ELASTICSEARCH_PORT="443"
+ELASTICSEARCH_PASSWORD="3T7o7h82vv6Rnq0Ltzu1f7a8"
+ELASTICSEARCH_INDEX="noveum_dev_logs"
+
+# Environment
+ENVIRONMENT="development"
+
+# Note: Copy this file to .dev.vars and update the values
+# Do not commit .dev.vars to version control 

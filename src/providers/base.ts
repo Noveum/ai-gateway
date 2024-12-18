@@ -24,6 +24,12 @@ export abstract class BaseProvider implements AIProvider {
   abstract transformResponse(response: any, request: ChatCompletionRequest): Promise<any>;
 
   protected initializeMetrics(request: ChatCompletionRequest): MetricsCollector {
+    // Reset metrics collector for each new request
+    if (this.metricsCollector) {
+      console.debug('[BaseProvider] Resetting previous metrics collector');
+      this.metricsCollector = undefined;
+    }
+
     const requestId = crypto.randomUUID();
     this.metricsCollector = new MetricsCollector(
       requestId,
@@ -35,6 +41,8 @@ export abstract class BaseProvider implements AIProvider {
         outputTokenCost: this.config.outputTokenCost
       }
     );
+    
+    console.debug('[BaseProvider] Initialized new metrics collector:', requestId);
     
     if (request.model) {
       this.metricsCollector.setModel(request.model);

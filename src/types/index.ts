@@ -85,7 +85,17 @@ export type ProviderConfig = {
   outputTokenCost?: number;
 };
 
-export type Bindings = {
+export interface Env {
+  // Elasticsearch Configuration
+  ELASTICSEARCH_HOST: string;
+  ELASTICSEARCH_PORT: string;
+  ELASTICSEARCH_PASSWORD: string;
+  ELASTICSEARCH_INDEX: string;
+  ELASTICSEARCH_USERNAME?: string;
+  ENVIRONMENT?: string;
+}
+
+export interface Bindings extends Env {
   DEFAULT_PROVIDER?: string;
   OPENAI_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
@@ -95,11 +105,13 @@ export type Bindings = {
   GROQ_API_KEY?: string;
   FIREWORKS_API_KEY?: string;
   TOGETHER_API_KEY?: string;
-};
+}
+
 
 export type Variables = {
   provider: Provider;
   config: ProviderConfig;
+  requestId: string;
 };
 
 export type ErrorResponse = {

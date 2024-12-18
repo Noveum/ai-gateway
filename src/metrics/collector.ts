@@ -1,11 +1,13 @@
 import { RequestMetrics, TokenUsage, ProviderMetricsConfig } from '../types';
 import { MODEL_COSTS } from './costs/index';
+import { MetricsExportManager } from './exporters';
 
 export class MetricsCollector {
   private metrics: RequestMetrics;
   private chunkCount: number = 0;
   private streamComplete: boolean = false;
   private config: ProviderMetricsConfig;
+  private isFinished: boolean = false;
 
   constructor(requestId: string, method: string, path: string, provider: string, config: ProviderMetricsConfig = {}) {
     this.metrics = {
@@ -138,25 +140,28 @@ export class MetricsCollector {
     this.metrics.cached = cached;
   }
 
-  finish() {
+  async finish(): Promise<RequestMetrics> {
+    if (this.isFinished) {
+      return this.metrics;
+    }
+    
+    this.isFinished = true;
     console.debug('[Metrics] Finishing collection');
+    
     this.metrics.performance.endTime = Date.now();
     this.metrics.performance.totalLatency = this.metrics.performance.endTime - this.metrics.performance.startTime;
     
     this.updateCosts();
     
-    console.log('[Metrics] Final Report:', JSON.stringify({
-        ...this.metrics,
-        _debug: {
-          hasCostConfig: !!(this.config.inputTokenCost || this.config.outputTokenCost),
-          hasTokens: !!this.metrics.tokens,
-          isStreamComplete: this.streamComplete
-        }
-      }, null, 2)
-    );
-    // setTimeout(() => {
-    //   , null, 2));
-    // }, 0);
+    // Export metrics non-blocking
+    try {
+      await MetricsExportManager.getInstance().exportMetrics(this.metrics);
+    } catch (error) {
+      console.error('[Metrics] Export failed:', error);
+      // Don't throw - we don't want export failures to affect the request
+    }
+    
+    console.log('[Metrics] Final Report:', JSON.stringify(this.metrics, null, 2));
 
     return this.metrics;
   }

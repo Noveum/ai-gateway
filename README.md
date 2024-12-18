@@ -87,6 +87,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
+
 ### Anthropic Integration
 
 #### Using cURL
@@ -179,22 +180,39 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ### Project Structure
 ```
-src/
-  ├── providers/          # AI provider implementations
-  │   ├── openai.ts      # OpenAI provider
-  │   ├── anthropic.ts   # Anthropic provider
-  │   ├── bedrock.ts     # AWS Bedrock provider
-  │   ├── groq.ts        # GROQ provider
-  │   ├── fireworks.ts   # Fireworks AI provider
-  │   └── together.ts    # Together AI provider
-  ├── middleware/         # Middleware components
-  │   ├── auth.ts        # Authentication middleware
-  │   ├── validation.ts  # Request validation
-  │   └── logging.ts     # Request/response logging
-  ├── hooks/             # Transformation hooks
-  ├── handlers/          # Route handlers
-  ├── types/             # TypeScript definitions
-  └── index.ts          # Application entry
+/src/
+├── handlers
+│   └── chat.ts
+├── hooks
+│   └── index.ts
+├── index.ts
+├── metrics
+│   ├── collector.ts
+│   └── costs
+│       ├── anthropic.ts
+│       ├── fireworks.ts
+│       ├── groq.ts
+│       ├── index.ts
+│       ├── openai.ts
+│       ├── together.ts
+│       └── types.ts
+├── middleware
+│   ├── auth.ts
+│   ├── logging.ts
+│   ├── types.ts
+│   └── validation.ts
+├── providers
+│   ├── anthropic.ts
+│   ├── base.ts
+│   ├── bedrock.ts
+│   ├── factory.ts
+│   ├── fireworks.ts
+│   ├── groq.ts
+│   ├── openai.ts
+│   └── together.ts
+├── types
+│   └── index.ts
+└── utils
 ```
 
 ### Key Components
