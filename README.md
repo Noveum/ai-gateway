@@ -27,9 +27,9 @@ A hyper-efficient, lightweight AI Gateway that provides a unified interface to a
 - OpenAI (GPT-4, GPT-3.5)
 - Anthropic (Claude 3)
 - AWS Bedrock
-- GROQ (Coming Soon)
-- Fireworks (Coming Soon)
-- Together AI (Coming Soon)
+- GROQ
+- Fireworks AI
+- Together AI
 
 ## 🚀 Quick Start
 
@@ -52,6 +52,9 @@ ANTHROPIC_API_KEY=your_anthropic_key
 AWS_ACCESS_KEY_ID=your_aws_key
 AWS_SECRET_ACCESS_KEY=your_aws_secret
 AWS_REGION=us-east-1
+GROQ_API_KEY=your_groq_key
+FIREWORKS_API_KEY=your_fireworks_key
+TOGETHER_API_KEY=your_together_key
 ```
 
 4. **Development:**
@@ -83,24 +86,6 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-#### Using TypeScript/JavaScript
-```typescript
-import OpenAI from 'openai';
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: "http://localhost:3000/v1/",
-  defaultHeaders: { "x-provider": "openai" }
-});
-
-const response = await openai.chat.completions.create({
-  model: "gpt-4",
-  messages: [{ role: "user", content: "Hello!" }],
-  temperature: 0.7,
-  stream: true
-});
-```
-
 ### Anthropic Integration
 
 #### Using cURL
@@ -114,6 +99,60 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello!"}],
     "temperature": 0.7,
     "max_tokens": 1000
+  }'
+```
+
+### Fireworks AI Integration
+
+#### Using cURL
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: fireworks" \
+  -H "Authorization: Bearer your-fireworks-api-key" \
+  -d '{
+    "model": "accounts/fireworks/models/llama-v3p2-11b-vision-instruct",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What's in this image?"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://example.com/image.jpg"
+            }
+          }
+        ]
+      }
+    ],
+    "temperature": 0.7,
+    "max_tokens": 300,
+    "stream": true
+  }'
+```
+
+### Together AI Integration
+
+#### Using cURL
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: together" \
+  -H "Authorization: Bearer your-together-api-key" \
+  -d '{
+    "model": "meta-llama/Llama-2-7b-chat-hf",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 512,
+    "temperature": 0.7,
+    "top_p": 0.7,
+    "top_k": 50,
+    "repetition_penalty": 1,
+    "stop": ["<|eot_id|>", "<|eom_id|>"],
+    "stream": true
   }'
 ```
 
@@ -143,7 +182,10 @@ src/
   ├── providers/          # AI provider implementations
   │   ├── openai.ts      # OpenAI provider
   │   ├── anthropic.ts   # Anthropic provider
-  │   └── bedrock.ts     # AWS Bedrock provider
+  │   ├── bedrock.ts     # AWS Bedrock provider
+  │   ├── groq.ts        # GROQ provider
+  │   ├── fireworks.ts   # Fireworks AI provider
+  │   └── together.ts    # Together AI provider
   ├── middleware/         # Middleware components
   │   ├── auth.ts        # Authentication middleware
   │   ├── validation.ts  # Request validation

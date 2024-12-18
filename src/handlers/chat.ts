@@ -7,37 +7,37 @@ export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bi
   try {
     const provider = c.get('provider');
     const config = c.get('config');
-    console.debug('[ChatCompletion] Starting request handling', { provider });
+    console.debug('[ChatCompletion] Starting request handling');
     
     // Get request body
     const originalRequest = await c.req.json<ChatCompletionRequest>();
-    console.debug('[ChatCompletion] Original request', { originalRequest });
+    console.debug('[ChatCompletion] Received request');
 
     // Transform request through hooks
     const request = await hooksManager.transformRequest(originalRequest, c);
-    console.debug('[ChatCompletion] Transformed request', { request });
+    console.debug('[ChatCompletion] Request transformed');
 
     // Get provider instance
     const providerInstance = ProviderFactory.getProvider(provider, config);
-    console.debug('[ChatCompletion] Provider instance created', { providerType: provider });
+    console.debug('[ChatCompletion] Initialized provider');
 
     // Make the request to the provider
-    console.debug('[ChatCompletion] Making request to provider');
+    console.debug('[ChatCompletion] Processing request');
     const response = await providerInstance.chatCompletion(request);
-    console.debug('[ChatCompletion] Received provider response', { response });
+    console.debug('[ChatCompletion] Request processed');
 
     // Transform response through hooks
     const transformedResponse = await hooksManager.transformResponse(response, c);
-    console.debug('[ChatCompletion] Final transformed response', { transformedResponse });
+    console.debug('[ChatCompletion] Response transformed');
 
     return transformedResponse;
   } catch (error) {
-    console.debug('[ChatCompletion] Error in main try block', { error });
+    console.debug('[ChatCompletion] Error occurred');
     // Let hooks try to handle the error first
     try {
       return await hooksManager.handleError(error, c);
     } catch (e) {
-      console.debug('[ChatCompletion] Error in error handling', { error: e });
+      console.debug('[ChatCompletion] Error handling failed');
       // If no hook handles the error, return a generic error response
       return c.json({
         error: {

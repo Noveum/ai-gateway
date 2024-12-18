@@ -4,6 +4,8 @@ import { OpenAIProvider } from './openai';
 import { AnthropicProvider } from './anthropic';
 import { BedrockProvider } from './bedrock';
 import { GroqProvider } from './groq';
+import { FireworksProvider } from './fireworks';
+import { TogetherProvider } from './together';
 
 export class ProviderFactory {
   private static providers: Map<Provider, AIProvider> = new Map();
@@ -31,11 +33,9 @@ export class ProviderFactory {
       case 'groq':
         return new GroqProvider();
       case 'fireworks':
-        // TODO: Implement Fireworks provider
-        throw new Error('Fireworks provider not implemented yet');
+        return new FireworksProvider();
       case 'together':
-        // TODO: Implement Together provider
-        throw new Error('Together provider not implemented yet');
+        return new TogetherProvider();
       default:
         throw new Error(`Provider ${provider} not supported`);
     }
