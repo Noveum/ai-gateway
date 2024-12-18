@@ -58,6 +58,8 @@ export type ChatCompletionRequest = {
   stream_options?: StreamOptions;
   temperature?: number;
   top_p?: number;
+  top_k?: number;
+  repetition_penalty?: number;
   tools?: Tool[];
   tool_choice?: ToolChoice;
   parallel_tool_calls?: boolean;
