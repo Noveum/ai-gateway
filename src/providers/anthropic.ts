@@ -1,6 +1,15 @@
 import { BaseProvider } from './base';
 import { ChatCompletionRequest } from '../types';
 
+interface AnthropicResponse {
+  content: Array<{ text: string }>;
+  stop_reason?: string;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+  };
+}
+
 export class AnthropicProvider extends BaseProvider {
   private readonly ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
   private readonly API_VERSION = '2023-06-01';
@@ -35,7 +44,7 @@ export class AnthropicProvider extends BaseProvider {
 
   async transformResponse(response: Response, request: ChatCompletionRequest): Promise<Response> {
     if (!request.stream) {
-      const anthropicResponse = await response.json();
+      const anthropicResponse = await response.json() as AnthropicResponse;
       const openAIFormat = {
         id: 'chatcmpl-' + crypto.randomUUID(),
         object: 'chat.completion',
@@ -169,6 +178,7 @@ export class AnthropicProvider extends BaseProvider {
     try {
       this.validateConfig();
       const requestBody = await this.transformRequest(request);
+      const metrics = this.initializeMetrics(request);
 
       const response = await fetch(this.ANTHROPIC_API_URL, {
         method: 'POST',
@@ -189,9 +199,57 @@ export class AnthropicProvider extends BaseProvider {
         };
       }
 
-      return this.transformResponse(response, request);
+      return this.wrapResponseWithMetrics(response, request, this.extractMetrics);
     } catch (error) {
       return this.handleError(error);
     }
+  }
+
+  extractMetrics(data: any) {
+    if (!data) return null;
+
+    // Handle message_start event
+    if (data.type === 'message_start') {
+      return {
+        tokens: data.message.usage ? {
+          inputTokens: data.message.usage.input_tokens,
+          outputTokens: 0, // Will be updated in subsequent chunks
+          totalTokens: data.message.usage.input_tokens
+        } : undefined,
+        metadata: {
+          messageId: data.message.id,
+          model: data.message.model
+        }
+      };
+    }
+
+    // Handle message_delta event
+    if (data.type === 'message_delta') {
+      return {
+        tokens: data.usage ? {
+          outputTokens: data.usage.output_tokens
+        } : undefined,
+        metadata: {
+          stopReason: data.delta.stop_reason
+        }
+      };
+    }
+
+    // Handle regular response
+    if (data.id && data.usage) {
+      return {
+        tokens: {
+          inputTokens: data.usage.prompt_tokens,
+          outputTokens: data.usage.completion_tokens,
+          totalTokens: data.usage.total_tokens
+        },
+        metadata: {
+          messageId: data.id,
+          model: data.model
+        }
+      };
+    }
+
+    return null;
   }
 } 

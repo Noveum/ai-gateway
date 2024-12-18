@@ -80,8 +80,8 @@ export class OpenAIProvider extends BaseProvider {
   async chatCompletion(request: ChatCompletionRequest): Promise<Response> {
     try {
       this.validateConfig();
-
       const requestBody = await this.transformRequest(request);
+      const metrics = this.initializeMetrics(request);
 
       console.debug('[OpenAI] Request:', {
         url: this.OPENAI_API_URL,
@@ -120,10 +120,57 @@ export class OpenAIProvider extends BaseProvider {
       }
 
       console.debug('[OpenAI] Success: Forwarding response');
-      return this.transformResponse(response, request);
+      return this.wrapResponseWithMetrics(response, request, this.extractMetrics);
     } catch (error) {
       console.error('[OpenAI] Caught error:', error);
       return this.handleError(error);
     }
+  }
+
+  extractMetrics(data: any) {
+    if (!data) return null;
+
+    // Handle streaming response
+    if (data.object === 'chat.completion.chunk') {
+      return {
+        tokens: data.usage ? {
+          inputTokens: data.usage.prompt_tokens,
+          outputTokens: data.usage.completion_tokens,
+          totalTokens: data.usage.total_tokens
+        } : undefined,
+        metadata: {
+          finishReason: data.choices?.[0]?.finish_reason,
+          systemFingerprint: data.system_fingerprint
+        }
+      };
+    }
+
+    // Handle regular response
+    if (data.object === 'chat.completion') {
+      const usage = data.usage || {};
+      const promptTokensDetails = usage.prompt_tokens_details || {};
+      const completionTokensDetails = usage.completion_tokens_details || {};
+
+      return {
+        tokens: {
+          inputTokens: usage.prompt_tokens,
+          outputTokens: usage.completion_tokens,
+          totalTokens: usage.total_tokens,
+          details: {
+            cachedTokens: promptTokensDetails.cached_tokens,
+            audioTokens: promptTokensDetails.audio_tokens + (completionTokensDetails.audio_tokens || 0),
+            reasoningTokens: completionTokensDetails.reasoning_tokens,
+            acceptedPredictionTokens: completionTokensDetails.accepted_prediction_tokens,
+            rejectedPredictionTokens: completionTokensDetails.rejected_prediction_tokens
+          }
+        },
+        metadata: {
+          finishReason: data.choices?.[0]?.finish_reason,
+          systemFingerprint: data.system_fingerprint
+        }
+      };
+    }
+
+    return null;
   }
 } 
