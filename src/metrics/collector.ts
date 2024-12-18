@@ -1,4 +1,5 @@
 import { RequestMetrics, TokenUsage, ProviderMetricsConfig } from '../types';
+import { MODEL_COSTS } from './costs/index';
 
 export class MetricsCollector {
   private metrics: RequestMetrics;
@@ -31,6 +32,10 @@ export class MetricsCollector {
     return this.metrics.performance.startTime;
   }
 
+  getRequestId(): string {
+    return this.metrics.requestId;
+  }
+
   setTTFB(ttfb: number) {
     console.debug('[Metrics] Setting TTFB:', ttfb);
     this.metrics.performance.ttfb = ttfb;
@@ -54,6 +59,26 @@ export class MetricsCollector {
 
   setModel(model: string) {
     this.metrics.model = model;
+    // Update token costs based on provider and model if not explicitly set
+    if (!this.config.inputTokenCost || !this.config.outputTokenCost) {
+      const providerCosts = MODEL_COSTS[this.metrics.provider];
+      if (providerCosts) {
+        // Try exact match first
+        let costs = providerCosts[model];
+        if (!costs) {
+          // Try normalized version (lowercase, no hyphens)
+          const normalizedModel = model.toLowerCase().replace(/[-_]/g, '');
+          costs = providerCosts[normalizedModel];
+        }
+        if (costs) {
+          this.config = {
+            ...this.config,
+            inputTokenCost: costs.inputTokenCost,
+            outputTokenCost: costs.outputTokenCost
+          };
+        }
+      }
+    }
   }
 
   setTokenUsage(usage: TokenUsage) {

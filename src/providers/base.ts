@@ -116,7 +116,10 @@ export abstract class BaseProvider implements AIProvider {
       });
 
       return new Response(stream, {
-        headers: response.headers,
+        headers: {
+          ...Object.fromEntries(response.headers.entries()),
+          'x-request-id': metrics.getRequestId()
+        },
         status: response.status
       });
     } else {
@@ -133,7 +136,10 @@ export abstract class BaseProvider implements AIProvider {
       metrics.finish();
 
       return new Response(JSON.stringify(data), {
-        headers: response.headers,
+        headers: {
+          ...Object.fromEntries(response.headers.entries()),
+          'x-request-id': metrics.getRequestId()
+        },
         status: response.status
       });
     }
@@ -159,7 +165,8 @@ export abstract class BaseProvider implements AIProvider {
     return new Response(JSON.stringify(errorResponse), {
       status: error.status || 500,
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'x-request-id': this.metricsCollector?.getRequestId() || crypto.randomUUID()
       }
     });
   }

@@ -19,6 +19,7 @@ A hyper-efficient, lightweight AI Gateway that provides a unified interface to a
 - 🛠 **Extensible Middleware**: Customizable request/response pipeline
 - ✅ **Built-in Validation**: Automatic request validation and error handling
 - 🔄 **Auto-Transform**: Automatic request/response transformation
+- 📝 **Detailed Metrics**: Comprehensive request metrics and cost tracking
 - 📝 **Comprehensive Logging**: Detailed logging for monitoring and debugging
 - 💪 **Type-Safe**: Built with TypeScript for robust type safety
 
@@ -320,6 +321,67 @@ For more detailed information about contributing, please see our [CONTRIBUTING.m
 ## 📄 License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## 📊 Metrics & Monitoring
+
+The gateway collects detailed metrics for every request, providing insights into performance, usage, and costs.
+
+### Example Metrics
+```json
+{
+  "requestId": "1c3f70e1-7eac-4b96-a41d-30dfe799596d",
+  "timestamp": "2024-12-18T12:16:18.773Z",
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "provider": "together",
+  "performance": {
+    "startTime": 1734524178773,
+    "ttfb": 555,
+    "endTime": 1734524179734,
+    "totalLatency": 961
+  },
+  "success": true,
+  "cached": false,
+  "metadata": {
+    "estimated": false,
+    "totalChunks": 26,
+    "streamComplete": true
+  },
+  "model": "meta-llama/Llama-2-7b-chat-hf",
+  "status": 200,
+  "tokens": {
+    "input": 34,
+    "output": 75,
+    "total": 109
+  }
+}
+```
+
+### Metrics Features
+- 📈 Real-time performance tracking
+- 💰 Token usage and cost calculation
+- 🔄 Streaming metrics support
+- 📊 Provider-specific metadata
+- ⏱️ Latency and TTFB monitoring
+- 🔍 Detailed debugging information
+
+For detailed metrics documentation, see [METRICS.md](docs/METRICS.md)
+
+## 🙏 Acknowledgments
+
+- Built with [Hono](https://hono.dev/)
+- Deployed on [Cloudflare Workers](https://workers.cloudflare.com/)
+
+## 📬 Contact
+
+- GitHub Issues: [https://github.com/Noveum/ai-gateway/issues](https://github.com/Noveum/ai-gateway/issues)
+- Twitter: [@NoveumAI](https://twitter.com/NoveumAI)
+
+---
+
+<div align="center">
+Made with ❤️ by the Noveum Team
+</div>
 
 ```
 Copyright 2024 Noveum AI
