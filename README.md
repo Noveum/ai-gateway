@@ -2,10 +2,9 @@
 
 <div align="center">
 
-[![GitHub license](https://img.shields.io/github/license/Noveum/ai-gateway)](https://github.com/Noveum/ai-gateway/blob/main/LICENSE)
+[![Apache License 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/Noveum/ai-gateway/blob/main/LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Noveum/ai-gateway/pulls)
 [![Contributors](https://img.shields.io/github/contributors/Noveum/ai-gateway)](https://github.com/Noveum/ai-gateway/graphs/contributors)
-[![Apache License 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/Noveum/ai-gateway/blob/main/LICENSE)
 
 </div>
 
@@ -311,8 +310,3 @@ limitations under the License.
 <div align="center">
 Made with ❤️ by the Noveum Team
 </div>
-```
-
-```
-npm run deploy
-```
