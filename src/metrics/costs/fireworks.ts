@@ -194,7 +194,7 @@ const createModelCostsWithNormalized = (costs: ProviderModelCosts): ProviderMode
           outputTokenCost: cost / MILLION
         };
       }
-      return target[prop as string];
+      return target[String(prop)];
     }
   });
 };

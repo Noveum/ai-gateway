@@ -6,7 +6,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --minify",
     "test": "vitest",
-    "lint": "eslint . --ext .ts",
+    "lint": "eslint . --config eslint.config.js",
     "format": "prettier --write .",
     "type-check": "tsc --noEmit",
     "build": "npm run type-check && npm run lint"
