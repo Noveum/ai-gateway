@@ -149,6 +149,78 @@ interface RequestMetrics {
 }
 ```
 
+### GROQ
+```json
+{
+  "requestId": "61cf76a3-c844-459d-a288-b73a149b005f",
+  "timestamp": "2024-12-18T13:07:23.025Z",
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "provider": "groq",
+  "performance": {
+    "startTime": 1734527243025,
+    "ttfb": 765,
+    "endTime": 1734527243809,
+    "totalLatency": 784
+  },
+  "success": true,
+  "cached": false,
+  "metadata": {
+    "estimated": false,
+    "totalChunks": 76,
+    "streamComplete": true
+  },
+  "model": "llama-3.1-8b-instant",
+  "status": 200,
+  "tokens": {
+    "input": 45,
+    "output": 207,
+    "total": 252
+  },
+  "cost": {
+    "inputCost": 0.00000225,
+    "outputCost": 0.00001656,
+    "totalCost": 0.00001881
+  }
+}
+```
+
+### Fireworks
+```json
+{
+  "requestId": "db486b29-63fb-451f-8441-e2521de528c6",
+  "timestamp": "2024-12-18T13:07:34.496Z",
+  "method": "POST",
+  "path": "/v1/chat/completions", 
+  "provider": "fireworks",
+  "performance": {
+    "startTime": 1734527254496,
+    "ttfb": 802,
+    "endTime": 1734527255774,
+    "totalLatency": 1278
+  },
+  "success": true,
+  "cached": false,
+  "metadata": {
+    "estimated": false,
+    "totalChunks": 24,
+    "streamComplete": true
+  },
+  "model": "accounts/fireworks/models/llama-v3p2-11b-vision-instruct",
+  "status": 200,
+  "tokens": {
+    "input": 6434,
+    "output": 69,
+    "total": 99
+  },
+  "cost": {
+    "inputCost": 0.0006434,
+    "outputCost": 0.0000069,
+    "totalCost": 0.0006503
+  }
+}
+```
+
 ## Provider-Specific Metrics
 
 Each provider may include additional metadata or token details specific to their service:
@@ -175,30 +247,71 @@ Each provider may include additional metadata or token details specific to their
 - Prompt time
 - Completion time
 - System fingerprint
+- Model-specific token details
+- Stream metrics
 
 ### Fireworks
 - Model-specific metadata
 - Request ID
 - Finish reason
+- Token usage details
+- Stream performance metrics
 
 ## Cost Tracking
 
-When token costs are configured, the metrics include detailed cost breakdown:
+When token costs are configured, the metrics include detailed cost breakdown. Cost estimates are based on public pricing as of December 18, 2024:
+
 ```json
 "cost": {
   "inputCost": 0.0015,    // Cost for input tokens
-  "outputCost": 0.003,    // Cost for output tokens
+  "outputCost": 0.003,    // Cost for output tokens  
   "totalCost": 0.0045     // Total request cost
 }
 ```
 
-Configure costs per provider in your environment:
-```env
-OPENAI_INPUT_TOKEN_COST=0.00003
-OPENAI_OUTPUT_TOKEN_COST=0.00006
-ANTHROPIC_INPUT_TOKEN_COST=0.00001
-ANTHROPIC_OUTPUT_TOKEN_COST=0.00003
-```
+Costs are configured per provider in the following files under `/src/metrics/costs/`:
+
+### OpenAI
+- Configuration: [`openai.ts`](https://github.com/Noveum/ai-gateway/blob/main/src/metrics/costs/openai.ts)
+- Includes pricing for GPT-4, GPT-4 Turbo, GPT-3.5 Turbo models
+- Costs are defined in dollars per million tokens
+- Supports model name normalization for matching variants
+
+### Anthropic
+- Configuration: [`anthropic.ts`](https://github.com/Noveum/ai-gateway/blob/main/src/metrics/costs/anthropic.ts)
+- Includes pricing for Claude 3 Opus, Sonnet, and Haiku models
+- Handles model version variations (e.g., claude-3 vs claude-3.5)
+- Supports normalized model name matching
+
+### Together AI
+- Configuration: [`together.ts`](https://github.com/Noveum/ai-gateway/blob/main/src/metrics/costs/together.ts)
+- Dynamic pricing based on model size and type (Lite, Turbo, Reference)
+- Supports Llama, Mixtral, Qwen, and other models
+- Includes specialized pricing for vision and code models
+
+### GROQ
+- Configuration: [`groq.ts`](https://github.com/Noveum/ai-gateway/blob/main/src/metrics/costs/groq.ts)
+- Includes pricing for Llama, Mixtral, and Gemma models
+- Handles context window variations in model names
+- Supports base model matching without context window suffix
+
+### Fireworks
+- Configuration: [`fireworks.ts`](https://github.com/Noveum/ai-gateway/blob/main/src/metrics/costs/fireworks.ts)
+- Tiered pricing based on model size (Small, Medium, Large)
+- Special pricing for MoE models (Mixtral)
+- Dynamic cost calculation based on model architecture
+
+Each provider's cost configuration includes:
+- Model name normalization for flexible matching
+- Per-token cost calculation (converted from dollars per million tokens)
+- Support for both input and output token pricing
+- Fallback pricing for unlisted models based on size/type
+
+To add or update costs for a provider:
+1. Locate the provider's cost file in `/src/metrics/costs/`
+2. Update the `BASE_COSTS` configuration
+3. Costs should be specified in dollars per million tokens
+4. Use the `MILLION` constant for conversion: `cost / MILLION`
 
 ## Streaming Metrics
 

@@ -243,6 +243,126 @@ export class NewProvider implements AIProvider {
 3. Add provider-specific types in \`src/types/\`
 4. Update the provider factory
 
+### Adding Provider Metrics and Costs
+
+1. Create a cost file in \`src/metrics/costs/\`:
+```typescript
+import { ProviderModelCosts } from './types';
+
+// Convert price from dollars per million tokens to dollars per token
+const MILLION = 1_000_000;
+
+// Define pricing structure
+const BASE_COSTS: ProviderModelCosts = {
+  'model-name': {
+    inputTokenCost: 0.50 / MILLION,  // $0.50 per million tokens
+    outputTokenCost: 0.50 / MILLION
+  }
+};
+
+// Add helper functions for model name normalization
+const normalizeModelName = (model: string): string => {
+  return model.toLowerCase()
+    .replace(/[-_\s]/g, '')
+    .replace(/\.(\d)/g, '$1')
+    .replace(/v\d+(\.\d+)?/, '');
+};
+
+// Create normalized costs map with fallback
+const createModelCostsWithNormalized = (costs: ProviderModelCosts): ProviderModelCosts => {
+  const normalizedCosts: ProviderModelCosts = { ...costs };
+  
+  Object.entries(costs).forEach(([model, cost]) => {
+    normalizedCosts[normalizeModelName(model)] = cost;
+  });
+  
+  return normalizedCosts;
+};
+
+export const PROVIDER_COSTS = createModelCostsWithNormalized(BASE_COSTS);
+```
+
+2. Update \`src/metrics/costs/index.ts\` to include your provider:
+```typescript
+import { PROVIDER_COSTS } from './provider';
+
+export const MODEL_COSTS: Record<string, ProviderModelCosts> = {
+  // ... existing providers
+  provider: PROVIDER_COSTS
+};
+```
+
+3. Implement metrics collection in your provider:
+```typescript
+export class NewProvider implements AIProvider {
+  async chat(request: ChatRequest): Promise<ChatResponse> {
+    const metrics = new MetricsCollector(
+      requestId,
+      'POST',
+      '/v1/chat/completions',
+      'provider-name'
+    );
+    
+    try {
+      // Your implementation
+      metrics.setModel(request.model);
+      metrics.setTokenUsage({
+        inputTokens: inputCount,
+        outputTokens: outputCount
+      });
+      return response;
+    } finally {
+      metrics.finish();
+    }
+  }
+}
+```
+
+4. Add provider-specific metrics documentation in \`docs/providers/\`:
+```markdown
+# Provider Name Metrics
+
+## Token Counting
+Explain how tokens are counted for this provider.
+
+## Cost Calculation
+Document the pricing structure and how costs are calculated.
+
+## Model-Specific Details
+List any model-specific considerations for metrics.
+```
+
+### Best Practices for Metrics Implementation
+
+1. **Token Counting**
+   - Implement accurate token counting for input and output
+   - Handle streaming responses correctly
+   - Consider model-specific token calculation methods
+
+2. **Cost Calculation**
+   - Use the MILLION constant for per-token cost conversion
+   - Implement proper model name normalization
+   - Handle different pricing tiers if applicable
+   - Consider input vs output token cost differences
+
+3. **Performance Metrics**
+   - Track Time To First Byte (TTFB)
+   - Measure total request latency
+   - Count streaming chunks if applicable
+   - Track cache hits/misses
+
+4. **Error Handling**
+   - Set appropriate status codes
+   - Track failed requests
+   - Include error details in metrics
+   - Handle token counting in error cases
+
+5. **Documentation**
+   - Document pricing structure clearly
+   - Explain any provider-specific behaviors
+   - Include example metrics output
+   - Document any limitations or special cases
+
 ### Custom Middleware
 
 Create custom middleware in \`src/middleware/\`:
