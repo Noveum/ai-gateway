@@ -463,6 +463,24 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 The gateway collects detailed metrics for every request, providing insights into performance, usage, and costs.
 
+### Metrics Exporters
+
+The gateway supports exporting metrics to various destinations. Currently supported exporters:
+
+#### Elasticsearch Exporter
+
+Configure the Elasticsearch exporter using environment variables:
+
+```env
+ELASTICSEARCH_HOST=your-elasticsearch-host
+ELASTICSEARCH_PORT=9200  # Optional, defaults to 9200
+ELASTICSEARCH_USERNAME=elastic  # Optional, defaults to 'elastic'
+ELASTICSEARCH_PASSWORD=your-password
+ELASTICSEARCH_INDEX=metrics  # Optional, defaults to 'metrics'
+```
+
+For detailed configuration and setup instructions, see [METRICS_EXPORTERS.md](docs/METRICS_EXPORTERS.md)
+
 ### Example Metrics
 ```json
 {
