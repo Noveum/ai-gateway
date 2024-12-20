@@ -6,6 +6,116 @@ First off, thank you for considering contributing to Noveum AI Gateway! It's peo
 
 This project and everyone participating in it is governed by our Code of Conduct. By participating, you are expected to uphold this code. Please report unacceptable behavior to [team@noveum.ai](mailto:team@noveum.ai).
 
+## Project Architecture
+
+### Project Structure
+```
+/src/
+├── handlers
+│   └── chat.ts
+├── hooks
+│   └── index.ts
+├── index.ts
+├── metrics
+│   ├── collector.ts
+│   └── costs
+│       ├── anthropic.ts
+│       ├── fireworks.ts
+│       ├── groq.ts
+│       ├── index.ts
+│       ├── openai.ts
+│       ├── together.ts
+│       └── types.ts
+├── middleware
+│   ├── auth.ts
+│   ├── logging.ts
+│   ├── types.ts
+│   └── validation.ts
+├── providers
+│   ├── anthropic.ts
+│   ├── base.ts
+│   ├── factory.ts
+│   ├── fireworks.ts
+│   ├── groq.ts
+│   ├── openai.ts
+│   └── together.ts
+├── types
+│   └── index.ts
+└── utils
+```
+
+### Key Components
+
+#### Middleware System
+- **Authentication**: Provider-specific API key validation
+- **Validation**: Request payload validation
+- **Logging**: Comprehensive request/response logging
+- **CORS**: Cross-origin resource sharing
+- **Error Handling**: Standardized error responses
+
+#### Provider Interface
+Each provider implements the `AIProvider` interface:
+```typescript
+interface AIProvider {
+  chat(request: ChatRequest): Promise<ChatResponse>;
+  stream(request: ChatRequest): ReadableStream;
+  validate(request: ChatRequest): void;
+}
+```
+
+## Development Guide
+
+### Adding a New Provider
+
+1. Create a new provider class in `src/providers/`:
+```typescript
+import { AIProvider } from '../types';
+
+export class NewProvider implements AIProvider {
+  async chat(request: ChatRequest): Promise<ChatResponse> {
+    // Implementation
+  }
+
+  stream(request: ChatRequest): ReadableStream {
+    // Implementation
+  }
+
+  validate(request: ChatRequest): void {
+    // Implementation
+  }
+}
+```
+
+2. Register the provider in `src/providers/index.ts`
+3. Add provider-specific types in `src/types/`
+4. Update the provider factory
+
+### Adding Provider Metrics and Costs
+
+1. Create a cost file in `src/metrics/costs/`:
+```typescript
+import { ProviderModelCosts } from './types';
+
+// Convert price from dollars per million tokens to dollars per token
+const MILLION = 1_000_000;
+
+// Define pricing structure
+const BASE_COSTS: ProviderModelCosts = {
+  'model-name': {
+    inputTokenCost: 0.50 / MILLION,  // $0.50 per million tokens
+    outputTokenCost: 0.50 / MILLION
+  }
+};
+
+// Add helper functions for model name normalization
+const normalizeModelName = (model: string): string => {
+  return model.toLowerCase()
+    .replace(/[-_\s]/g, '')
+    .replace(/\.(\d)/g, '$1')
+    .replace(/v\d+(\.\d+)?/, '');
+};
+```
+
 ## How Can I Contribute?
 
 ### Reporting Bugs
@@ -56,15 +166,24 @@ Unsure where to begin contributing? You can start by looking through these `begi
 * [Beginner issues](https://github.com/Noveum/ai-gateway/labels/good%20first%20issue) - issues which should only require a few lines of code.
 * [Help wanted issues](https://github.com/Noveum/ai-gateway/labels/help%20wanted) - issues which should be a bit more involved than `beginner` issues.
 
-### Pull Requests
+### Pull Request Process
 
-* Fill in the required template
-* Do not include issue numbers in the PR title
-* Include screenshots and animated GIFs in your pull request whenever possible
-* Follow the TypeScript styleguide
-* Include thoughtfully-worded, well-structured tests
-* Document new code
-* End all files with a newline
+1. Fork the repository
+2. Create your feature branch:
+   ```bash
+   git checkout -b feature/amazing-feature
+   ```
+3. Commit your changes:
+   ```bash
+   git commit -m 'Add amazing feature'
+   ```
+4. Push to the branch:
+   ```bash
+   git push origin feature/amazing-feature
+   ```
+5. Open a Pull Request
+
+The PR will be merged once you have the sign-off of at least one maintainer.
 
 ## Styleguides
 
@@ -99,10 +218,10 @@ Unsure where to begin contributing? You can start by looking through these `begi
 ### Documentation Styleguide
 
 * Use [Markdown](https://daringfireball.net/projects/markdown)
-* Reference methods and classes in markdown with the custom \`{}\` notation:
-    * Reference classes with \`{ClassName}\`
-    * Reference instance methods with \`{ClassName::methodName}\`
-    * Reference class methods with \`{ClassName.methodName}\`
+* Reference methods and classes in markdown with the custom `{}` notation:
+    * Reference classes with `{ClassName}`
+    * Reference instance methods with `{ClassName::methodName}`
+    * Reference class methods with `{ClassName.methodName}`
 
 ## Additional Notes
 

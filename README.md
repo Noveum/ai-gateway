@@ -22,95 +22,73 @@ A hyper-efficient, lightweight AI Gateway that provides a unified interface to a
 - 📝 **Detailed Metrics**: Comprehensive request metrics and cost tracking
 - 📝 **Comprehensive Logging**: Detailed logging for monitoring and debugging
 - 💪 **Type-Safe**: Built with TypeScript for robust type safety
+- 🔒 **OpenAI Compatible**: Drop-in replacement for OpenAI's API
 
 ## 🤖 Supported Providers
 
-- OpenAI (GPT-4, GPT-3.5)
-- Anthropic (Claude 3)
-- GROQ
-- Fireworks AI
-- Together AI
+| Provider | Streaming | OpenAI Compatible |
+|----------|-----------|------------------|
+| OpenAI | ✅ | Native |
+| Anthropic | ✅ | ✅ |
+| GROQ | ✅ | ✅ |
+| Fireworks | ✅ | ✅ |
+| Together | ✅ | ✅ |
 
 ## 🚀 Quick Start
 
-### Option 1: Cloudflare Workers (Recommended)
+### Using Cloudflare Workers (Recommended)
 
-1. **Install Wrangler CLI:**
 ```bash
+# Install Wrangler CLI
 npm install -g wrangler
-```
 
-2. **Clone and Setup:**
-```bash
+# Clone and Setup
 git clone https://github.com/Noveum/ai-gateway.git
 cd ai-gateway
 npm install
-```
 
-3. **Login to Cloudflare:**
-```bash
+# Login to Cloudflare
 wrangler login
-```
 
-4. **Configure Elasticsearch (Optional):**
-```bash
-wrangler secret put ELASTICSEARCH_HOST
-wrangler secret put ELASTICSEARCH_PORT
-wrangler secret put ELASTICSEARCH_PASSWORD
-wrangler secret put ELASTICSEARCH_INDEX
-```
+# Development
+npm run dev     # Server starts at http://localhost:3000
 
-5. **Development:**
-```bash
-npm run dev
-# Server starts at http://localhost:3000
-```
-
-6. **Deploy:**
-```bash
+# Deploy
 npm run deploy
 ```
 
-Your AI Gateway will be deployed to Cloudflare's edge network, providing:
-- Global distribution and low latency
-- Auto-scaling and DDoS protection
-- Zero cold starts
-- Edge caching capabilities
-
-For detailed deployment instructions, see [DEPLOYMENT.md](DEPLOYMENT.md)
-
-### Option 2: Docker (Alternative)
-
-If you can't use Cloudflare Workers, you can run the gateway using Docker:
+### Using Docker (Alternative)
 
 ```bash
 docker pull noveum/ai-gateway:latest
 docker run -p 3000:3000 noveum/ai-gateway:latest
 ```
 
-For Docker deployment options and configuration, see [DEPLOYMENT.md](DEPLOYMENT.md)
-
 ## 📚 Usage Examples
 
-### OpenAI Integration
+### OpenAI-Compatible Interface
 
-API keys are passed in request headers for security. Each request should include the provider and its corresponding API key.
+The gateway provides a drop-in replacement for OpenAI's API. You can use your existing OpenAI client libraries by just changing the base URL:
 
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-provider: openai" \
-  -H "Authorization: Bearer your-openai-api-key" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "temperature": 0.7,
-    "stream": true
-  }'
+```typescript
+// TypeScript/JavaScript
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+    baseURL: 'http://localhost:3000/v1',
+    apiKey: 'your-provider-api-key',
+    defaultHeaders: { 'x-provider': 'openai' }
+});
+
+const response = await openai.chat.completions.create({
+    model: 'gpt-4',
+    messages: [{ role: 'user', content: 'Hello!' }]
+});
 ```
 
-### Anthropic Integration
+### Provider-Specific Examples
 
+#### Anthropic (Claude)
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -124,8 +102,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-### GROQ Integration
-
+#### GROQ
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -139,276 +116,70 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-### Fireworks AI Integration
+#### Streaming Example
+```python
+from openai import OpenAI
 
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-provider: fireworks" \
-  -H "Authorization: Bearer your-fireworks-api-key" \
-  -d '{
-    "model": "accounts/fireworks/models/llama-v3-7b",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "temperature": 0.7,
-    "max_tokens": 300,
-    "stream": true
-  }'
+client = OpenAI(
+    base_url="http://localhost:3000/v1",
+    api_key="your-provider-api-key",
+    default_headers={"x-provider": "anthropic"}  # or any other provider
+)
+
+stream = client.chat.completions.create(
+    model="claude-3-sonnet-20240229-v1:0",
+    messages=[{"role": "user", "content": "Write a story"}],
+    stream=True
+)
+
+for chunk in stream:
+    if chunk.choices[0].delta.content is not None:
+        print(chunk.choices[0].delta.content, end="")
 ```
 
-### Together AI Integration
+### Example Response with Metrics
 
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-provider: together" \
-  -H "Authorization: Bearer your-together-api-key" \
-  -d '{
-    "model": "meta-llama/Llama-2-7b-chat-hf",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 512,
-    "temperature": 0.7,
-    "top_p": 0.7,
-    "top_k": 50,
-    "repetition_penalty": 1,
-    "stream": true
-  }'
-```
-
-Note: All provider API keys are passed securely in request headers, not environment variables. This allows for:
-- Per-request API key flexibility
-- Multiple API keys for the same provider
-- Better security through request-scoped credentials
-- No need to restart the server when changing API keys
-
-## 🏗 Architecture
-
-### Project Structure
-```
-/src/
-├── handlers
-│   └── chat.ts
-├── hooks
-│   └── index.ts
-├── index.ts
-├── metrics
-│   ├── collector.ts
-│   └── costs
-│       ├── anthropic.ts
-│       ├── fireworks.ts
-│       ├── groq.ts
-│       ├── index.ts
-│       ├── openai.ts
-│       ├── together.ts
-│       └── types.ts
-├── middleware
-│   ├── auth.ts
-│   ├── logging.ts
-│   ├── types.ts
-│   └── validation.ts
-├── providers
-│   ├── anthropic.ts
-│   ├── base.ts
-│   ├── factory.ts
-│   ├── fireworks.ts
-│   ├── groq.ts
-│   ├── openai.ts
-│   └── together.ts
-├── types
-│   └── index.ts
-└── utils
-```
-
-### Key Components
-
-#### Middleware System
-- **Authentication**: Provider-specific API key validation
-- **Validation**: Request payload validation
-- **Logging**: Comprehensive request/response logging
-- **CORS**: Cross-origin resource sharing
-- **Error Handling**: Standardized error responses
-
-#### Provider Interface
-Each provider implements the \`AIProvider\` interface:
-```typescript
-interface AIProvider {
-  chat(request: ChatRequest): Promise<ChatResponse>;
-  stream(request: ChatRequest): ReadableStream;
-  validate(request: ChatRequest): void;
-}
-```
-
-## 🛠 Development Guide
-
-### Adding a New Provider
-
-1. Create a new provider class in \`src/providers/\`:
-```typescript
-import { AIProvider } from '../types';
-
-export class NewProvider implements AIProvider {
-  async chat(request: ChatRequest): Promise<ChatResponse> {
-    // Implementation
-  }
-
-  stream(request: ChatRequest): ReadableStream {
-    // Implementation
-  }
-
-  validate(request: ChatRequest): void {
-    // Implementation
-  }
-}
-```
-
-2. Register the provider in \`src/providers/index.ts\`
-3. Add provider-specific types in \`src/types/\`
-4. Update the provider factory
-
-### Adding Provider Metrics and Costs
-
-1. Create a cost file in \`src/metrics/costs/\`:
-```typescript
-import { ProviderModelCosts } from './types';
-
-// Convert price from dollars per million tokens to dollars per token
-const MILLION = 1_000_000;
-
-// Define pricing structure
-const BASE_COSTS: ProviderModelCosts = {
-  'model-name': {
-    inputTokenCost: 0.50 / MILLION,  // $0.50 per million tokens
-    outputTokenCost: 0.50 / MILLION
-  }
-};
-
-// Add helper functions for model name normalization
-const normalizeModelName = (model: string): string => {
-  return model.toLowerCase()
-    .replace(/[-_\s]/g, '')
-    .replace(/\.(\d)/g, '$1')
-    .replace(/v\d+(\.\d+)?/, '');
-};
-```
-
-## 🤝 Contributing
-
-We love your input! We want to make contributing to Noveum AI Gateway as easy and transparent as possible, whether it's:
-
-- Reporting a bug
-- Discussing the current state of the code
-- Submitting a fix
-- Proposing new features
-- Becoming a maintainer
-
-### Getting Started
-
-1. Fork the repository
-2. Create your feature branch:
-   ```bash
-   git checkout -b feature/amazing-feature
-   ```
-3. Commit your changes:
-   ```bash
-   git commit -m 'Add amazing feature'
-   ```
-4. Push to the branch:
-   ```bash
-   git push origin feature/amazing-feature
-   ```
-5. Open a Pull Request
-
-### Development Process
-
-1. Create an issue for any major changes and enhancements
-2. Fork the repo and create your branch from `main`
-3. Make your changes
-4. Add tests for any new functionality
-5. Ensure the test suite passes
-6. Make sure your code lints
-7. Issue that pull request!
-
-For more detailed information about contributing, please see our [CONTRIBUTING.md](CONTRIBUTING.md) file.
-
-### Code Style
-
-- Use TypeScript for all new code
-- Follow the existing code style
-- Use meaningful variable names
-- Add comments for complex logic
-- Keep functions small and focused
-- Write unit tests for new features
-
-### Commit Messages
-
-- Use the present tense ("Add feature" not "Added feature")
-- Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
-- Limit the first line to 72 characters or less
-- Reference issues and pull requests liberally after the first line
-
-### Pull Request Process
-
-1. Update the README.md with details of changes if needed
-2. Update the CHANGELOG.md with details of changes
-3. The PR will be merged once you have the sign-off of at least one maintainer
-
-## 📄 License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## 📊 Metrics & Monitoring
-
-The gateway collects detailed metrics for every request, providing insights into performance, usage, and costs.
-
-### Metrics Exporters
-
-The gateway supports exporting metrics to various destinations. Currently supported exporters:
-
-#### Elasticsearch Exporter
-
-Configure the Elasticsearch exporter using environment variables:
-
-```env
-ELASTICSEARCH_HOST=your-elasticsearch-host
-ELASTICSEARCH_PORT=9200  # Optional, defaults to 9200
-ELASTICSEARCH_USERNAME=elastic  # Optional, defaults to 'elastic'
-ELASTICSEARCH_PASSWORD=your-password
-ELASTICSEARCH_INDEX=metrics  # Optional, defaults to 'metrics'
-```
-
-For detailed configuration and setup instructions, see [METRICS_EXPORTERS.md](docs/METRICS_EXPORTERS.md)
-
-### Example Metrics
 ```json
 {
-  "requestId": "1c3f70e1-7eac-4b96-a41d-30dfe799596d",
-  "timestamp": "2024-12-18T12:16:18.773Z",
-  "method": "POST",
-  "path": "/v1/chat/completions",
-  "provider": "together",
-  "performance": {
-    "startTime": 1734524178773,
-    "ttfb": 555,
-    "endTime": 1734524179734,
-    "totalLatency": 961
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1709312768,
+  "model": "gpt-4",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "Hello! How can I help you today?"
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 9,
+    "total_tokens": 19
   },
-  "success": true,
-  "cached": false,
-  "metadata": {
-    "estimated": false,
-    "totalChunks": 26,
-    "streamComplete": true
-  },
-  "model": "meta-llama/Llama-2-7b-chat-hf",
-  "status": 200,
-  "tokens": {
-    "input": 34,
-    "output": 75,
-    "total": 109
+  "system_fingerprint": "fp_1234",
+  "metrics": {
+    "latency_ms": 450,
+    "tokens_per_second": 42.2,
+    "cost": {
+      "input_cost": 0.0003,
+      "output_cost": 0.0006,
+      "total_cost": 0.0009
+    }
   }
 }
 ```
 
-### Metrics Features
+## 📖 Documentation
+
+- [Deployment Guide](docs/DEPLOYMENT.md)
+- [Metrics & Monitoring](docs/METRICS.md)
+- [Contributing Guidelines](CONTRIBUTING.md)
+
+## 📄 Metrics & Monitoring
+
+The gateway collects detailed metrics for every request, providing insights into:
 - 📈 Real-time performance tracking
 - 💰 Token usage and cost calculation
 - 🔄 Streaming metrics support
@@ -418,12 +189,11 @@ For detailed configuration and setup instructions, see [METRICS_EXPORTERS.md](do
 
 For detailed metrics documentation, see [METRICS.md](docs/METRICS.md)
 
-## 🙏 Acknowledgments
+## 📄 License
 
-- Built with [Hono](https://hono.dev/)
-- Deployed on [Cloudflare Workers](https://workers.cloudflare.com/)
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
-## 📬 Contact
+## 📊 Contact
 
 - GitHub Issues: [https://github.com/Noveum/ai-gateway/issues](https://github.com/Noveum/ai-gateway/issues)
 - Twitter: [@NoveumAI](https://twitter.com/NoveumAI)
