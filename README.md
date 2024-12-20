@@ -181,6 +181,60 @@ for chunk in stream:
 - [Metrics & Monitoring](docs/METRICS.md)
 - [Contributing Guidelines](CONTRIBUTING.md)
 
+## 📄 Contributing Opportunities
+
+We welcome contributions! Here are some tasks we're actively looking for help with:
+
+### High Priority Tasks
+1. **AWS Bedrock Integration**
+   - Add support for AWS Bedrock models
+   - Implement authentication and cost tracking
+   - [Get Started →](https://github.com/Noveum/ai-gateway/issues/new)
+
+2. **Testing Framework**
+   - Set up unit and integration tests
+   - Add provider-specific test cases
+   - [Get Started →](https://github.com/Noveum/ai-gateway/issues/new)
+
+3. **Performance Benchmarks**
+   - Create benchmarking suite
+   - Compare with other AI gateways
+   - [Get Started →](https://github.com/Noveum/ai-gateway/issues/new)
+
+### Feature Requests
+4. **Prometheus Integration**
+   - Add metrics exporter
+   - Create Grafana dashboards
+   - [Get Started →](https://github.com/Noveum/ai-gateway/issues/new)
+
+5. **Response Caching**
+   - Implement caching layer
+   - Add cache invalidation
+   - [Get Started →](https://github.com/Noveum/ai-gateway/issues/new)
+
+6. **Rate Limiting**
+   - Add per-user rate limits
+   - Implement token bucket algorithm
+   - [Get Started →](https://github.com/Noveum/ai-gateway/issues/new)
+
+### Documentation
+7. **Provider Guides**
+   - Create setup guides for each provider
+   - Add troubleshooting sections
+   - [Get Started →](https://github.com/Noveum/ai-gateway/issues/new)
+
+8. **Deployment Examples**
+   - Add Docker Compose examples
+   - Create cloud deployment guides
+   - [Get Started →](https://github.com/Noveum/ai-gateway/issues/new)
+
+Want to contribute? 
+1. Pick a task from above
+2. Open an issue to discuss your approach
+3. Submit a pull request
+
+Need help? Join our [Discord](https://discord.gg/noveum) or check existing [issues](https://github.com/Noveum/ai-gateway/issues).
+
 ## 📄 Metrics & Monitoring
 
 The gateway collects detailed metrics for every request, providing insights into:
