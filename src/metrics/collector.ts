@@ -6,7 +6,7 @@ import type { MiddlewareHandler } from 'hono';
 export class MetricsCollector {
   private metricsPromise: Promise<void>;
   private metricsResolve!: () => void;
-  private metricsTimeout: number | null = null;
+  private metricsTimeout: NodeJS.Timeout | null = null;
   private metrics: RequestMetrics;
   private chunkCount: number = 0;
   private streamComplete: boolean = false;

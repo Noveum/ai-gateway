@@ -1,5 +1,5 @@
-import { BaseExporter } from './base';
 import { RequestMetrics } from '../../types';
+import { BaseExporter } from './base';
 
 export interface ElasticsearchConfig {
   host: string;
@@ -9,19 +9,6 @@ export interface ElasticsearchConfig {
   username?: string;
 }
 
-interface ElasticsearchBulkResponse {
-  took: number;
-  errors: boolean;
-  items?: Array<{
-    index: {
-      _index: string;
-      _id: string;
-      status: number;
-      error?: any;
-    };
-  }>;
-}
-
 export class ElasticsearchExporter extends BaseExporter {
   private readonly url: string;
   private readonly authHeader: string;
@@ -29,15 +16,15 @@ export class ElasticsearchExporter extends BaseExporter {
 
   constructor(config: ElasticsearchConfig) {
     super(config as unknown as Record<string, string>);
-    
+
     this.index = config.index;
-    
+
     // Construct base URL with protocol
     this.url = config.host.startsWith('http') ? config.host : `https://${config.host}`;
     if (config.port) {
       this.url = `${this.url}:${config.port}`;
     }
-    
+
     // Create auth header
     const username = config.username || 'elastic';
     this.authHeader = `Basic ${btoa(`${username}:${config.password}`)}`;
@@ -51,7 +38,9 @@ export class ElasticsearchExporter extends BaseExporter {
   async export(metrics: RequestMetrics): Promise<void> {
     // Wait a small amount of time to ensure metrics are fully populated
     await new Promise(resolve => setTimeout(resolve, 100));
-    
+
+    console.info(`[ElasticsearchExporter] Exporting metrics for request ${metrics.requestId}`);
+
     // Create a deep copy of the metrics to avoid reference issues
     const document = {
       '@timestamp': metrics.timestamp,
@@ -95,22 +84,25 @@ export class ElasticsearchExporter extends BaseExporter {
     };
 
     const url = `${this.url}/${this.index}/_doc/${metrics.requestId}?pretty`;
-
+    
     let lastError: Error | null = null;
     const maxRetries = 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         await this.sendRequest(url, JSON.stringify(document));
+        console.info(`[ElasticsearchExporter] Successfully exported metrics for request ${metrics.requestId}`);
         return;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         console.error(`[ElasticsearchExporter] Attempt ${attempt}/${maxRetries} failed:`, {
-          error: lastError.message
+          error: lastError.message,
+          requestId: metrics.requestId
         });
 
         if (attempt < maxRetries) {
           const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+          console.info(`[ElasticsearchExporter] Retrying in ${delay}ms...`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
@@ -124,6 +116,7 @@ export class ElasticsearchExporter extends BaseExporter {
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
     try {
+      console.debug('[ElasticsearchExporter] Sending request...');
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -142,6 +135,7 @@ export class ElasticsearchExporter extends BaseExporter {
       }
 
       const responseText = await response.text();
+      console.debug('[ElasticsearchExporter] Response received:', responseText.substring(0, 100) + '...');
 
       if (!response.ok) {
         throw new Error(`Elasticsearch error: ${response.status}`);
@@ -162,5 +156,5 @@ export class ElasticsearchExporter extends BaseExporter {
     }
   }
 
-  async close(): Promise<void> {} // Nothing to clean up
+  async close(): Promise<void> { } // Nothing to clean up
 } 

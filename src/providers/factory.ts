@@ -1,10 +1,10 @@
 import { Provider, ProviderConfig } from '../types';
-import { AIProvider } from './base';
-import { OpenAIProvider } from './openai';
 import { AnthropicProvider } from './anthropic';
+import { AIProvider } from './base';
 import { BedrockProvider } from './bedrock';
-import { GroqProvider } from './groq';
 import { FireworksProvider } from './fireworks';
+import { GroqProvider } from './groq';
+import { OpenAIProvider } from './openai';
 import { TogetherProvider } from './together';
 
 export class ProviderFactory {
@@ -18,7 +18,7 @@ export class ProviderFactory {
       this.providers.set(provider, instance);
     }
 
-    instance.initialize(config);
+    instance.initialize(config, provider);
     return instance;
   }
 

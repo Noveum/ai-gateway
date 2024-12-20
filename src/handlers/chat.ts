@@ -2,6 +2,28 @@ import { Context } from 'hono';
 import { Variables, Bindings, ChatCompletionRequest } from '../types';
 import { ProviderFactory } from '../providers/factory';
 import { hooksManager } from '../hooks';
+import { getRuntimeKey } from 'hono/adapter';
+
+const processMetrics = async (providerInstance: any, c: Context) => {
+  const metrics = providerInstance.getMetricsCollector();
+  if (!metrics) return;
+
+  const processMetricsTask = metrics.finish(c.env).catch((error: Error) => {
+    console.error('[Metrics] Failed to process metrics:', error);
+  });
+
+  // Handle background tasks differently based on runtime
+  const runtime = getRuntimeKey();
+  if (runtime === 'node') {
+    // For Node.js, just run the promise in the background
+    processMetricsTask.catch((error: Error) => {
+      console.error('[Background Task] Error:', error);
+    });
+  } else if (c.executionCtx) {
+    // For Cloudflare Workers, use waitUntil
+    c.executionCtx.waitUntil(processMetricsTask);
+  }
+};
 
 export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bindings: Bindings }>) => {
   const startTime = Date.now();
@@ -36,7 +58,7 @@ export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bi
 
     success = true;
     return transformedResponse;
-  } catch (error) {
+  } catch (error: unknown) {
     success = false;
     console.debug('[ChatCompletion] Error occurred');
     // Let hooks try to handle the error first
@@ -55,15 +77,7 @@ export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bi
     }
   } finally {
     if (providerInstance) {
-      const metrics = providerInstance.getMetricsCollector();
-      if (metrics) {
-        // Process metrics in the background using waitUntil
-        c.executionCtx.waitUntil(
-          metrics.finish(c.executionCtx).catch(error => {
-            console.error('[Metrics] Failed to process metrics:', error);
-          })
-        );
-      }
+      await processMetrics(providerInstance, c);
     }
   }
 }; 
