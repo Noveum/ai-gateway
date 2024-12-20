@@ -3,8 +3,12 @@
 <div align="center">
 
 [![Apache License 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/Noveum/ai-gateway/blob/main/LICENSE)
+[![Docker Build](https://github.com/Noveum/ai-gateway/actions/workflows/docker.yml/badge.svg)](https://github.com/Noveum/ai-gateway/actions/workflows/docker.yml)
+[![Docker Pulls](https://img.shields.io/docker/pulls/noveum/ai-gateway)](https://hub.docker.com/r/noveum/ai-gateway)
+[![Docker Image Size](https://img.shields.io/docker/image-size/noveum/ai-gateway/latest)](https://hub.docker.com/r/noveum/ai-gateway)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Noveum/ai-gateway/pulls)
 [![Contributors](https://img.shields.io/github/contributors/Noveum/ai-gateway)](https://github.com/Noveum/ai-gateway/graphs/contributors)
+[![GitHub Release](https://img.shields.io/github/v/release/Noveum/ai-gateway)](https://github.com/Noveum/ai-gateway/releases)
 
 </div>
 
