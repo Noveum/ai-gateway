@@ -1,6 +1,6 @@
 {
   "name": "noveum-ai-gateway",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "A hyper efficient, lightweight AI Gateway for edge deployment",
   "type": "module",
   "scripts": {
