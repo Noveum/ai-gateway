@@ -1,8 +1,8 @@
-import { ChatCompletionRequest, ProviderConfig } from '../types';
 import { MetricsCollector } from '../metrics/collector';
+import { ChatCompletionRequest, ProviderConfig } from '../types';
 
 export interface AIProvider {
-  initialize(config: ProviderConfig): void;
+  initialize(config: ProviderConfig, provider: string): void;
   validateConfig(): void;
   chatCompletion(request: ChatCompletionRequest): Promise<Response>;
   transformRequest(request: ChatCompletionRequest): Promise<any>;
@@ -14,9 +14,11 @@ export interface AIProvider {
 export abstract class BaseProvider implements AIProvider {
   protected config: ProviderConfig = {};
   protected metricsCollector?: MetricsCollector;
+  protected provider: string = '';
 
-  initialize(config: ProviderConfig): void {
+  initialize(config: ProviderConfig, provider: string): void {
     this.config = config;
+    this.provider = provider;
   }
 
   abstract validateConfig(): void;
@@ -36,24 +38,24 @@ export abstract class BaseProvider implements AIProvider {
       requestId,
       'POST',
       '/v1/chat/completions',
-      this.constructor.name.replace('Provider', '').toLowerCase(),
+      this.provider,
       {
         inputTokenCost: this.config.inputTokenCost,
         outputTokenCost: this.config.outputTokenCost
       }
     );
-    
+
     console.debug('[BaseProvider] Initialized new metrics collector:', requestId);
-    
+
     if (request.model) {
       this.metricsCollector.setModel(request.model);
     }
-    
+
     return this.metricsCollector;
   }
 
   protected async wrapResponseWithMetrics(
-    response: Response, 
+    response: Response,
     request: ChatCompletionRequest,
     extractMetricsFn?: (data: any) => any
   ): Promise<Response> {
@@ -70,8 +72,8 @@ export abstract class BaseProvider implements AIProvider {
         async start(controller) {
           try {
             while (true) {
-              const {done, value} = await reader.read();
-              
+              const { done, value } = await reader.read();
+
               if (done) {
                 metrics.setStreamComplete();
                 // metrics.finish();
@@ -95,7 +97,7 @@ export abstract class BaseProvider implements AIProvider {
               for (const line of lines) {
                 const trimmedLine = line.trim();
                 if (!trimmedLine || trimmedLine === 'data: [DONE]') continue;
-                
+
                 if (trimmedLine.startsWith('data: ')) {
                   try {
                     const jsonStr = trimmedLine.slice(6);
@@ -134,7 +136,7 @@ export abstract class BaseProvider implements AIProvider {
     } else {
       // For non-streaming responses, clone before reading
       const clonedResponse = response.clone();
-      
+
       // Process metrics in the background
       (async () => {
         try {

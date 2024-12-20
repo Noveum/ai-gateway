@@ -27,53 +27,75 @@ A hyper-efficient, lightweight AI Gateway that provides a unified interface to a
 
 - OpenAI (GPT-4, GPT-3.5)
 - Anthropic (Claude 3)
-- AWS Bedrock
 - GROQ
 - Fireworks AI
 - Together AI
 
 ## 🚀 Quick Start
 
-1. **Clone the repository:**
+### Option 1: Cloudflare Workers (Recommended)
+
+1. **Install Wrangler CLI:**
+```bash
+npm install -g wrangler
+```
+
+2. **Clone and Setup:**
 ```bash
 git clone https://github.com/Noveum/ai-gateway.git
 cd ai-gateway
-```
-
-2. **Install dependencies:**
-```bash
 npm install
 ```
 
-3. **Configure environment variables:**
-Create a `.dev.vars` file in the root directory:
-```env
-OPENAI_API_KEY=your_openai_api_key
-ANTHROPIC_API_KEY=your_anthropic_key
-AWS_ACCESS_KEY_ID=your_aws_key
-AWS_SECRET_ACCESS_KEY=your_aws_secret
-AWS_REGION=us-east-1
-GROQ_API_KEY=your_groq_key
-FIREWORKS_API_KEY=your_fireworks_key
-TOGETHER_API_KEY=your_together_key
+3. **Login to Cloudflare:**
+```bash
+wrangler login
 ```
 
-4. **Development:**
+4. **Configure Elasticsearch (Optional):**
+```bash
+wrangler secret put ELASTICSEARCH_HOST
+wrangler secret put ELASTICSEARCH_PORT
+wrangler secret put ELASTICSEARCH_PASSWORD
+wrangler secret put ELASTICSEARCH_INDEX
+```
+
+5. **Development:**
 ```bash
 npm run dev
 # Server starts at http://localhost:3000
 ```
 
-5. **Deploy to Cloudflare Workers:**
+6. **Deploy:**
 ```bash
 npm run deploy
 ```
+
+Your AI Gateway will be deployed to Cloudflare's edge network, providing:
+- Global distribution and low latency
+- Auto-scaling and DDoS protection
+- Zero cold starts
+- Edge caching capabilities
+
+For detailed deployment instructions, see [DEPLOYMENT.md](DEPLOYMENT.md)
+
+### Option 2: Docker (Alternative)
+
+If you can't use Cloudflare Workers, you can run the gateway using Docker:
+
+```bash
+docker pull noveum/ai-gateway:latest
+docker run -p 3000:3000 noveum/ai-gateway:latest
+```
+
+For Docker deployment options and configuration, see [DEPLOYMENT.md](DEPLOYMENT.md)
 
 ## 📚 Usage Examples
 
 ### OpenAI Integration
 
-#### Using cURL
+API keys are passed in request headers for security. Each request should include the provider and its corresponding API key.
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -89,7 +111,6 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ### Anthropic Integration
 
-#### Using cURL
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -103,33 +124,31 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
+### GROQ Integration
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: groq" \
+  -H "Authorization: Bearer your-groq-api-key" \
+  -d '{
+    "model": "mixtral-8x7b-32768",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "temperature": 0.7,
+    "max_tokens": 1000
+  }'
+```
+
 ### Fireworks AI Integration
 
-#### Using cURL
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-provider: fireworks" \
   -H "Authorization: Bearer your-fireworks-api-key" \
   -d '{
-    "model": "accounts/fireworks/models/llama-v3p2-11b-vision-instruct",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "text",
-            "text": "What's in this image?"
-          },
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "https://example.com/image.jpg"
-            }
-          }
-        ]
-      }
-    ],
+    "model": "accounts/fireworks/models/llama-v3-7b",
+    "messages": [{"role": "user", "content": "Hello!"}],
     "temperature": 0.7,
     "max_tokens": 300,
     "stream": true
@@ -138,7 +157,6 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ### Together AI Integration
 
-#### Using cURL
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -152,28 +170,15 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     "top_p": 0.7,
     "top_k": 50,
     "repetition_penalty": 1,
-    "stop": ["<|eot_id|>", "<|eom_id|>"],
     "stream": true
   }'
 ```
 
-### AWS Bedrock Integration
-
-#### Using cURL
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-provider: bedrock" \
-  -H "x-aws-access-key-id: YOUR_ACCESS_KEY" \
-  -H "x-aws-secret-access-key: YOUR_SECRET_KEY" \
-  -H "x-aws-region: us-east-1" \
-  -d '{
-    "model": "anthropic.claude-3-sonnet-20240229-v1:0",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "temperature": 0.7,
-    "max_tokens": 1000
-  }'
-```
+Note: All provider API keys are passed securely in request headers, not environment variables. This allows for:
+- Per-request API key flexibility
+- Multiple API keys for the same provider
+- Better security through request-scoped credentials
+- No need to restart the server when changing API keys
 
 ## 🏗 Architecture
 
@@ -203,7 +208,6 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ├── providers
 │   ├── anthropic.ts
 │   ├── base.ts
-│   ├── bedrock.ts
 │   ├── factory.ts
 │   ├── fireworks.ts
 │   ├── groq.ts
@@ -283,114 +287,6 @@ const normalizeModelName = (model: string): string => {
     .replace(/[-_\s]/g, '')
     .replace(/\.(\d)/g, '$1')
     .replace(/v\d+(\.\d+)?/, '');
-};
-
-// Create normalized costs map with fallback
-const createModelCostsWithNormalized = (costs: ProviderModelCosts): ProviderModelCosts => {
-  const normalizedCosts: ProviderModelCosts = { ...costs };
-  
-  Object.entries(costs).forEach(([model, cost]) => {
-    normalizedCosts[normalizeModelName(model)] = cost;
-  });
-  
-  return normalizedCosts;
-};
-
-export const PROVIDER_COSTS = createModelCostsWithNormalized(BASE_COSTS);
-```
-
-2. Update \`src/metrics/costs/index.ts\` to include your provider:
-```typescript
-import { PROVIDER_COSTS } from './provider';
-
-export const MODEL_COSTS: Record<string, ProviderModelCosts> = {
-  // ... existing providers
-  provider: PROVIDER_COSTS
-};
-```
-
-3. Implement metrics collection in your provider:
-```typescript
-export class NewProvider implements AIProvider {
-  async chat(request: ChatRequest): Promise<ChatResponse> {
-    const metrics = new MetricsCollector(
-      requestId,
-      'POST',
-      '/v1/chat/completions',
-      'provider-name'
-    );
-    
-    try {
-      // Your implementation
-      metrics.setModel(request.model);
-      metrics.setTokenUsage({
-        inputTokens: inputCount,
-        outputTokens: outputCount
-      });
-      return response;
-    } finally {
-      metrics.finish();
-    }
-  }
-}
-```
-
-4. Add provider-specific metrics documentation in \`docs/providers/\`:
-```markdown
-# Provider Name Metrics
-
-## Token Counting
-Explain how tokens are counted for this provider.
-
-## Cost Calculation
-Document the pricing structure and how costs are calculated.
-
-## Model-Specific Details
-List any model-specific considerations for metrics.
-```
-
-### Best Practices for Metrics Implementation
-
-1. **Token Counting**
-   - Implement accurate token counting for input and output
-   - Handle streaming responses correctly
-   - Consider model-specific token calculation methods
-
-2. **Cost Calculation**
-   - Use the MILLION constant for per-token cost conversion
-   - Implement proper model name normalization
-   - Handle different pricing tiers if applicable
-   - Consider input vs output token cost differences
-
-3. **Performance Metrics**
-   - Track Time To First Byte (TTFB)
-   - Measure total request latency
-   - Count streaming chunks if applicable
-   - Track cache hits/misses
-
-4. **Error Handling**
-   - Set appropriate status codes
-   - Track failed requests
-   - Include error details in metrics
-   - Handle token counting in error cases
-
-5. **Documentation**
-   - Document pricing structure clearly
-   - Explain any provider-specific behaviors
-   - Include example metrics output
-   - Document any limitations or special cases
-
-### Custom Middleware
-
-Create custom middleware in \`src/middleware/\`:
-```typescript
-export const customMiddleware = async (
-  c: Context,
-  next: Next
-) => {
-  // Pre-processing
-  await next();
-  // Post-processing
 };
 ```
 

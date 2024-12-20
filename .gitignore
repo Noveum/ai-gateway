@@ -32,5 +32,7 @@ lerna-debug.log*
 # misc
 .DS_Store
 
+build/
+
 docs/API_EXAMPLE.md
 docs/HONO.md

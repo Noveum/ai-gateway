@@ -2,13 +2,13 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { prettyJSON } from 'hono/pretty-json';
-import { Variables, Bindings, Env } from './types';
-import { authMiddleware } from './middleware/auth';
-import { validationMiddleware } from './middleware/validation';
-import { loggingMiddleware } from './middleware/logging';
 import { handleChatCompletion } from './handlers/chat';
 import { hooksManager } from './hooks';
-import { MetricsExportManager, ElasticsearchExporter } from './metrics/exporters';
+import { ElasticsearchExporter, MetricsExportManager } from './metrics/exporters';
+import { authMiddleware } from './middleware/auth';
+import { loggingMiddleware } from './middleware/logging';
+import { validationMiddleware } from './middleware/validation';
+import { Bindings, Env, Variables } from './types';
 
 // Create the application
 const app = new Hono<{ Variables: Variables; Bindings: Bindings }>();
@@ -16,7 +16,7 @@ const app = new Hono<{ Variables: Variables; Bindings: Bindings }>();
 // Initialize metrics exporters once at startup
 const initializeMetricsExporters = (env: Env) => {
   const manager = MetricsExportManager.getInstance();
-  
+
   if (manager.isInitialized()) {
     return;
   }
@@ -117,6 +117,10 @@ app.onError((err, c) => {
   }, 500);
 });
 
+// Export the app instance for direct use
+export { app };
+
+// Export default object for Cloudflare Workers
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
