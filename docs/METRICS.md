@@ -39,13 +39,13 @@ interface RequestMetrics {
     [key: string]: any;     // Additional provider-specific metadata
   };
   location?: {
-    city: string;
-    country: string;
-    continent: string;
-    latitude: string;
-    longitude: string;
-    timezone: string;
-    region: string;
+    city: string;           // City name from Cloudflare
+    country: string;        // Country code (e.g., US, IN)
+    continent: string;      // Continent code (e.g., NA, AS)
+    latitude: string;       // Latitude of request origin
+    longitude: string;      // Longitude of request origin
+    timezone: string;       // IANA timezone (e.g., America/Los_Angeles)
+    region: string;         // Region/State name
   };
 }
 ```
@@ -75,13 +75,13 @@ interface RequestMetrics {
     "systemFingerprint": "fp_1234"
   },
   "location": {
-    "city": "San Francisco",
-    "country": "US",
-    "continent": "NA",
-    "latitude": "37.7749",
-    "longitude": "-122.4194",
-    "timezone": "America/Los_Angeles",
-    "region": "California"
+    "city": "Bengaluru",
+    "country": "IN",
+    "continent": "AS",
+    "latitude": "12.96340",
+    "longitude": "77.58550",
+    "timezone": "Asia/Kolkata",
+    "region": "Karnataka"
   },
   "model": "gpt-4",
   "status": 200,
@@ -374,3 +374,19 @@ For streaming responses, metrics are collected throughout the stream:
 - Token counts are updated with each chunk
 - Final metrics are logged when stream completes
 - Chunk count tracks total response segments 
+
+## Location Data
+
+When deployed to Cloudflare Workers, the gateway automatically collects geographic information about each request using Cloudflare's location data. This includes:
+
+- Precise city-level location
+- Country and continent codes
+- Geographic coordinates (latitude/longitude)
+- IANA timezone
+- Region/State information
+
+This data is useful for:
+- Geographic request distribution analysis
+- Latency monitoring by region
+- Usage patterns across different locations
+- Compliance and data residency tracking
