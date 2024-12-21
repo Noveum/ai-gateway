@@ -179,6 +179,7 @@ for chunk in stream:
 
 - [Deployment Guide](docs/DEPLOYMENT.md)
 - [Metrics & Monitoring](docs/METRICS.md)
+- [Load Testing Guide](tests/README.md)
 - [Contributing Guidelines](CONTRIBUTING.md)
 
 ## 📄 Contributing Opportunities
