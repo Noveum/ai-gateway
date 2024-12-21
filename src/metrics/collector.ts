@@ -44,6 +44,45 @@ export class MetricsCollector {
     this.config = config;
   }
 
+  setCloudflareContext(request: Request): void {
+    const cfData = (request as any).cf;
+    if (cfData) {
+      this.setLocation({
+        city: cfData.city as string | undefined,
+        country: cfData.country as string | undefined,
+        continent: cfData.continent as string | undefined,
+        latitude: cfData.latitude as string | undefined,
+        longitude: cfData.longitude as string | undefined,
+        timezone: cfData.timezone as string | undefined,
+        region: cfData.region as string | undefined
+      });
+      console.debug('[Metrics] Location data set from Cloudflare context');
+    }
+  }
+
+  setLocation(cf?: { 
+    city?: string;
+    country?: string;
+    continent?: string;
+    latitude?: string;
+    longitude?: string;
+    timezone?: string;
+    region?: string;
+  }) {
+    if (cf) {
+      console.debug('[Metrics] Setting Cloudflare location data:', cf);
+      this.metrics.location = {
+        city: cf.city || 'unknown',
+        country: cf.country || 'unknown',
+        continent: cf.continent || 'unknown',
+        latitude: cf.latitude || '0',
+        longitude: cf.longitude || '0',
+        timezone: cf.timezone || 'unknown',
+        region: cf.region || 'unknown'
+      };
+    }
+  }
+
   getStartTime(): number {
     return this.metrics.performance.startTime;
   }

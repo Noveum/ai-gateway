@@ -46,11 +46,16 @@ export const handleChatCompletion = async (c: Context<{ Variables: Variables; Bi
     // Get provider instance
     providerInstance = ProviderFactory.getProvider(provider, config);
     console.debug('[ChatCompletion] Initialized provider');
-
     // Make the request to the provider
     console.debug('[ChatCompletion] Processing request');
     const response = await providerInstance.chatCompletion(request);
     console.debug('[ChatCompletion] Request processed');
+
+    // Set Cloudflare context data if available
+    const metricsCollector = providerInstance?.getMetricsCollector();
+    if (metricsCollector) {
+      metricsCollector.setCloudflareContext(c.req.raw);
+    }
 
     // Transform response through hooks
     const transformedResponse = await hooksManager.transformResponse(response, c);

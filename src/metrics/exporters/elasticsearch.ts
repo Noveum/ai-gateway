@@ -80,7 +80,16 @@ export class ElasticsearchExporter extends BaseExporter {
         inputCost: 0,
         outputCost: 0,
         totalCost: 0
-      }
+      },
+      location: metrics.location ? {
+        city: metrics.location.city,
+        country: metrics.location.country,
+        continent: metrics.location.continent,
+        latitude: metrics.location.latitude,
+        longitude: metrics.location.longitude,
+        timezone: metrics.location.timezone,
+        region: metrics.location.region
+      } : undefined
     };
 
     const url = `${this.url}/${this.index}/_doc/${metrics.requestId}?pretty`;
