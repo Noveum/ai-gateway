@@ -9,6 +9,7 @@ export interface AIProvider {
   transformResponse(response: any, request: ChatCompletionRequest): Promise<any>;
   extractMetrics?(response: any): { tokens?: any, performance?: any, metadata?: any } | null;
   getMetricsCollector(): MetricsCollector | undefined;
+  setLocation(location: any): void;
 }
 
 export abstract class BaseProvider implements AIProvider {
@@ -208,5 +209,11 @@ export abstract class BaseProvider implements AIProvider {
 
   getMetricsCollector(): MetricsCollector | undefined {
     return this.metricsCollector;
+  }
+
+  setLocation(location: any): void {
+    if (this.metricsCollector) {
+      this.metricsCollector.setLocation(location);
+    }
   }
 } 

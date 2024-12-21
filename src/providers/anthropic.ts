@@ -1,5 +1,6 @@
 import { BaseProvider } from './base';
 import { ChatCompletionRequest } from '../types';
+import { ANTHROPIC_COSTS } from '../metrics/costs/anthropic';
 
 interface AnthropicResponse {
   content: Array<{ text: string }>;
@@ -178,6 +179,15 @@ export class AnthropicProvider extends BaseProvider {
     try {
       this.validateConfig();
       const requestBody = await this.transformRequest(request);
+      
+      // Set token costs based on model
+      const modelName = request.model.toLowerCase().replace(/-\d{8}$/, ''); // Remove date suffix
+      const costs = ANTHROPIC_COSTS[modelName];
+      if (costs) {
+        this.config.inputTokenCost = costs.inputTokenCost;
+        this.config.outputTokenCost = costs.outputTokenCost;
+      }
+      
       const metrics = this.initializeMetrics(request);
 
       const response = await fetch(this.ANTHROPIC_API_URL, {
@@ -208,14 +218,14 @@ export class AnthropicProvider extends BaseProvider {
   extractMetrics(data: any) {
     if (!data) return null;
 
-    // Handle message_start event
+    // Handle streaming message_start event
     if (data.type === 'message_start') {
       return {
-        tokens: data.message.usage ? {
-          inputTokens: data.message.usage.input_tokens,
-          outputTokens: 0, // Will be updated in subsequent chunks
-          totalTokens: data.message.usage.input_tokens
-        } : undefined,
+        tokens: {
+          inputTokens: data.message.usage?.input_tokens || 0,
+          outputTokens: 0,
+          totalTokens: data.message.usage?.input_tokens || 0
+        },
         metadata: {
           messageId: data.message.id,
           model: data.message.model
@@ -223,29 +233,31 @@ export class AnthropicProvider extends BaseProvider {
       };
     }
 
-    // Handle message_delta event
-    if (data.type === 'message_delta') {
+    // Handle streaming message_delta event with usage info
+    if (data.type === 'message_delta' && data.usage) {
       return {
-        tokens: data.usage ? {
-          outputTokens: data.usage.output_tokens
-        } : undefined,
+        tokens: {
+          outputTokens: data.usage.output_tokens || 0,
+          totalTokens: (data.usage.input_tokens || 0) + (data.usage.output_tokens || 0)
+        },
         metadata: {
           stopReason: data.delta.stop_reason
         }
       };
     }
 
-    // Handle regular response
-    if (data.id && data.usage) {
+    // Handle non-streaming response
+    if (data.usage) {
       return {
         tokens: {
-          inputTokens: data.usage.prompt_tokens,
-          outputTokens: data.usage.completion_tokens,
-          totalTokens: data.usage.total_tokens
+          inputTokens: data.usage.input_tokens || 0,
+          outputTokens: data.usage.output_tokens || 0,
+          totalTokens: (data.usage.input_tokens || 0) + (data.usage.output_tokens || 0)
         },
         metadata: {
           messageId: data.id,
-          model: data.model
+          model: data.model,
+          stopReason: data.stop_reason
         }
       };
     }

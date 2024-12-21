@@ -38,6 +38,15 @@ interface RequestMetrics {
     streamComplete?: boolean; // Whether stream completed successfully
     [key: string]: any;     // Additional provider-specific metadata
   };
+  location?: {
+    city: string;
+    country: string;
+    continent: string;
+    latitude: string;
+    longitude: string;
+    timezone: string;
+    region: string;
+  };
 }
 ```
 
@@ -64,6 +73,15 @@ interface RequestMetrics {
     "totalChunks": 15,
     "streamComplete": true,
     "systemFingerprint": "fp_1234"
+  },
+  "location": {
+    "city": "San Francisco",
+    "country": "US",
+    "continent": "NA",
+    "latitude": "37.7749",
+    "longitude": "-122.4194",
+    "timezone": "America/Los_Angeles",
+    "region": "California"
   },
   "model": "gpt-4",
   "status": 200,
@@ -107,6 +125,15 @@ interface RequestMetrics {
     "streamComplete": true,
     "messageId": "msg_123"
   },
+  "location": {
+    "city": "San Francisco",
+    "country": "US",
+    "continent": "NA",
+    "latitude": "37.7749",
+    "longitude": "-122.4194",
+    "timezone": "America/Los_Angeles",
+    "region": "California"
+  },
   "model": "claude-3-sonnet-20240229-v1:0",
   "status": 200,
   "tokens": {
@@ -139,6 +166,15 @@ interface RequestMetrics {
     "streamComplete": true,
     "seed": 9180670685818186000
   },
+  "location": {
+    "city": "San Francisco",
+    "country": "US",
+    "continent": "NA",
+    "latitude": "37.7749",
+    "longitude": "-122.4194",
+    "timezone": "America/Los_Angeles",
+    "region": "California"
+  },
   "model": "meta-llama/Llama-2-7b-chat-hf",
   "status": 200,
   "tokens": {
@@ -169,6 +205,15 @@ interface RequestMetrics {
     "estimated": false,
     "totalChunks": 76,
     "streamComplete": true
+  },
+  "location": {
+    "city": "San Francisco",
+    "country": "US",
+    "continent": "NA",
+    "latitude": "37.7749",
+    "longitude": "-122.4194",
+    "timezone": "America/Los_Angeles",
+    "region": "California"
   },
   "model": "llama-3.1-8b-instant",
   "status": 200,
@@ -205,6 +250,15 @@ interface RequestMetrics {
     "estimated": false,
     "totalChunks": 24,
     "streamComplete": true
+  },
+  "location": {
+    "city": "San Francisco",
+    "country": "US",
+    "continent": "NA",
+    "latitude": "37.7749",
+    "longitude": "-122.4194",
+    "timezone": "America/Los_Angeles",
+    "region": "California"
   },
   "model": "accounts/fireworks/models/llama-v3p2-11b-vision-instruct",
   "status": 200,

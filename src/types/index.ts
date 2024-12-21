@@ -167,4 +167,13 @@ export type RequestMetrics = {
     streamComplete?: boolean;
     [key: string]: any;
   };
+  location?: {
+    city: string;
+    country: string;
+    continent: string;
+    latitude: string;
+    longitude: string;
+    timezone: string;
+    region: string;
+  };
 }; 
