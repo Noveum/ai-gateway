@@ -168,6 +168,11 @@ export default function() {
 }
 
 export function handleSummary(data) {
+  // Helper function to safely get metric values
+  const getMetricValue = (metric, property, defaultValue = 0) => {
+    return metric?.values?.[property] ?? defaultValue;
+  };
+
   // Only show cloud URL and region info for cloud runs
   if (IS_CLOUD) {
     const cloudURL = `https://app.k6.io/runs/${__ENV.K6_CLOUD_RUN_ID}`;
@@ -179,33 +184,33 @@ export function handleSummary(data) {
     console.log('===========================================\n');
   }
 
-  const noveumFaster = data.metrics.noveum_faster.values.count || 0;
-  const groqFaster = data.metrics.groq_faster.values.count || 0;
+  const noveumFaster = getMetricValue(data.metrics.noveum_faster, 'count');
+  const groqFaster = getMetricValue(data.metrics.groq_faster, 'count');
   
   // Calculate additional statistics
-  const noveumAvg = data.metrics.noveum_latency.values.avg;
-  const groqAvg = data.metrics.groq_latency.values.avg;
+  const noveumAvg = getMetricValue(data.metrics.noveum_latency, 'avg');
+  const groqAvg = getMetricValue(data.metrics.groq_latency, 'avg');
   const avgDiff = Math.abs(noveumAvg - groqAvg);
-  const avgDiffPercent = (avgDiff / Math.min(noveumAvg, groqAvg)) * 100;
+  const avgDiffPercent = noveumAvg && groqAvg ? (avgDiff / Math.min(noveumAvg, groqAvg)) * 100 : 0;
   
-  const noveumSuccessRate = data.metrics.noveum_success_rate.values.rate * 100;
-  const groqSuccessRate = data.metrics.groq_success_rate.values.rate * 100;
+  const noveumSuccessRate = getMetricValue(data.metrics.noveum_success_rate, 'rate', 1) * 100;
+  const groqSuccessRate = getMetricValue(data.metrics.groq_success_rate, 'rate', 1) * 100;
   
   // Format numbers for better readability
-  const formatMs = (num) => `${num.toFixed(2)}ms`;
-  const formatPercent = (num) => `${num.toFixed(2)}%`;
+  const formatMs = (num) => num ? `${num.toFixed(2)}ms` : 'N/A';
+  const formatPercent = (num) => num ? `${num.toFixed(2)}%` : 'N/A';
   
   // Determine performance characteristics
   const fasterService = noveumAvg < groqAvg ? 'Noveum Gateway' : 'Direct Groq';
   const slowerService = noveumAvg < groqAvg ? 'Direct Groq' : 'Noveum Gateway';
   const consistencyWinner = 
-    data.metrics.noveum_latency.values.std < data.metrics.groq_latency.values.std
+    getMetricValue(data.metrics.noveum_latency, 'std') < getMetricValue(data.metrics.groq_latency, 'std')
       ? 'Noveum Gateway'
       : 'Direct Groq';
   
   // Add rate limit statistics
-  const noveumRateLimits = data.metrics.noveum_rate_limits?.values.count || 0;
-  const groqRateLimits = data.metrics.groq_rate_limits?.values.count || 0;
+  const noveumRateLimits = getMetricValue(data.metrics.noveum_rate_limits, 'count');
+  const groqRateLimits = getMetricValue(data.metrics.groq_rate_limits, 'count');
   
   return {
     'stdout': JSON.stringify({
@@ -218,35 +223,35 @@ export function handleSummary(data) {
       'Noveum Gateway Performance': {
         'Latency Statistics': {
           'Average': formatMs(noveumAvg),
-          'Median': formatMs(data.metrics.noveum_latency.values.med),
-          'Min': formatMs(data.metrics.noveum_latency.values.min),
-          'Max': formatMs(data.metrics.noveum_latency.values.max),
-          '95th Percentile': formatMs(data.metrics.noveum_latency.values['p(95)']),
-          'Standard Deviation': formatMs(data.metrics.noveum_latency.values.std)
+          'Median': formatMs(getMetricValue(data.metrics.noveum_latency, 'med')),
+          'Min': formatMs(getMetricValue(data.metrics.noveum_latency, 'min')),
+          'Max': formatMs(getMetricValue(data.metrics.noveum_latency, 'max')),
+          '95th Percentile': formatMs(getMetricValue(data.metrics.noveum_latency, 'p(95)')),
+          'Standard Deviation': formatMs(getMetricValue(data.metrics.noveum_latency, 'std'))
         },
         'Success Rate': formatPercent(noveumSuccessRate),
         'Times Faster': noveumFaster,
-        'Win Rate': formatPercent((noveumFaster / options.iterations) * 100),
+        'Win Rate': formatPercent((noveumFaster / (options.iterations || 1)) * 100),
         'Rate Limits': {
           'Count': noveumRateLimits,
-          'Rate': formatPercent((noveumRateLimits / options.iterations) * 100)
+          'Rate': formatPercent((noveumRateLimits / (options.iterations || 1)) * 100)
         }
       },
       'Direct Groq Performance': {
         'Latency Statistics': {
           'Average': formatMs(groqAvg),
-          'Median': formatMs(data.metrics.groq_latency.values.med),
-          'Min': formatMs(data.metrics.groq_latency.values.min),
-          'Max': formatMs(data.metrics.groq_latency.values.max),
-          '95th Percentile': formatMs(data.metrics.groq_latency.values['p(95)']),
-          'Standard Deviation': formatMs(data.metrics.groq_latency.values.std)
+          'Median': formatMs(getMetricValue(data.metrics.groq_latency, 'med')),
+          'Min': formatMs(getMetricValue(data.metrics.groq_latency, 'min')),
+          'Max': formatMs(getMetricValue(data.metrics.groq_latency, 'max')),
+          '95th Percentile': formatMs(getMetricValue(data.metrics.groq_latency, 'p(95)')),
+          'Standard Deviation': formatMs(getMetricValue(data.metrics.groq_latency, 'std'))
         },
         'Success Rate': formatPercent(groqSuccessRate),
         'Times Faster': groqFaster,
-        'Win Rate': formatPercent((groqFaster / options.iterations) * 100),
+        'Win Rate': formatPercent((groqFaster / (options.iterations || 1)) * 100),
         'Rate Limits': {
           'Count': groqRateLimits,
-          'Rate': formatPercent((groqRateLimits / options.iterations) * 100)
+          'Rate': formatPercent((groqRateLimits / (options.iterations || 1)) * 100)
         }
       },
       'Comparative Analysis': {
@@ -277,8 +282,8 @@ export function handleSummary(data) {
         noveumSuccessRate < 95 ? '⚠️ Noveum Gateway success rate is below 95% threshold' : '✅ Noveum Gateway success rate is good',
         groqSuccessRate < 95 ? '⚠️ Direct Groq success rate is below 95% threshold' : '✅ Direct Groq success rate is good',
         avgDiffPercent > 20 ? `⚠️ Large performance gap (${formatPercent(avgDiffPercent)}) between services` : '✅ Performance difference is within acceptable range',
-        data.metrics.noveum_latency.values['p(95)'] > 2000 ? '⚠️ Noveum Gateway 95th percentile latency exceeds 2s' : '✅ Noveum Gateway latency is within limits',
-        data.metrics.groq_latency.values['p(95)'] > 2000 ? '⚠️ Direct Groq 95th percentile latency exceeds 2s' : '✅ Direct Groq latency is within limits',
+        getMetricValue(data.metrics.noveum_latency, 'p(95)') > 2000 ? '⚠️ Noveum Gateway 95th percentile latency exceeds 2s' : '✅ Noveum Gateway latency is within limits',
+        getMetricValue(data.metrics.groq_latency, 'p(95)') > 2000 ? '⚠️ Direct Groq 95th percentile latency exceeds 2s' : '✅ Direct Groq latency is within limits',
         noveumRateLimits > 0 ? `⚠️ Noveum Gateway hit rate limits ${noveumRateLimits} times` : '✅ Noveum Gateway had no rate limits',
         groqRateLimits > 0 ? `⚠️ Direct Groq hit rate limits ${groqRateLimits} times` : '✅ Direct Groq had no rate limits',
       ]
