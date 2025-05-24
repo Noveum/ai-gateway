@@ -12,6 +12,242 @@ use std::time::Duration;
 use tracing::{debug, error, warn};
 use bytes::Bytes;
 
+/// Model mapping utilities for Azure OpenAI
+mod model_mapping {
+    use tracing::debug;
+
+    /// Map Azure deployment ID to actual model name
+    pub fn map_deployment_to_model(deployment_id: &str, response_model: Option<&str>) -> String {
+        debug!("Mapping Azure deployment '{}' to model name, response_model={:?}", deployment_id, response_model);
+        
+        // If the response includes a model name, use that (most accurate)
+        if let Some(model) = response_model {
+            debug!("Using model name from response: {}", model);
+            return model.to_string();
+        }
+        
+        // Otherwise, try to infer from deployment ID patterns
+        let deployment_lower = deployment_id.to_lowercase();
+        debug!("Deployment ID: {}", deployment_lower);
+        
+        let mapped_model = match deployment_lower.as_str() {
+            // O3 models (latest reasoning models from 2025)
+            d if d.contains("o3-mini") => "o3-mini",
+            d if d.contains("o3") => "o3",
+            
+            // O4 models (newer reasoning models)
+            d if d.contains("o4-mini") => "o4-mini",
+            d if d.contains("o4") => "o4",
+            
+            // O1 models (reasoning models)
+            d if d.contains("o1-preview") => "o1-preview",
+            d if d.contains("o1-mini") => "o1-mini",
+            d if d.contains("o1") => "o1-preview",
+            
+            // GPT-4.1 series (2025 models)
+            d if d.contains("gpt-4.1-nano") || d.contains("gpt-41-nano") => "gpt-4.1-nano",
+            d if d.contains("gpt-4.1-mini") || d.contains("gpt-41-mini") => "gpt-4.1-mini",
+            d if d.contains("gpt-4.1") || d.contains("gpt-41") => "gpt-4.1",
+            
+            // GPT-4.5 models
+            d if d.contains("gpt-4.5") || d.contains("gpt-45") => "gpt-4.5-preview",
+            
+            // GPT-4o models
+            d if d.contains("gpt-4o-realtime") => "gpt-4o-realtime-preview",
+            d if d.contains("gpt-4o-audio") => "gpt-4o-audio-preview",
+            d if d.contains("gpt-4o-mini") => "gpt-4o-mini",
+            d if d.contains("gpt-4o") => "gpt-4o",
+            
+            // GPT-4 Turbo models
+            d if d.contains("gpt-4-turbo") || d.contains("gpt4-turbo") || d.contains("gpt-4-1106") || d.contains("gpt-4-0125") => "gpt-4-turbo",
+            
+            // GPT-4 Vision models
+            d if d.contains("gpt-4-vision") || d.contains("gpt4-vision") || d.contains("gpt-4v") => "gpt-4-vision-preview",
+            
+            // GPT-4 32k models
+            d if d.contains("gpt-4-32k") || d.contains("gpt4-32k") => "gpt-4-32k",
+            
+            // Standard GPT-4 models
+            d if d.contains("gpt-4") || d.contains("gpt4") => "gpt-4",
+            
+            // GPT-3.5 Turbo variants
+            d if d.contains("gpt-35-turbo-16k") || d.contains("gpt-3.5-turbo-16k") || d.contains("gpt35-turbo-16k") => "gpt-3.5-turbo-16k",
+            d if d.contains("gpt-35-turbo-instruct") || d.contains("gpt-3.5-turbo-instruct") => "gpt-3.5-turbo-instruct",
+            d if d.contains("gpt-35-turbo") || d.contains("gpt-3.5-turbo") || d.contains("gpt35-turbo") => "gpt-3.5-turbo",
+            
+            // Embedding models
+            d if d.contains("text-embedding-ada-002") || d.contains("ada-002") => "text-embedding-ada-002",
+            d if d.contains("text-embedding-3-small") || d.contains("embedding-3-small") => "text-embedding-3-small",
+            d if d.contains("text-embedding-3-large") || d.contains("embedding-3-large") => "text-embedding-3-large",
+            d if d.contains("text-embedding") || d.contains("embedding") => "text-embedding-ada-002",
+            
+            // DALL-E models
+            d if d.contains("dall-e-3") || d.contains("dalle-3") => "dall-e-3",
+            d if d.contains("dall-e-2") || d.contains("dalle-2") => "dall-e-2",
+            d if d.contains("dall-e") || d.contains("dalle") => "dall-e-3",
+            
+            // Whisper models
+            d if d.contains("whisper-1") || d.contains("whisper") => "whisper-1",
+            
+            // Fallback: use deployment ID itself
+            _ => {
+                debug!("No model mapping found for deployment '{}', using deployment ID as model name", deployment_id);
+                deployment_id
+            }
+        };
+        
+        let result = mapped_model.to_string();
+        debug!("Mapped deployment '{}' to model '{}'", deployment_id, result);
+        result
+    }
+
+    /// Check if model requires parameter transformation (max_tokens -> max_completion_tokens)
+    pub fn model_requires_transformation(model: &str) -> bool {
+        matches!(model, 
+            "o1" | "o1-preview" | "o1-mini" |
+            "o3" | "o3-mini" |
+            "o4" | "o4-mini" |
+            "gpt-4.1" | "gpt-4.1-nano" | "gpt-4.1-mini" |
+            "gpt-4.5-preview"
+        ) || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") || model.contains("o4-mini")
+    }
+}
+
+/// Pricing utilities for Azure OpenAI
+mod pricing {
+    use tracing::debug;
+
+    /// Get pricing information for a model (input_cost_per_1k, output_cost_per_1k)
+    pub fn get_model_pricing(model: &str) -> (f64, f64) {
+        match model {
+            // O3 models (latest reasoning models from 2025) - Estimated pricing
+            "o3" => (0.02, 0.08),
+            "o3-mini" => (0.008, 0.032),
+            
+            // O4 models - Estimated pricing
+            "o4" => (0.015, 0.06),
+            "o4-mini" | "o4-mini-2025-04-16" => (0.004, 0.016),
+            d if d.starts_with("o4-mini") => (0.004, 0.016),
+            
+            // O1 models - Higher cost due to reasoning capability
+            "o1-preview" => (0.015, 0.06),
+            "o1-mini" => (0.003, 0.012),
+            
+            // GPT-4.1 series - Estimated pricing
+            "gpt-4.1" => (0.012, 0.036),
+            "gpt-4.1-mini" => (0.0008, 0.0024),
+            "gpt-4.1-nano" => (0.0002, 0.0006),
+            
+            // GPT-4.5 models
+            "gpt-4.5-preview" => (0.015, 0.045),
+            
+            // GPT-4o models
+            "gpt-4o" | "gpt-4o-2024-11-20" | "gpt-4o-2024-08-06" | "gpt-4o-2024-05-13" => (0.005, 0.015),
+            "gpt-4o-mini" | "gpt-4o-mini-2024-07-18" => (0.0004, 0.0016),
+            "gpt-4o-realtime-preview" => (0.01, 0.03),
+            "gpt-4o-audio-preview" => (0.008, 0.024),
+            
+            // GPT-4 Turbo models
+            "gpt-4-turbo" | "gpt-4-turbo-2024-04-09" | "gpt-4-turbo-preview" | 
+            "gpt-4-0125-preview" | "gpt-4-1106-preview" => (0.01, 0.03),
+            
+            // GPT-4 Vision models
+            "gpt-4-vision-preview" | "gpt-4v" => (0.01, 0.03),
+            
+            // GPT-4 32K models
+            "gpt-4-32k" | "gpt-4-32k-0314" | "gpt-4-32k-0613" => (0.06, 0.12),
+            
+            // Standard GPT-4 models
+            "gpt-4" | "gpt-4-0314" | "gpt-4-0613" => (0.03, 0.06),
+            
+            // GPT-3.5 Turbo variants
+            "gpt-35-turbo-16k" | "gpt-3.5-turbo-16k" | 
+            "gpt-35-turbo-16k-0613" | "gpt-3.5-turbo-16k-0613" => (0.003, 0.004),
+            "gpt-35-turbo-instruct" | "gpt-3.5-turbo-instruct" => (0.0015, 0.002),
+            "gpt-35-turbo" | "gpt-3.5-turbo" | "gpt-35-turbo-0301" | 
+            "gpt-3.5-turbo-0613" | "gpt-35-turbo-1106" | "gpt-3.5-turbo-1106" => (0.0015, 0.002),
+            
+            // Embedding models (input only)
+            "text-embedding-ada-002" => (0.0001, 0.0),
+            "text-embedding-3-small" => (0.00002, 0.0),
+            "text-embedding-3-large" => (0.00013, 0.0),
+            
+            // DALL-E models (approximate per generation)
+            "dall-e-3" => (0.04, 0.0),
+            "dall-e-2" => (0.02, 0.0),
+            
+            // Whisper models (per minute, approximated)
+            "whisper-1" => (0.006, 0.0),
+            
+            // Unknown models
+            _ => {
+                debug!("Unknown model '{}' for Azure cost calculation, returning $0", model);
+                (0.0, 0.0)
+            }
+        }
+    }
+
+    /// Calculate cost based on model and token usage
+    pub fn calculate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
+        let (input_cost_per_1k, output_cost_per_1k) = get_model_pricing(model);
+        
+        let input_cost = (input_tokens as f64 / 1000.0) * input_cost_per_1k;
+        let output_cost = (output_tokens as f64 / 1000.0) * output_cost_per_1k;
+        let total_cost = input_cost + output_cost;
+        
+        debug!(
+            "Azure cost calculation for model '{}': {} input tokens (${:.6}), {} output tokens (${:.6}), total: ${:.6}",
+            model, input_tokens, input_cost, output_tokens, output_cost, total_cost
+        );
+        
+        total_cost
+    }
+}
+
+/// Azure resource validation utilities
+mod validation {
+    use crate::error::AppError;
+
+    /// Validate Azure resource name format
+    pub fn validate_resource_name(resource_name: &str) -> Result<(), AppError> {
+        if resource_name.is_empty() {
+            return Err(AppError::RequestError(
+                "Azure resource name is required. Provide 'x-azure-resource-name' header or set AZURE_OPENAI_RESOURCE_NAME environment variable.".to_string()
+            ));
+        }
+
+        if resource_name.len() < 3 || resource_name.len() > 24 {
+            return Err(AppError::RequestError(
+                format!("Azure resource name '{}' must be between 3 and 24 characters", resource_name)
+            ));
+        }
+        
+        if !resource_name.chars().all(|c| c.is_alphanumeric() || c == '-') {
+            return Err(AppError::RequestError(
+                format!("Azure resource name '{}' can only contain alphanumeric characters and hyphens", resource_name)
+            ));
+        }
+        
+        if resource_name.starts_with('-') || resource_name.ends_with('-') {
+            return Err(AppError::RequestError(
+                format!("Azure resource name '{}' cannot start or end with a hyphen", resource_name)
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate Azure deployment ID
+    pub fn validate_deployment_id(deployment_id: &str) -> Result<(), AppError> {
+        if deployment_id.is_empty() {
+            return Err(AppError::RequestError(
+                "Azure deployment ID is required. The 'model' field must be provided in the request body.".to_string()
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for Azure OpenAI provider
 /// 
 /// Centralizes all Azure OpenAI-specific configuration with validation
@@ -203,7 +439,7 @@ impl AzureOpenAIProvider {
     /// Extract Azure resource name from headers with fallback to default
     ///
     /// Looks for 'x-azure-resource-name' header first, then falls back to the configured default
-    fn extract_resource_name(&self, headers: &HeaderMap) -> String {
+    pub fn extract_resource_name(&self, headers: &HeaderMap) -> String {
         headers
             .get("x-azure-resource-name")
             .and_then(|h| h.to_str().ok())
@@ -214,7 +450,7 @@ impl AzureOpenAIProvider {
     /// Extract Azure deployment ID from headers with fallback to default
     ///
     /// Looks for 'x-azure-deployment-id' header first, then falls back to the configured default
-    fn extract_deployment_id(&self, headers: &HeaderMap) -> String {
+    pub fn extract_deployment_id(&self, headers: &HeaderMap) -> String {
         headers
             .get("x-azure-deployment-id")
             .and_then(|h| h.to_str().ok())
@@ -225,7 +461,7 @@ impl AzureOpenAIProvider {
     /// Extract Azure API version from headers with fallback to default
     ///
     /// Looks for 'x-azure-api-version' header first, then falls back to the configured default
-    fn extract_api_version(&self, headers: &HeaderMap) -> String {
+    pub fn extract_api_version(&self, headers: &HeaderMap) -> String {
         headers
             .get("x-azure-api-version")
             .and_then(|h| h.to_str().ok())
@@ -238,44 +474,9 @@ impl AzureOpenAIProvider {
     /// Ensures that required Azure parameters are not empty and meet basic requirements.
     /// This validation happens when headers are processed, not during provider creation.
     /// By this point, deployment_id should have been extracted from the request body.
-    fn validate_azure_parameters(&self, resource_name: &str, deployment_id: &str) -> Result<(), AppError> {
-        // Validate resource name
-        if resource_name.is_empty() {
-            error!("Azure resource name is required but not provided in headers or environment");
-            return Err(AppError::RequestError(
-                "Azure resource name is required. Provide 'x-azure-resource-name' header or set AZURE_OPENAI_RESOURCE_NAME environment variable.".to_string()
-            ));
-        }
-
-        // Validate deployment ID - this should have been extracted from request body by now
-        if deployment_id.is_empty() {
-            error!("Azure deployment ID is required but not extracted from request body");
-            return Err(AppError::RequestError(
-                "Azure deployment ID is required. The 'model' field must be provided in the request body.".to_string()
-            ));
-        }
-
-        // Validate resource name format (basic Azure naming rules)
-        if resource_name.len() < 3 || resource_name.len() > 24 {
-            return Err(AppError::RequestError(
-                format!("Azure resource name '{}' must be between 3 and 24 characters", resource_name)
-            ));
-        }
-        
-        // Azure resource names should be alphanumeric with hyphens
-        if !resource_name.chars().all(|c| c.is_alphanumeric() || c == '-') {
-            return Err(AppError::RequestError(
-                format!("Azure resource name '{}' can only contain alphanumeric characters and hyphens", resource_name)
-            ));
-        }
-        
-        // Should not start or end with hyphen
-        if resource_name.starts_with('-') || resource_name.ends_with('-') {
-            return Err(AppError::RequestError(
-                format!("Azure resource name '{}' cannot start or end with a hyphen", resource_name)
-            ));
-        }
-
+    pub fn validate_azure_parameters(&self, resource_name: &str, deployment_id: &str) -> Result<(), AppError> {
+        validation::validate_resource_name(resource_name)?;
+        validation::validate_deployment_id(deployment_id)?;
         debug!("Azure parameters validated successfully: resource={}, deployment={}", resource_name, deployment_id);
         Ok(())
     }
@@ -284,7 +485,7 @@ impl AzureOpenAIProvider {
     ///
     /// Returns a tuple containing (resource_name, deployment_id, api_version)
     /// Uses the individual extraction methods for better modularity
-    fn extract_azure_headers(&self, headers: &HeaderMap) -> (String, String, String) {
+    pub fn extract_azure_headers(&self, headers: &HeaderMap) -> (String, String, String) {
         let resource_name = self.extract_resource_name(headers);
         let deployment_id = self.extract_deployment_id(headers);
         let api_version = self.extract_api_version(headers);
@@ -300,39 +501,29 @@ impl AzureOpenAIProvider {
     /// Map OpenAI-style paths to Azure OpenAI endpoints
     ///
     /// Converts standard OpenAI API paths to Azure OpenAI deployment-specific endpoints
-    fn get_endpoint_path(&self, path: &str) -> Result<&'static str, AppError> {
-        if path.contains("chat/completions") || path.ends_with("chat/completions") {
-            Ok("chat/completions")
-        } else if path.contains("completions") || path.ends_with("completions") {
-            Ok("completions")
-        } else if path.contains("embeddings") || path.ends_with("embeddings") {
-            Ok("embeddings")
-        } else if path.contains("audio/transcriptions") || path.ends_with("audio/transcriptions") {
-            Ok("audio/transcriptions")
-        } else if path.contains("audio/translations") || path.ends_with("audio/translations") {
-            Ok("audio/translations")
-        } else if path.contains("images/generations") || path.ends_with("images/generations") {
-            Ok("images/generations")
-        } else {
-            // Default to chat/completions for Azure OpenAI (most common use case)
-            debug!("Unknown path '{}', defaulting to chat/completions", path);
-            Ok("chat/completions")
-        }
+    pub fn get_endpoint_path(&self, path: &str) -> Result<&'static str, AppError> {
+        let endpoint = match path {
+            p if p.contains("chat/completions") || p.ends_with("chat/completions") => "chat/completions",
+            p if p.contains("completions") || p.ends_with("completions") => "completions",
+            p if p.contains("embeddings") || p.ends_with("embeddings") => "embeddings",
+            p if p.contains("audio/transcriptions") || p.ends_with("audio/transcriptions") => "audio/transcriptions",
+            p if p.contains("audio/translations") || p.ends_with("audio/translations") => "audio/translations",
+            p if p.contains("images/generations") || p.ends_with("images/generations") => "images/generations",
+            _ => {
+                debug!("Unknown path '{}', defaulting to chat/completions", path);
+                "chat/completions"
+            }
+        };
+        Ok(endpoint)
     }
 
     /// Construct Azure OpenAI API URL using reqwest::Url for proper validation
     ///
     /// Format: https://{resource}.openai.azure.com/openai/deployments/{deployment}/{endpoint}?api-version={version}
-    fn build_azure_url(&self, resource_name: &str, deployment_id: &str, api_version: &str, path: &str) -> Result<Url, AppError> {
+    pub fn build_azure_url(&self, resource_name: &str, deployment_id: &str, api_version: &str, path: &str) -> Result<Url, AppError> {
         // Validate input parameters
-        if resource_name.is_empty() {
-            return Err(AppError::RequestError("Resource name cannot be empty".to_string()));
-        }
-        if deployment_id.is_empty() {
-            return Err(AppError::RequestError("Deployment ID cannot be empty".to_string()));
-        }
-        if api_version.is_empty() {
-            return Err(AppError::RequestError("API version cannot be empty".to_string()));
+        if resource_name.is_empty() || deployment_id.is_empty() || api_version.is_empty() {
+            return Err(AppError::RequestError("All Azure parameters (resource, deployment, API version) are required".to_string()));
         }
 
         // Get the appropriate endpoint for the given path
@@ -351,8 +542,7 @@ impl AzureOpenAIProvider {
         url.set_path(&full_path);
 
         // Add API version query parameter
-        url.query_pairs_mut()
-            .append_pair("api-version", api_version);
+        url.query_pairs_mut().append_pair("api-version", api_version);
 
         debug!("Constructed Azure OpenAI URL: {}", url);
         Ok(url)
@@ -362,28 +552,57 @@ impl AzureOpenAIProvider {
     /// 
     /// Azure OpenAI uses the model name from the request body as the deployment name
     /// This allows for a cleaner API where users only specify the model they want
-    fn extract_model_from_body(&self, body_bytes: &Bytes) -> Option<String> {
-        // Parse the JSON body to extract the model field
+    pub fn extract_model_from_body(&self, body_bytes: &Bytes) -> Option<String> {
         debug!("Attempting to extract model from request body, body size: {} bytes", body_bytes.len());
         
-        if let Ok(body_str) = std::str::from_utf8(body_bytes) {
-            debug!("Request body as string: {}", body_str);
-            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(body_str) {
-                debug!("Successfully parsed JSON body");
-                if let Some(model) = json_value.get("model").and_then(|m| m.as_str()) {
-                    debug!("Extracted model from request body: {}", model);
-                    return Some(model.to_string());
-                } else {
-                    debug!("No 'model' field found in JSON body");
-                }
-            } else {
-                debug!("Failed to parse request body as JSON");
-            }
+        let body_str = std::str::from_utf8(body_bytes).ok()?;
+        let json_value: serde_json::Value = serde_json::from_str(body_str).ok()?;
+        
+        if let Some(model) = json_value.get("model").and_then(|m| m.as_str()) {
+            debug!("Extracted model from request body: {}", model);
+            Some(model.to_string())
         } else {
-            debug!("Failed to convert request body to UTF-8 string");
+            debug!("No 'model' field found in JSON body");
+            None
         }
-        debug!("Could not extract model from request body");
-        None
+    }
+
+    /// Transform request body for Azure OpenAI compatibility
+    /// 
+    /// Newer models (o1, o3, o4, etc.) require max_completion_tokens instead of max_tokens
+    fn transform_request_body(&self, body_bytes: &Bytes, model: &str) -> Result<Bytes, AppError> {
+        if !model_mapping::model_requires_transformation(model) {
+            debug!("Model '{}' does not require parameter transformation", model);
+            return Ok(body_bytes.clone());
+        }
+        
+        debug!("Transforming request body for model '{}' - replacing max_tokens with max_completion_tokens", model);
+        
+        // Parse and transform the JSON
+        let body_str = std::str::from_utf8(body_bytes)
+            .map_err(|e| AppError::RequestError(format!("Invalid UTF-8 in request body: {}", e)))?;
+            
+        let mut json_value: serde_json::Value = serde_json::from_str(body_str)
+            .map_err(|e| AppError::RequestError(format!("Invalid JSON in request body: {}", e)))?;
+        
+        // Transform max_tokens to max_completion_tokens if present
+        if let Some(max_tokens) = json_value.get("max_tokens") {
+            debug!("Found max_tokens parameter, converting to max_completion_tokens for model '{}'", model);
+            let max_tokens_value = max_tokens.clone();
+            
+            if let Some(obj) = json_value.as_object_mut() {
+                obj.remove("max_tokens");
+                obj.insert("max_completion_tokens".to_string(), max_tokens_value);
+                debug!("Successfully transformed max_tokens to max_completion_tokens");
+            }
+        }
+        
+        // Convert back to bytes
+        let transformed_body = serde_json::to_string(&json_value)
+            .map_err(|e| AppError::RequestError(format!("Failed to serialize transformed JSON: {}", e)))?;
+            
+        debug!("Transformed request body: {}", transformed_body);
+        Ok(Bytes::from(transformed_body))
     }
 
     /// Handle Azure OpenAI-specific error responses
@@ -409,15 +628,12 @@ impl AzureOpenAIProvider {
         let error_json: Result<serde_json::Value, _> = serde_json::from_str(&error_body);
         
         match (status_code, error_json) {
-            // Authentication errors (401)
             (401, _) => {
                 debug!("Azure authentication error detected");
                 AppError::AzureAuthenticationError(
                     "Invalid Azure OpenAI API key or insufficient permissions".to_string()
                 )
             },
-            
-            // Resource not found (404) - often means deployment doesn't exist
             (404, Ok(json)) => {
                 debug!("Azure resource not found error detected");
                 let message = json
@@ -427,8 +643,6 @@ impl AzureOpenAIProvider {
                     .unwrap_or("Azure resource or deployment not found");
                 AppError::AzureResourceNotFoundError(message.to_string())
             },
-            
-            // Rate limiting (429)
             (429, Ok(json)) => {
                 debug!("Azure rate limit error detected");
                 let message = json
@@ -438,8 +652,6 @@ impl AzureOpenAIProvider {
                     .unwrap_or("Azure OpenAI rate limit exceeded");
                 AppError::AzureRateLimitError(message.to_string())
             },
-            
-            // Content filtering (400 with specific error code)
             (400, Ok(json)) if json
                 .get("error")
                 .and_then(|e| e.get("code"))
@@ -453,8 +665,6 @@ impl AzureOpenAIProvider {
                     .unwrap_or("Content was filtered by Azure OpenAI");
                 AppError::AzureContentFilterError(message.to_string())
             },
-            
-            // Bad request (400) - validation errors, invalid parameters, etc.
             (400, Ok(json)) => {
                 debug!("Azure bad request error detected");
                 let message = json
@@ -464,8 +674,6 @@ impl AzureOpenAIProvider {
                     .unwrap_or("Invalid request to Azure OpenAI");
                 AppError::AzureProviderError(format!("Bad request: {}", message))
             },
-            
-            // Server errors (5xx)
             (500..=599, Ok(json)) => {
                 debug!("Azure server error detected: {}", status_code);
                 let message = json
@@ -475,8 +683,6 @@ impl AzureOpenAIProvider {
                     .unwrap_or("Azure OpenAI service error");
                 AppError::AzureProviderError(format!("Server error ({}): {}", status_code, message))
             },
-            
-            // Other structured JSON errors
             (_, Ok(json)) if json.get("error").is_some() => {
                 debug!("Azure structured error detected: {}", status_code);
                 let error_code = json
@@ -491,8 +697,6 @@ impl AzureOpenAIProvider {
                     .unwrap_or("Unknown Azure OpenAI error");
                 AppError::AzureProviderError(format!("Error {}: {} ({})", error_code, message, status_code))
             },
-            
-            // Fallback for any other error types
             _ => {
                 debug!("Azure unstructured error detected: {}", status_code);
                 AppError::AzureProviderError(format!(
@@ -504,198 +708,16 @@ impl AzureOpenAIProvider {
         }
     }
 
-    /// Map Azure deployment ID to actual model name for accurate metrics and cost calculation
-    ///
-    /// Azure OpenAI deployments can have custom names that don't always match the underlying model.
-    /// This method provides intelligent mapping with fallbacks:
-    /// 1. Use the model name from the response if available (most accurate)
-    /// 2. Attempt to infer the model from deployment ID patterns
-    /// 3. Fall back to the deployment ID itself
-    fn map_deployment_to_model(&self, deployment_id: &str, response_model: Option<&str>) -> String {
-        debug!("Mapping Azure deployment '{}' to model name, response_model={:?}", deployment_id, response_model);
-        
-        // If the response includes a model name, use that (most accurate)
-        if let Some(model) = response_model {
-            debug!("Using model name from response: {}", model);
-            return model.to_string();
-        }
-        
-        // Otherwise, try to infer from deployment ID patterns
-        let deployment_lower = deployment_id.to_lowercase();
-        debug!("Deployment ID: {}", deployment_lower);
-        let mapped_model = match deployment_lower.as_str() {
-            // O3 models (latest reasoning models from 2025)
-            d if d.contains("o3-mini") => {
-                "o3-mini"
-            },
-            d if d.contains("o3") => {
-                "o3"
-            },
-            
-            // O4 models (newer reasoning models)
-            d if d.contains("o4-mini") => {
-                "o4-mini"
-            },
-            d if d.contains("o4") => {
-                "o4"
-            },
-            
-            // O1 models (reasoning models)
-            d if d.contains("o1-preview") => {
-                "o1-preview"
-            },
-            d if d.contains("o1-mini") => {
-                "o1-mini"
-            },
-            d if d.contains("o1") => {
-                "o1-preview" // Default to preview version
-            },
-            
-            // GPT-4.1 series (2025 models)
-            d if d.contains("gpt-4.1-nano") || d.contains("gpt-41-nano") => {
-                "gpt-4.1-nano"
-            },
-            d if d.contains("gpt-4.1-mini") || d.contains("gpt-41-mini") => {
-                "gpt-4.1-mini"
-            },
-            d if d.contains("gpt-4.1") || d.contains("gpt-41") => {
-                "gpt-4.1"
-            },
-            
-            // GPT-4.5 models
-            d if d.contains("gpt-4.5") || d.contains("gpt-45") => {
-                "gpt-4.5-preview"
-            },
-            
-            // GPT-4o models - Latest generation with multimodal capabilities
-            d if d.contains("gpt-4o-realtime") => {
-                "gpt-4o-realtime-preview"
-            },
-            d if d.contains("gpt-4o-audio") => {
-                "gpt-4o-audio-preview"
-            },
-            d if d.contains("gpt-4o-mini") => {
-                "gpt-4o-mini"
-            },
-            d if d.contains("gpt-4o") => {
-                "gpt-4o"
-            },
-            
-            // GPT-4 Turbo models
-            d if d.contains("gpt-4-turbo") || d.contains("gpt4-turbo") || d.contains("gpt-4-1106") || d.contains("gpt-4-0125") => {
-                "gpt-4-turbo"
-            },
-            // GPT-4 Vision models
-            d if d.contains("gpt-4-vision") || d.contains("gpt4-vision") || d.contains("gpt-4v") => {
-                "gpt-4-vision-preview"
-            },
-            // GPT-4 32k models
-            d if d.contains("gpt-4-32k") || d.contains("gpt4-32k") => {
-                "gpt-4-32k"
-            },
-            // Standard GPT-4 models
-            d if d.contains("gpt-4") || d.contains("gpt4") => {
-                "gpt-4"
-            },
-            // GPT-3.5 Turbo 16k models
-            d if d.contains("gpt-35-turbo-16k") || d.contains("gpt-3.5-turbo-16k") || d.contains("gpt35-turbo-16k") => {
-                "gpt-3.5-turbo-16k"
-            },
-            // GPT-3.5 Turbo Instruct
-            d if d.contains("gpt-35-turbo-instruct") || d.contains("gpt-3.5-turbo-instruct") => {
-                "gpt-3.5-turbo-instruct"
-            },
-            // Standard GPT-3.5 Turbo models
-            d if d.contains("gpt-35-turbo") || d.contains("gpt-3.5-turbo") || d.contains("gpt35-turbo") => {
-                "gpt-3.5-turbo"
-            },
-            // Text embedding models
-            d if d.contains("text-embedding-ada-002") || d.contains("ada-002") => {
-                "text-embedding-ada-002"
-            },
-            d if d.contains("text-embedding-3-small") || d.contains("embedding-3-small") => {
-                "text-embedding-3-small"
-            },
-            d if d.contains("text-embedding-3-large") || d.contains("embedding-3-large") => {
-                "text-embedding-3-large"
-            },
-            d if d.contains("text-embedding") || d.contains("embedding") => {
-                "text-embedding-ada-002" // Default embedding model
-            },
-            // DALL-E models
-            d if d.contains("dall-e-3") || d.contains("dalle-3") => {
-                "dall-e-3"
-            },
-            d if d.contains("dall-e-2") || d.contains("dalle-2") => {
-                "dall-e-2"
-            },
-            d if d.contains("dall-e") || d.contains("dalle") => {
-                "dall-e-3" // Default to latest
-            },
-            // Whisper models
-            d if d.contains("whisper-1") || d.contains("whisper") => {
-                "whisper-1"
-            },
-            // Fallback: use deployment ID itself
-            _ => {
-                debug!("No model mapping found for deployment '{}', using deployment ID as model name", deployment_id);
-                deployment_id
-            }
-        };
-        
-        let result = mapped_model.to_string();
-        debug!("Mapped deployment '{}' to model '{}'", deployment_id, result);
-        result
+    /// Get the currently extracted deployment ID (for testing)
+    #[cfg(test)]
+    pub fn get_extracted_deployment_id(&self) -> String {
+        self.extracted_deployment_id.read().unwrap().clone()
     }
 
-    /// Transform request body for Azure OpenAI compatibility
-    /// 
-    /// Newer models (o1, o3, o4, etc.) require max_completion_tokens instead of max_tokens
-    fn transform_request_body(&self, body_bytes: &Bytes, model: &str) -> Result<Bytes, AppError> {
-        // Check if this model requires parameter transformation
-        let needs_transformation = match model {
-            "o1" | "o1-preview" | "o1-mini" => true,
-            "o3" | "o3-mini" => true,
-            "o4" | "o4-mini" => true,
-            "gpt-4.1" | "gpt-4.1-nano" | "gpt-4.1-mini" => true,
-            "gpt-4.5-preview" => true,
-            m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.contains("o4-mini") => true,
-            _ => false,
-        };
-        
-        if !needs_transformation {
-            debug!("Model '{}' does not require parameter transformation", model);
-            return Ok(body_bytes.clone());
-        }
-        
-        debug!("Transforming request body for model '{}' - replacing max_tokens with max_completion_tokens", model);
-        
-        // Parse the JSON body
-        let body_str = std::str::from_utf8(body_bytes)
-            .map_err(|e| AppError::RequestError(format!("Invalid UTF-8 in request body: {}", e)))?;
-            
-        let mut json_value: serde_json::Value = serde_json::from_str(body_str)
-            .map_err(|e| AppError::RequestError(format!("Invalid JSON in request body: {}", e)))?;
-        
-        // Transform max_tokens to max_completion_tokens if present
-        if let Some(max_tokens) = json_value.get("max_tokens") {
-            debug!("Found max_tokens parameter, converting to max_completion_tokens for model '{}'", model);
-            let max_tokens_value = max_tokens.clone();
-            
-            // Remove max_tokens and add max_completion_tokens
-            if let Some(obj) = json_value.as_object_mut() {
-                obj.remove("max_tokens");
-                obj.insert("max_completion_tokens".to_string(), max_tokens_value);
-                debug!("Successfully transformed max_tokens to max_completion_tokens");
-            }
-        }
-        
-        // Convert back to bytes
-        let transformed_body = serde_json::to_string(&json_value)
-            .map_err(|e| AppError::RequestError(format!("Failed to serialize transformed JSON: {}", e)))?;
-            
-        debug!("Transformed request body: {}", transformed_body);
-        Ok(Bytes::from(transformed_body))
+    /// Set the extracted deployment ID (for testing)
+    #[cfg(test)]
+    pub fn set_extracted_deployment_id(&self, deployment_id: String) {
+        *self.extracted_deployment_id.write().unwrap() = deployment_id;
     }
 }
 
@@ -861,9 +883,6 @@ impl Provider for AzureOpenAIProvider {
         debug!("Stored Azure configuration: resource={}, deployment={}, api_version={}", 
             resource_name, deployment_id, api_version);
 
-        // Defer URL construction until we have a valid deployment ID
-        // This will happen in transform_path after the deployment ID is extracted
-
         // Store Azure configuration in custom headers for later use
         headers.insert(
             "x-azure-resource-name-processed",
@@ -933,292 +952,18 @@ impl AzureOpenAIMetricsExtractor {
         }
     }
 
-    /// Map Azure deployment ID to actual model name for accurate metrics and cost calculation
-    ///
-    /// This is a duplicate of the method in AzureOpenAIProvider to avoid coupling.
-    /// In a more sophisticated design, this could be extracted to a shared utility.
-    fn map_deployment_to_model(&self, response_model: Option<&str>) -> String {
-        debug!("Mapping Azure deployment '{}' to model name, response_model={:?}", self.deployment_id, response_model);
-        
-        // If the response includes a model name, use that (most accurate)
-        if let Some(model) = response_model {
-            debug!("Using model name from response: {}", model);
-            return model.to_string();
-        }
-        
-        // Otherwise, try to infer from deployment ID patterns
-        let deployment_lower = self.deployment_id.to_lowercase();
-        let mapped_model = match deployment_lower.as_str() {
-            // O3 models (latest reasoning models from 2025)
-            d if d.contains("o3-mini") => {
-                "o3-mini"
-            },
-            d if d.contains("o3") => {
-                "o3"
-            },
-            
-            // O4 models (newer reasoning models)
-            d if d.contains("o4-mini") => {
-                "o4-mini"
-            },
-            d if d.contains("o4") => {
-                "o4"
-            },
-            
-            // O1 models (reasoning models)
-            d if d.contains("o1-preview") => {
-                "o1-preview"
-            },
-            d if d.contains("o1-mini") => {
-                "o1-mini"
-            },
-            d if d.contains("o1") => {
-                "o1-preview" // Default to preview version
-            },
-            
-            // GPT-4.1 series (2025 models)
-            d if d.contains("gpt-4.1-nano") || d.contains("gpt-41-nano") => {
-                "gpt-4.1-nano"
-            },
-            d if d.contains("gpt-4.1-mini") || d.contains("gpt-41-mini") => {
-                "gpt-4.1-mini"
-            },
-            d if d.contains("gpt-4.1") || d.contains("gpt-41") => {
-                "gpt-4.1"
-            },
-            
-            // GPT-4.5 models
-            d if d.contains("gpt-4.5") || d.contains("gpt-45") => {
-                "gpt-4.5-preview"
-            },
-            
-            // GPT-4o models - Latest generation with multimodal capabilities
-            d if d.contains("gpt-4o-realtime") => {
-                "gpt-4o-realtime-preview"
-            },
-            d if d.contains("gpt-4o-audio") => {
-                "gpt-4o-audio-preview"
-            },
-            d if d.contains("gpt-4o-mini") => {
-                "gpt-4o-mini"
-            },
-            d if d.contains("gpt-4o") => {
-                "gpt-4o"
-            },
-            
-            // GPT-4 Turbo models
-            d if d.contains("gpt-4-turbo") || d.contains("gpt4-turbo") || d.contains("gpt-4-1106") || d.contains("gpt-4-0125") => {
-                "gpt-4-turbo"
-            },
-            // GPT-4 Vision models
-            d if d.contains("gpt-4-vision") || d.contains("gpt4-vision") || d.contains("gpt-4v") => {
-                "gpt-4-vision-preview"
-            },
-            // GPT-4 32k models
-            d if d.contains("gpt-4-32k") || d.contains("gpt4-32k") => {
-                "gpt-4-32k"
-            },
-            // Standard GPT-4 models
-            d if d.contains("gpt-4") || d.contains("gpt4") => {
-                "gpt-4"
-            },
-            // GPT-3.5 Turbo 16k models
-            d if d.contains("gpt-35-turbo-16k") || d.contains("gpt-3.5-turbo-16k") || d.contains("gpt35-turbo-16k") => {
-                "gpt-3.5-turbo-16k"
-            },
-            // GPT-3.5 Turbo Instruct
-            d if d.contains("gpt-35-turbo-instruct") || d.contains("gpt-3.5-turbo-instruct") => {
-                "gpt-3.5-turbo-instruct"
-            },
-            // Standard GPT-3.5 Turbo models
-            d if d.contains("gpt-35-turbo") || d.contains("gpt-3.5-turbo") || d.contains("gpt35-turbo") => {
-                "gpt-3.5-turbo"
-            },
-            // Text embedding models
-            d if d.contains("text-embedding-ada-002") || d.contains("ada-002") => {
-                "text-embedding-ada-002"
-            },
-            d if d.contains("text-embedding-3-small") || d.contains("embedding-3-small") => {
-                "text-embedding-3-small"
-            },
-            d if d.contains("text-embedding-3-large") || d.contains("embedding-3-large") => {
-                "text-embedding-3-large"
-            },
-            d if d.contains("text-embedding") || d.contains("embedding") => {
-                "text-embedding-ada-002" // Default embedding model
-            },
-            // DALL-E models
-            d if d.contains("dall-e-3") || d.contains("dalle-3") => {
-                "dall-e-3"
-            },
-            d if d.contains("dall-e-2") || d.contains("dalle-2") => {
-                "dall-e-2"
-            },
-            d if d.contains("dall-e") || d.contains("dalle") => {
-                "dall-e-3" // Default to latest
-            },
-            // Whisper models
-            d if d.contains("whisper-1") || d.contains("whisper") => {
-                "whisper-1"
-            },
-            // Fallback: use deployment ID itself
-            _ => {
-                debug!("No model mapping found for deployment '{}', using deployment ID as model name", self.deployment_id);
-                &self.deployment_id
-            }
-        };
-        
-        let result = mapped_model.to_string();
-        debug!("Mapped deployment '{}' to model '{}'", self.deployment_id, result);
-        result
-    }
-
     /// Calculate Azure OpenAI cost based on model and token usage
     ///
     /// Azure OpenAI uses separate pricing for input and output tokens.
     /// Pricing is per 1K tokens and varies by model type.
-    fn calculate_azure_cost(&self, model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
-        let (input_cost_per_1k, output_cost_per_1k) = match model {
-            // O3 models (latest reasoning models from 2025) - Estimated pricing
-            "o3" => {
-                (0.02, 0.08) // $0.02 input, $0.08 output per 1K tokens (estimated high-end reasoning)
-            },
-            "o3-mini" => {
-                (0.008, 0.032) // $0.008 input, $0.032 output per 1K tokens (estimated)
-            },
-            
-            // O4 models (newer reasoning models) - Estimated pricing based on capabilities
-            "o4" => {
-                (0.015, 0.06) // $0.015 input, $0.06 output per 1K tokens (estimated)
-            },
-            "o4-mini" | "o4-mini-2025-04-16" => {
-                (0.004, 0.016) // $0.004 input, $0.016 output per 1K tokens (estimated)
-            },
-            d if d.starts_with("o4-mini") => {
-                (0.004, 0.016) // $0.004 input, $0.016 output per 1K tokens (estimated)
-            },
-            
-            // O1 models (reasoning models) - Higher cost due to reasoning capability
-            "o1-preview" => {
-                (0.015, 0.06) // $0.015 input, $0.06 output per 1K tokens
-            },
-            "o1-mini" => {
-                (0.003, 0.012) // $0.003 input, $0.012 output per 1K tokens
-            },
-            
-            // GPT-4.1 series (2025 models) - Estimated pricing
-            "gpt-4.1" => {
-                (0.012, 0.036) // $0.012 input, $0.036 output per 1K tokens (estimated)
-            },
-            "gpt-4.1-mini" => {
-                (0.0008, 0.0024) // $0.0008 input, $0.0024 output per 1K tokens (estimated)
-            },
-            "gpt-4.1-nano" => {
-                (0.0002, 0.0006) // $0.0002 input, $0.0006 output per 1K tokens (estimated)
-            },
-            
-            // GPT-4.5 models (estimated pricing)
-            "gpt-4.5-preview" => {
-                (0.015, 0.045) // $0.015 input, $0.045 output per 1K tokens (estimated)
-            },
-            
-            // GPT-4o models - Latest generation with multimodal capabilities
-            "gpt-4o" | "gpt-4o-2024-11-20" | "gpt-4o-2024-08-06" | "gpt-4o-2024-05-13" => {
-                (0.005, 0.015) // $0.005 input, $0.015 output per 1K tokens
-            },
-            "gpt-4o-mini" | "gpt-4o-mini-2024-07-18" => {
-                (0.0004, 0.0016) // $0.0004 input, $0.0016 output per 1K tokens
-            },
-            "gpt-4o-realtime-preview" => {
-                (0.01, 0.03) // $0.01 input, $0.03 output per 1K tokens (estimated for realtime)
-            },
-            "gpt-4o-audio-preview" => {
-                (0.008, 0.024) // $0.008 input, $0.024 output per 1K tokens (estimated for audio)
-            },
-            
-            // GPT-4 Turbo models - Latest generation
-            "gpt-4-turbo" | "gpt-4-turbo-2024-04-09" | "gpt-4-turbo-preview" | "gpt-4-0125-preview" | "gpt-4-1106-preview" => {
-                (0.01, 0.03) // $0.01 input, $0.03 output per 1K tokens
-            },
-            
-            // GPT-4 Vision models
-            "gpt-4-vision-preview" | "gpt-4v" => {
-                (0.01, 0.03) // Same as GPT-4 Turbo
-            },
-            
-            // GPT-4 32K models
-            "gpt-4-32k" | "gpt-4-32k-0314" | "gpt-4-32k-0613" => {
-                (0.06, 0.12) // $0.06 input, $0.12 output per 1K tokens
-            },
-            
-            // Standard GPT-4 models
-            "gpt-4" | "gpt-4-0314" | "gpt-4-0613" => {
-                (0.03, 0.06) // $0.03 input, $0.06 output per 1K tokens
-            },
-            
-            // GPT-3.5 Turbo 16K models
-            "gpt-35-turbo-16k" | "gpt-3.5-turbo-16k" | "gpt-35-turbo-16k-0613" | "gpt-3.5-turbo-16k-0613" => {
-                (0.003, 0.004) // $0.003 input, $0.004 output per 1K tokens
-            },
-            
-            // GPT-3.5 Turbo Instruct
-            "gpt-35-turbo-instruct" | "gpt-3.5-turbo-instruct" => {
-                (0.0015, 0.002) // $0.0015 input, $0.002 output per 1K tokens
-            },
-            
-            // Standard GPT-3.5 Turbo models
-            "gpt-35-turbo" | "gpt-3.5-turbo" | "gpt-35-turbo-0301" | "gpt-3.5-turbo-0613" | "gpt-35-turbo-1106" | "gpt-3.5-turbo-1106" => {
-                (0.0015, 0.002) // $0.0015 input, $0.002 output per 1K tokens
-            },
-            
-            // Text embedding models (input only)
-            "text-embedding-ada-002" => {
-                (0.0001, 0.0) // $0.0001 input per 1K tokens, no output cost
-            },
-            "text-embedding-3-small" => {
-                (0.00002, 0.0) // $0.00002 input per 1K tokens
-            },
-            "text-embedding-3-large" => {
-                (0.00013, 0.0) // $0.00013 input per 1K tokens
-            },
-            
-            // DALL-E models (per image, but we'll approximate per 1K tokens)
-            "dall-e-3" => {
-                (0.04, 0.0) // Approximate cost per generation
-            },
-            "dall-e-2" => {
-                (0.02, 0.0) // Approximate cost per generation
-            },
-            
-            // Whisper models (per minute, approximated per 1K tokens)
-            "whisper-1" => {
-                (0.006, 0.0) // $0.006 per minute of audio
-            },
-            
-            // Unknown models or fallback
-            _ => {
-                debug!("Unknown model '{}' for Azure cost calculation, returning $0", model);
-                (0.0, 0.0)
-            }
-        };
-        
-        let input_cost = (input_tokens as f64 / 1000.0) * input_cost_per_1k;
-        let output_cost = (output_tokens as f64 / 1000.0) * output_cost_per_1k;
-        let total_cost = input_cost + output_cost;
-        
-        debug!(
-            "Azure cost calculation for model '{}': {} input tokens (${:.6}), {} output tokens (${:.6}), total: ${:.6}",
-            model, input_tokens, input_cost, output_tokens, output_cost, total_cost
-        );
-        
-        total_cost
+    pub fn calculate_azure_cost(&self, model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
+        pricing::calculate_cost(model, input_tokens, output_tokens)
     }
 
     /// Extract Azure-specific content filtering metrics
     ///
     /// Azure responses include content filtering results that should be captured for compliance
     fn extract_content_filtering_metrics(&self, response_body: &Value, _metrics: &mut ProviderMetrics) {
-        // Implementation for extracting content filtering metrics
         debug!("Extracting Azure content filtering metrics");
         
         // Extract content filtering from choices (for completion responses)
@@ -1252,7 +997,7 @@ impl MetricsExtractor for AzureOpenAIMetricsExtractor {
         let response_model = response_body
             .get("model")
             .and_then(|m| m.as_str());
-        let mapped_model = self.map_deployment_to_model(response_model);
+        let mapped_model = model_mapping::map_deployment_to_model(&self.deployment_id, response_model);
         
         debug!("Using mapped model '{}' for metrics (deployment: '{}')", mapped_model, self.deployment_id);
         
@@ -1315,19 +1060,13 @@ impl MetricsExtractor for AzureOpenAIMetricsExtractor {
         debug!("Extracting Azure OpenAI streaming metrics from chunk");
         
         // Parse the streaming chunk as JSON
-        let chunk_json: Value = match serde_json::from_str(chunk) {
-            Ok(json) => json,
-            Err(e) => {
-                debug!("Failed to parse streaming chunk as JSON: {}", e);
-                return None;
-            }
-        };
+        let chunk_json: Value = serde_json::from_str(chunk).ok()?;
         
         // Get the actual model name using mapping
         let response_model = chunk_json
             .get("model")
             .and_then(|m| m.as_str());
-        let mapped_model = self.map_deployment_to_model(response_model);
+        let mapped_model = model_mapping::map_deployment_to_model(&self.deployment_id, response_model);
         
         debug!("Using mapped model '{}' for streaming metrics (deployment: '{}')", mapped_model, self.deployment_id);
         
