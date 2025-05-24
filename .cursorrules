@@ -1,64 +1,191 @@
+# Noveum AI Gateway - Rust Development Rules
 
-You are an expert in Rust, async programming, and concurrent systems.
+## Project Overview
+This is a high-performance AI Gateway written in Rust using Axum and Tokio. The gateway provides a unified interface for multiple AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together AI, AWS Bedrock, and Azure OpenAI).
 
-NEVER REMOVE OLDER CODE IF YOU DON"T UNDERSTAND WHAT YOU ARE DOING. DON"T REMOVE LOGS etc if they are already there.
-Remove logs if they might log a secret key etc.
+## Core Architecture Patterns
 
-Key Principles
-- Write clear, concise, and idiomatic Rust code with accurate examples.
-- Use async programming paradigms effectively, leveraging `tokio` for concurrency.
-- Prioritize modularity, clean code organization, and efficient resource management.
-- Use expressive variable names that convey intent (e.g., `is_ready`, `has_data`).
-- Adhere to Rust's naming conventions: snake_case for variables and functions, PascalCase for types and structs.
-- Avoid code duplication; use functions and modules to encapsulate reusable logic.
-- Write code with safety, concurrency, and performance in mind, embracing Rust's ownership and type system.
+### Provider Implementation Pattern
+When adding new AI providers, follow the established pattern:
 
-Async Programming
-- Use `tokio` as the async runtime for handling asynchronous tasks and I/O.
-- Implement async functions using `async fn` syntax.
-- Leverage `tokio::spawn` for task spawning and concurrency.
-- Use `tokio::select!` for managing multiple async tasks and cancellations.
-- Favor structured concurrency: prefer scoped tasks and clean cancellation paths.
-- Implement timeouts, retries, and backoff strategies for robust async operations.
+1. **Provider Trait Implementation**: All providers must implement the `Provider` trait found in [src/providers/mod.rs](mdc:src/providers/mod.rs)
+2. **File Location**: Create provider files in [src/providers/](mdc:src/providers/) directory
+3. **Naming Convention**: Use snake_case for provider files (e.g., `azure_openai.rs`, `anthropic.rs`)
+4. **Required Methods**:
+   - `base_url()` - Returns the provider's base URL
+   - `name()` - Returns provider identifier string
+   - `process_headers()` - Handles authentication and header transformation
 
-Channels and Concurrency
-- Use Rust's `tokio::sync::mpsc` for asynchronous, multi-producer, single-consumer channels.
-- Use `tokio::sync::broadcast` for broadcasting messages to multiple consumers.
-- Implement `tokio::sync::oneshot` for one-time communication between tasks.
-- Prefer bounded channels for backpressure; handle capacity limits gracefully.
-- Use `tokio::sync::Mutex` and `tokio::sync::RwLock` for shared state across tasks, avoiding deadlocks.
+Example provider structure:
+```rust
+pub struct AzureOpenAIProvider {
+    base_url: String,
+}
 
-Error Handling and Safety
-- Embrace Rust's Result and Option types for error handling.
-- Use `?` operator to propagate errors in async functions.
-- Implement custom error types using `thiserror` or `anyhow` for more descriptive errors.
-- Handle errors and edge cases early, returning errors where appropriate.
-- Use `.await` responsibly, ensuring safe points for context switching.
+impl Provider for AzureOpenAIProvider {
+    fn base_url(&self) -> String { /* implementation */ }
+    fn name(&self) -> &str { /* provider name */ }
+    fn process_headers(&self, headers: &HeaderMap) -> Result<HeaderMap, AppError> { /* auth logic */ }
+}
+```
 
-Testing
-- Write unit tests with `tokio::test` for async tests.
-- Use `tokio::time::pause` for testing time-dependent code without real delays.
-- Implement integration tests to validate async behavior and concurrency.
-- Use mocks and fakes for external dependencies in tests.
+### Metrics Extraction Pattern
+Each provider should have a corresponding metrics extractor:
 
-Performance Optimization
-- Minimize async overhead; use sync code where async is not needed.
-- Avoid blocking operations inside async functions; offload to dedicated blocking threads if necessary.
-- Use `tokio::task::yield_now` to yield control in cooperative multitasking scenarios.
-- Optimize data structures and algorithms for async use, reducing contention and lock duration.
-- Use `tokio::time::sleep` and `tokio::time::interval` for efficient time-based operations.
+1. **Location**: Implement metrics extractor in the same provider file
+2. **Trait**: Implement `MetricsExtractor` trait from [src/telemetry/provider_metrics.rs](mdc:src/telemetry/provider_metrics.rs)
+3. **Registration**: Update the factory function in `provider_metrics.rs`
+4. **Required Methods**:
+   - `extract_metrics()` - Extract metrics from full response
+   - `try_extract_provider_specific_streaming_metrics()` - Optional streaming metrics
 
-Key Conventions
-1. Structure the application into modules: separate concerns like networking, database, and business logic.
-2. Use environment variables for configuration management (e.g., `dotenv` crate).
-3. Ensure code is well-documented with inline comments and Rustdoc.
+### Error Handling Conventions
+- Use `AppError` enum for application-specific errors
+- Always use `Result<T, AppError>` for fallible operations
+- Log errors with appropriate context using tracing macros
+- Provide meaningful error messages for debugging
 
-Async Ecosystem
-- Use `tokio` for async runtime and task management.
-- Leverage `hyper` or `reqwest` for async HTTP requests.
-- Use `serde` for serialization/deserialization.
-- Use `sqlx` or `tokio-postgres` for async database interactions.
-- Utilize `tonic` for gRPC with async support.
+### Async Programming Standards
+- Use `#[async_trait]` for trait methods that need to be async
+- Prefer `tokio::spawn` for concurrent tasks
+- Use `Arc` and `Mutex`/`RwLock` for shared state
+- Always handle timeouts for external API calls
 
-Refer to Rust's async book and `tokio` documentation for in-depth information on async patterns, best practices, and advanced features.
+## Code Organization Rules
+
+### Module Structure
+- **Providers**: [src/providers/](mdc:src/providers/) - AI provider implementations
+- **Proxy**: [src/proxy/](mdc:src/proxy/) - HTTP proxy logic
+- **Telemetry**: [src/telemetry/](mdc:src/telemetry/) - Metrics and observability
+- **Handlers**: [src/handlers.rs](mdc:src/handlers.rs) - HTTP request handlers
+- **Config**: [src/config.rs](mdc:src/config.rs) - Application configuration
+
+### File Naming Conventions
+- Use snake_case for all Rust files
+- Provider files should match provider name (e.g., `azure_openai.rs`)
+- Use descriptive names for modules (e.g., `provider_metrics.rs`, `middleware.rs`)
+
+### Import Organization
+1. Standard library imports first
+2. External crate imports second
+3. Internal module imports last
+4. Group related imports together
+
+## Configuration Management
+
+### Environment Variables
+Reference [src/config.rs](mdc:src/config.rs) for configuration patterns:
+- Use `env::var()` with sensible defaults
+- Validate configuration at startup
+- Support both development and production configurations
+- Document all environment variables in README
+
+### Default Values
+- Always provide reasonable defaults for optional configuration
+- Use CPU core count for thread pool sizing
+- Set appropriate timeouts and buffer sizes
+
+## Telemetry and Observability
+
+### Logging Standards
+- Use `tracing` crate for structured logging
+- Log levels: `debug` for development, `info` for operations, `error` for failures
+- Include relevant context in log messages
+- Reference [src/telemetry/middleware.rs](mdc:src/telemetry/middleware.rs) for patterns
+
+### Metrics Collection
+- Track request latency, token usage, and costs
+- Support streaming and non-streaming responses
+- Extract provider-specific request IDs
+- Support tracking headers (project-id, org-id, user-id, experiment-id)
+
+## Testing Conventions
+
+### Integration Tests
+- Create provider-specific integration tests
+- Test both streaming and non-streaming responses
+- Include error scenario testing
+- Use `.env.test` file for test configuration
+
+### Unit Tests
+- Test each provider implementation in isolation
+- Mock external dependencies
+- Validate error handling paths
+- Test metrics extraction logic
+
+## Performance Guidelines
+
+### Optimization Rules
+- Maintain sub-100ms proxy overhead
+- Use connection pooling via Reqwest
+- Minimize memory allocations in hot paths
+- Implement proper async streaming for responses
+
+### Resource Management
+- Use `Arc` for shared immutable data
+- Prefer `tokio::sync::RwLock` over `std::sync::RwLock`
+- Clean up resources in Drop implementations
+- Monitor memory usage in streaming scenarios
+
+## Security Best Practices
+
+### API Key Handling
+- Never log API keys or sensitive headers
+- Validate credentials before forwarding requests
+- Use secure header transformation
+- Implement proper error responses for auth failures
+
+### Request Validation
+- Sanitize and validate all input headers
+- Implement rate limiting considerations
+- Handle malformed requests gracefully
+- Log security-relevant events
+
+## Documentation Standards
+
+### Code Documentation
+- Use Rustdoc comments for public APIs
+- Include usage examples in documentation
+- Document error conditions and return values
+- Keep README.md updated with new features
+
+### Provider Documentation
+- Create markdown files in [docs/providers/](mdc:docs/providers/)
+- Include configuration examples
+- Document supported features and limitations
+- Provide troubleshooting guides
+
+## Development Workflow
+
+### Adding New Providers
+1. Create provider file in [src/providers/](mdc:src/providers/)
+2. Implement Provider trait and MetricsExtractor
+3. Register in [src/providers/mod.rs](mdc:src/providers/mod.rs)
+4. Add to metrics factory function
+5. Create integration tests
+6. Update documentation
+
+### Debugging Guidelines
+- Use `RUST_LOG=debug` for detailed logging
+- Enable telemetry for request tracing
+- Check provider-specific request IDs
+- Validate configuration at startup
+
+## Performance Monitoring
+
+### Key Metrics
+- Request latency (TTFB and total)
+- Token consumption and costs
+- Error rates by provider
+- Connection pool utilization
+
+### Optimization Targets
+- Sub-100ms proxy overhead
+- 1000+ concurrent requests support
+- Minimal memory footprint
+- Efficient streaming response handling
+
+---
+
+**Remember**: This is a high-performance proxy service. Every change should consider latency, memory usage, and concurrent request handling capabilities.
   
