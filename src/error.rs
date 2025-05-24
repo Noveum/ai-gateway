@@ -70,6 +70,22 @@ pub enum AppError {
     
     #[error("JSON serialize error: {0}")]
     JsonSerializeError(String),
+
+    // Azure OpenAI-specific errors
+    #[error("Azure OpenAI authentication failed: {0}")]
+    AzureAuthenticationError(String),
+
+    #[error("Azure OpenAI rate limit exceeded: {0}")]
+    AzureRateLimitError(String),
+
+    #[error("Azure OpenAI content filtered: {0}")]
+    AzureContentFilterError(String),
+
+    #[error("Azure OpenAI resource not found: {0}")]
+    AzureResourceNotFoundError(String),
+
+    #[error("Azure OpenAI provider error: {0}")]
+    AzureProviderError(String),
 }
 
 impl IntoResponse for AppError {
@@ -146,6 +162,26 @@ impl IntoResponse for AppError {
             AppError::JsonSerializeError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("JSON serialize error: {}", e),
+            ),
+            AppError::AzureAuthenticationError(e) => (
+                StatusCode::UNAUTHORIZED,
+                format!("Azure OpenAI authentication failed: {}", e),
+            ),
+            AppError::AzureRateLimitError(e) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Azure OpenAI rate limit exceeded: {}", e),
+            ),
+            AppError::AzureContentFilterError(e) => (
+                StatusCode::BAD_REQUEST,
+                format!("Azure OpenAI content filtered: {}", e),
+            ),
+            AppError::AzureResourceNotFoundError(e) => (
+                StatusCode::NOT_FOUND,
+                format!("Azure OpenAI resource not found: {}", e),
+            ),
+            AppError::AzureProviderError(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Azure OpenAI provider error: {}", e),
             ),
         };
 

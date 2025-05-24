@@ -231,7 +231,7 @@ pub fn get_metrics_extractor(provider: &str) -> Box<dyn MetricsExtractor> {
     
     match provider {
         "anthropic" => Box::new(AnthropicMetricsExtractor),
-        "azure-openai" => Box::new(AzureOpenAIMetricsExtractor),
+        "azure-openai" => Box::new(AzureOpenAIMetricsExtractor::new("gpt-4".to_string())),
         "bedrock" => Box::new(BedrockMetricsExtractor),
         "groq" => Box::new(GroqMetricsExtractor),
         "fireworks" => Box::new(FireworksMetricsExtractor), // Now using Fireworks-specific extractor
