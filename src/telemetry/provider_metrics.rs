@@ -223,6 +223,7 @@ pub trait MetricsExtractor: Send + Sync {
 // Factory function for creating metrics extractors
 pub fn get_metrics_extractor(provider: &str) -> Box<dyn MetricsExtractor> {
     use crate::providers::anthropic::AnthropicMetricsExtractor;
+    use crate::providers::azure_openai::AzureOpenAIMetricsExtractor;
     use crate::providers::bedrock::BedrockMetricsExtractor;
     use crate::providers::fireworks::FireworksMetricsExtractor;
     use crate::providers::groq::GroqMetricsExtractor;
@@ -230,6 +231,7 @@ pub fn get_metrics_extractor(provider: &str) -> Box<dyn MetricsExtractor> {
     
     match provider {
         "anthropic" => Box::new(AnthropicMetricsExtractor),
+        "azure-openai" => Box::new(AzureOpenAIMetricsExtractor),
         "bedrock" => Box::new(BedrockMetricsExtractor),
         "groq" => Box::new(GroqMetricsExtractor),
         "fireworks" => Box::new(FireworksMetricsExtractor), // Now using Fireworks-specific extractor

@@ -68,6 +68,7 @@ pub trait Provider: Send + Sync {
 
 // Use pub instead of mod to make the modules and their contents public
 pub mod anthropic;
+pub mod azure_openai;
 pub mod bedrock;
 pub mod fireworks;
 pub mod groq;
@@ -76,6 +77,7 @@ pub mod together;
 pub mod utils;
 
 pub use anthropic::AnthropicProvider;
+pub use azure_openai::AzureOpenAIProvider;
 pub use bedrock::BedrockProvider;
 pub use fireworks::FireworksProvider;
 pub use groq::GroqProvider;
@@ -87,6 +89,7 @@ pub fn create_provider(provider_name: &str) -> Result<Box<dyn Provider>, AppErro
     match provider_name.to_lowercase().as_str() {
         "openai" => Ok(Box::new(OpenAIProvider::new())),
         "anthropic" => Ok(Box::new(AnthropicProvider::new())),
+        "azure-openai" => Ok(Box::new(AzureOpenAIProvider::new())),
         "groq" => Ok(Box::new(GroqProvider::new())),
         "fireworks" => Ok(Box::new(FireworksProvider::new())),
         "together" => Ok(Box::new(TogetherProvider::new())),
