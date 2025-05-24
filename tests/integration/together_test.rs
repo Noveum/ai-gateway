@@ -1,9 +1,7 @@
-use reqwest::{Client, header::{HeaderMap, HeaderValue}};
 use serde_json::{json, Value};
 use std::env;
 use std::time::Duration;
 use tokio::time::sleep;
-use dotenv::dotenv;
 use uuid::Uuid;
 use super::common::{ProviderTestConfig, run_non_streaming_test, run_streaming_test};
 
@@ -18,7 +16,7 @@ async fn search_elasticsearch(request_id: &str) -> Result<Value, reqwest::Error>
     let es_password = env::var("ELASTICSEARCH_PASSWORD").expect("ELASTICSEARCH_PASSWORD must be set");
     let es_index = env::var("ELASTICSEARCH_INDEX").expect("ELASTICSEARCH_INDEX must be set");
     
-    let client = Client::new();
+    let client = reqwest::Client::new();
     let search_url = format!("{}/{}/_search", es_url, es_index);
     
     let query = json!({
@@ -41,6 +39,9 @@ async fn search_elasticsearch(request_id: &str) -> Result<Value, reqwest::Error>
 
 #[tokio::test]
 async fn test_together_non_streaming() {
+    // Add delay to avoid rate limiting
+    sleep(Duration::from_secs(2)).await;
+    
     let config = ProviderTestConfig::new("together", "TOGETHER_API_KEY", "deepseek-ai/DeepSeek-V3")
         .with_max_tokens(512);
     run_non_streaming_test(&config).await;
@@ -48,6 +49,9 @@ async fn test_together_non_streaming() {
 
 #[tokio::test]
 async fn test_together_streaming() {
+    // Add delay to avoid rate limiting
+    sleep(Duration::from_secs(5)).await;
+    
     let config = ProviderTestConfig::new("together", "TOGETHER_API_KEY", "deepseek-ai/DeepSeek-V3")
         .with_max_tokens(512);
     run_streaming_test(&config).await;

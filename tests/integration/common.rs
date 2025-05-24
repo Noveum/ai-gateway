@@ -149,10 +149,12 @@ pub fn setup_test_headers(provider: &str, api_key: &str, request_id: &str) -> He
     // Common headers for all providers
     headers.insert("Content-Type", HeaderValue::from_str("application/json").unwrap());
     headers.insert("x-provider", HeaderValue::from_str(provider).unwrap());
-    headers.insert("x-organisation-id", HeaderValue::from_str("TEST_ORG").unwrap());
-    headers.insert("x-project-id", HeaderValue::from_str("TEST_PROJECT").unwrap());
-    headers.insert("x-experiment-id", HeaderValue::from_str("TEST_EXPERIMENT").unwrap());
-    headers.insert("x-user-id", HeaderValue::from_str("TEST_USER").unwrap());
+    
+    // Use proper organization header name and realistic test values
+    headers.insert("x-organization-id", HeaderValue::from_str("fjMGlSqUngxBRJiDJCCVu6rrYqpJ4Xqh").unwrap());
+    headers.insert("x-project-id", HeaderValue::from_str("1").unwrap());
+    headers.insert("x-experiment-id", HeaderValue::from_str("test-experiment").unwrap());
+    headers.insert("x-user-id", HeaderValue::from_str("test-user").unwrap());
     
     headers
 }
@@ -645,7 +647,7 @@ pub async fn validate_with_llm(
         "x-provider": request_headers.get("x-provider")
             .and_then(|v| v.to_str().ok())
             .unwrap_or(""),
-        "x-organisation-id": request_headers.get("x-organisation-id")
+        "x-organization-id": request_headers.get("x-organization-id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or(""),
         "x-project-id": request_headers.get("x-project-id")
@@ -716,7 +718,7 @@ pub async fn validate_with_llm(
         // .post("https://api.openai.com/v1/chat/completions")
         .header("provider", "openai")
         .header("x-project-id", "noveum-integration-test")
-        .header("x-organisation-id", "noveumtest")
+        .header("x-organization-id", "noveumtest")
         .header("x-experiment-id", "eval_job_1")
         .header("x-user-id", "shashank")
         .header("Content-Type", "application/json")
