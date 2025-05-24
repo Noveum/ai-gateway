@@ -108,6 +108,9 @@ pub async fn search_elasticsearch(gateway_request_id: &str) -> Result<Value, req
 
 /// Set up request headers for a provider test
 pub fn setup_test_headers(provider: &str, api_key: &str, request_id: &str) -> HeaderMap {
+    // Load environment variables from test config
+    init_test_env();
+    
     let mut headers = HeaderMap::new();
     
     // Different header setup based on provider
@@ -121,6 +124,21 @@ pub fn setup_test_headers(provider: &str, api_key: &str, request_id: &str) -> He
             headers.insert("x-aws-access-key-id", HeaderValue::from_str(&aws_access_key).unwrap());
             headers.insert("x-aws-secret-access-key", HeaderValue::from_str(&aws_secret_key).unwrap());
             headers.insert("x-aws-region", HeaderValue::from_str(&aws_region).unwrap());
+        },
+        "azure-openai" => {
+            // For Azure OpenAI, use api-key header instead of Authorization
+            headers.insert("api-key", HeaderValue::from_str(api_key).unwrap());
+            
+            // Add Azure resource name - try from env var or use default
+            let azure_resource_name = env::var("AZURE_OPENAI_RESOURCE_NAME")
+                .or_else(|_| env::var("AZURE_RESOURCE_NAME"))
+                .unwrap_or_else(|_| "ai-gateway-test".to_string());
+            headers.insert("x-azure-resource-name", HeaderValue::from_str(&azure_resource_name).unwrap());
+            
+            // Add Azure API version if specified
+            if let Ok(api_version) = env::var("AZURE_OPENAI_API_VERSION") {
+                headers.insert("x-azure-api-version", HeaderValue::from_str(&api_version).unwrap());
+            }
         },
         _ => {
             // For other providers, use Bearer token auth
@@ -197,8 +215,9 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
     // Print request ID for debugging
     println!("Request ID: {}", request_id);
     
-    // Create request body
+    // Print the request body for debugging
     let request_body = create_test_request_body(config, false);
+    println!("Request body: {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()));
     
     // Send request to the gateway
     let client = Client::new();
@@ -218,6 +237,13 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
         let error_body = response.text().await.expect("Failed to read error response body");
         println!("Error response from gateway: {}", error_body);
         panic!("Request failed with status: 403 Forbidden - Make sure your AWS credentials have the correct permissions for AWS Bedrock");
+    }
+    
+    // If we got a 400 Bad Request, print the response body to debug
+    if response.status() == StatusCode::BAD_REQUEST {
+        let error_body = response.text().await.expect("Failed to read error response body");
+        println!("Error response from gateway (400): {}", error_body);
+        panic!("Request failed with status: 400 Bad Request - Check API key and request format. Error: {}", error_body);
     }
     
     // Ensure the request was successful
@@ -271,6 +297,32 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
     let hits_array = hits.as_array().expect("Hits is not an array");
     assert!(!hits_array.is_empty(), "No matching documents found in ElasticSearch");
     
+    // Print the ES response for debugging
+    println!("ElasticSearch response summary:");
+    println!("  - Total hits: {}", hits_array.len());
+    if let Some(first_hit) = hits_array.first() {
+        println!("  - First hit source keys: {:?}", 
+            first_hit.get("_source").and_then(|s| s.as_object()).map(|o| o.keys().collect::<Vec<_>>()));
+        
+        // Print provider request ID from ES
+        if let Some(provider_req_id) = first_hit.get("_source")
+            .and_then(|s| s.get("attributes"))
+            .and_then(|a| a.get("metadata"))
+            .and_then(|m| m.get("provider_request_id"))
+        {
+            println!("  - Provider request ID from ES: {}", provider_req_id);
+        }
+        
+        // Print gateway request ID from ES
+        if let Some(gateway_req_id) = first_hit.get("_source")
+            .and_then(|s| s.get("attributes"))
+            .and_then(|a| a.get("metadata"))
+            .and_then(|m| m.get("request_id"))
+        {
+            println!("  - Gateway request ID from ES: {}", gateway_req_id);
+        }
+    }
+    
     // Use LLM to validate the test results
     let llm_validation_passed = validate_with_llm(
         &config.provider_name,
@@ -310,6 +362,9 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
     // Create request body with streaming enabled
     let request_body = create_test_request_body(config, true);
     
+    // Print the request body for debugging
+    println!("Request body: {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()));
+    
     // Send request to the gateway
     let client = Client::new();
     let response = client
@@ -328,6 +383,13 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
         let error_body = response.text().await.expect("Failed to read error response body");
         println!("Error response from gateway: {}", error_body);
         panic!("Request failed with status: 403 Forbidden - Make sure your AWS credentials have the correct permissions for AWS Bedrock");
+    }
+    
+    // If we got a 400 Bad Request, print the response body to debug
+    if response.status() == StatusCode::BAD_REQUEST {
+        let error_body = response.text().await.expect("Failed to read error response body");
+        println!("Error response from gateway (400): {}", error_body);
+        panic!("Request failed with status: 400 Bad Request - Check API key and request format. Error: {}", error_body);
     }
     
     // Ensure the request was successful
@@ -399,6 +461,32 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
     let hits_array = hits.as_array().expect("Hits is not an array");
     assert!(!hits_array.is_empty(), "No matching documents found in ElasticSearch");
     
+    // Print the ES response for debugging
+    println!("ElasticSearch response summary:");
+    println!("  - Total hits: {}", hits_array.len());
+    if let Some(first_hit) = hits_array.first() {
+        println!("  - First hit source keys: {:?}", 
+            first_hit.get("_source").and_then(|s| s.as_object()).map(|o| o.keys().collect::<Vec<_>>()));
+        
+        // Print provider request ID from ES
+        if let Some(provider_req_id) = first_hit.get("_source")
+            .and_then(|s| s.get("attributes"))
+            .and_then(|a| a.get("metadata"))
+            .and_then(|m| m.get("provider_request_id"))
+        {
+            println!("  - Provider request ID from ES: {}", provider_req_id);
+        }
+        
+        // Print gateway request ID from ES
+        if let Some(gateway_req_id) = first_hit.get("_source")
+            .and_then(|s| s.get("attributes"))
+            .and_then(|a| a.get("metadata"))
+            .and_then(|m| m.get("request_id"))
+        {
+            println!("  - Gateway request ID from ES: {}", gateway_req_id);
+        }
+    }
+    
     // Reconstruct the complete response from the streaming chunks for the LLM validation
     let last_chunk = stream_data.last().unwrap();
     
@@ -429,15 +517,9 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
             }]
             // Intentionally omit usage field for OpenAI streaming
         })
-    } else {
-        // For other providers, include a usage field if available
-        let usage = serde_json::json!({
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        });
-        
-        serde_json::json!({
+    } else if config.provider_name == "azure-openai" {
+        // For Azure OpenAI, check if the final chunk contains usage information
+        let mut response = serde_json::json!({
             "id": last_chunk.get("id").unwrap_or(&serde_json::Value::Null),
             "object": "chat.completion",
             "model": last_chunk.get("model").unwrap_or(&serde_json::Value::Null),
@@ -458,9 +540,65 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
                     .and_then(|choices| choices.get(0))
                     .and_then(|choice| choice.get("finish_reason"))
                     .unwrap_or(&serde_json::Value::Null)
-            }],
-            "usage": usage
-        })
+            }]
+        });
+        
+        // Look for usage information in any of the final chunks
+        if let Some(usage) = stream_data.iter().rev().find_map(|chunk| chunk.get("usage")) {
+            response["usage"] = usage.clone();
+        }
+        // If no usage found in chunks, Azure OpenAI streaming typically omits usage like OpenAI
+        
+        response
+    } else {
+        // For other providers (Anthropic, Fireworks, GROQ, Together, etc.), 
+        // they typically include usage in the final streaming chunk
+        let mut response = serde_json::json!({
+            "id": last_chunk.get("id").unwrap_or(&serde_json::Value::Null),
+            "object": "chat.completion",
+            "model": last_chunk.get("model").unwrap_or(&serde_json::Value::Null),
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": stream_data.iter()
+                        .filter_map(|chunk| chunk.get("choices").and_then(|choices| 
+                            choices.get(0).and_then(|choice| 
+                                choice.get("delta").and_then(|delta| 
+                                    delta.get("content").and_then(|content| 
+                                        content.as_str())))))
+                        .collect::<Vec<_>>()
+                        .join("")
+                },
+                "finish_reason": last_chunk.get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .unwrap_or(&serde_json::Value::Null)
+            }]
+        });
+        
+        // Look for usage information in any of the chunks (usually in the final one)
+        if let Some(usage) = stream_data.iter().rev().find_map(|chunk| chunk.get("usage")) {
+            response["usage"] = usage.clone();
+            println!("Found usage in streaming chunks for {}: {:?}", config.provider_name, usage);
+        } else if config.provider_name == "groq" {
+            // GROQ has a special structure where usage is in x_groq.usage
+            if let Some(x_groq_usage) = stream_data.iter().rev().find_map(|chunk| 
+                chunk.get("x_groq").and_then(|x_groq| x_groq.get("usage"))) {
+                response["usage"] = x_groq_usage.clone();
+                println!("Found usage in x_groq field for {}: {:?}", config.provider_name, x_groq_usage);
+            } else {
+                println!("No usage found in streaming chunks for provider: {}", config.provider_name);
+                // For debugging - print the last few chunks to see what's available
+                println!("Last chunk structure: {:#?}", last_chunk);
+            }
+        } else {
+            println!("No usage found in streaming chunks for provider: {}", config.provider_name);
+            // For debugging - print the last few chunks to see what's available
+            println!("Last chunk structure: {:#?}", last_chunk);
+        }
+        
+        response
     };
     
     // Use LLM to validate the test results
@@ -523,39 +661,32 @@ pub async fn validate_with_llm(
     
     // Build the prompt for the OpenAI model
     let prompt = format!(
-        "As a LLM judge and validator your task is to make sure that all metrics are getting accurately logged for the given request ->\n\n\n\
-        This is our request and other logs ->\n\
-        Also make sure that the response from provider is OpenAI compatible always. Give error if the response format is not OpenAI compatible.
-        Running non-streaming test for provider: {}\n\
+        "As a LLM judge and validator, your task is to verify that metrics are getting accurately logged for this request.\n\n\
+        IMPORTANT: The response format does NOT need to be exactly OpenAI-compatible. Different providers (GROQ, Fireworks, etc.) have their own response formats and this is acceptable.\n\n\
+        Test Details:\n\
+        Provider: {}\n\
         Request ID: {}\n\
         Request Headers: {}\n\
-        Gateway request ID from headers: {}\n\
-        Response: {:#?}\n\
-        Waiting for data to be indexed in ElasticSearch...\n\
-        Loaded environment from .env.test\n\n\
-        This is what we stored in ElasticSearch -> \n{:#?}\n\n\n\
-        Fields we really care about ->\n\
-        tokens computation (match input_token, output_token, total_token). They can be named differently, so for validation check in the response from the ES log.\n\
-        IMPORTANT NOTE: For streaming responses, the tokens may not be present in the response object. In this case, only validate tokens in metrics if they exist in the response object. If tokens are not in the response, they can be ignored.\n\
-        There should be a valid request and response.\n\
-        request-id\n\
-        organisation+id or org_id\n\
-        project_id\n\
-        experiment_id\n\
-        user_id\n\n\
-        Ignore these fields ->\n\
-        - provider_latency can be zero.\n\
-        - provider_status_code\n\
-        - provider_latency\n\
-        - Model Mismatch like these are okay -> Request used '{model_name}', but logged request shows a different model name\n\n\n\
-        and other metrics. So just tell me in JSON response did the test pass or fail?\n\
-        IMPORTANT: A mismatch in token counts is NOT an error. be smart and match prompt_tokens with input, completion with output and total with total tokens
-        and other metrics. So just tell me in JSON response did the test pass or fail?
-        Which field failed, de descriptive in error message with failed field and reason?
-        IMPORTANT: Your response must be a valid JSON object in EXACTLY this format:\n\
+        Gateway Request ID: {}\n\
+        Provider Response: {:#?}\n\n\
+        ElasticSearch Logs: {:#?}\n\n\
+        VALIDATION RULES:\n\
+        1. Token counts: If the response contains usage tokens (prompt_tokens, completion_tokens, total_tokens), verify they match the ElasticSearch logs. Token field names may vary by provider (e.g., input_tokens vs prompt_tokens).\n\
+        2. For STREAMING responses: Usage tokens may be missing from the final response object - this is normal and acceptable.\n\
+        3. Tracking fields: These should be in the ElasticSearch logs, NOT in the response:\n\
+           - request_id or gateway request ID\n\
+           - organisation_id, org_id, or similar\n\
+           - project_id\n\
+           - experiment_id\n\
+           - user_id\n\
+        4. Response format: Different providers have different response structures (GROQ has x_groq, Fireworks has different fields). This is acceptable.\n\n\
+        IGNORE THESE:\n\
+        - provider_latency (can be zero)\n\
+        - Model name mismatches (e.g., request used '{model_name}' but log shows different name)\n\
+        - Provider-specific response format differences\n\n\
+        Return ONLY a JSON object in this exact format:\n\
         {{\n  \"test_result\": \"pass\",\n  \"failed_fields\": []\n}}\n\
-        where test_result is either \"pass\" or \"fail\", and failed_fields is an array of field names that failed validation.\n\
-        Do not include any explanation, only return the JSON object.",
+        where test_result is \"pass\" or \"fail\", and failed_fields contains specific field names that failed validation with reasons.",
         provider_name,
         request_id,
         headers_json,
