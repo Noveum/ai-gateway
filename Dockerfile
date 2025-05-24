@@ -1,5 +1,5 @@
 # Build stage
-FROM --platform=linux/amd64 rust:1.82-slim-bookworm as builder
+FROM rust:1.82-slim-bookworm AS builder
 
 # Install required dependencies
 RUN apt-get update && apt-get install -y \
@@ -13,9 +13,10 @@ WORKDIR /usr/src/app
 # Copy only necessary files first
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy main.rs to build dependencies
+# Create dummy source files to build dependencies
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
+    echo "// dummy lib file" > src/lib.rs && \
     cargo build --release --target x86_64-unknown-linux-gnu && \
     rm -rf src
 
@@ -27,7 +28,7 @@ RUN RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target x86
     strip target/x86_64-unknown-linux-gnu/release/noveum-ai-gateway
 
 # Runtime stage
-FROM --platform=linux/amd64 debian:bookworm-slim
+FROM debian:bookworm-slim
 
 # Add LABEL to identify the image
 LABEL org.opencontainers.image.source="https://github.com/noveum/ai-gateway"
