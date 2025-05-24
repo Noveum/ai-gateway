@@ -3,7 +3,10 @@ use super::utils::log_tracking_headers;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
-use axum::http::HeaderMap;
+use axum::{
+    body::Body,
+    http::{HeaderMap, Response},
+};
 use reqwest::Url;
 use serde_json::Value;
 use std::sync::Arc;
@@ -929,6 +932,34 @@ impl Provider for AzureOpenAIProvider {
             debug!("Could not extract model from request body, using body as-is");
             Ok(body)
         }
+    }
+
+    async fn process_response(&self, response: Response<Body>) -> Result<Response<Body>, AppError> {
+        debug!("Azure OpenAI process_response called");
+        
+        // Extract Azure request ID from response headers for telemetry
+        if let Some(request_id) = response.headers().get("x-request-id")
+            .and_then(|v| v.to_str().ok()) {
+            debug!("Azure OpenAI request ID: {}", request_id);
+            // Note: Request ID is available for logging/debugging
+            // In a full implementation, this could be added to telemetry context
+        } else {
+            debug!("No Azure request ID found in response headers");
+        }
+        
+        // Log other relevant Azure headers if present
+        if let Some(content_type) = response.headers().get("content-type")
+            .and_then(|v| v.to_str().ok()) {
+            debug!("Azure OpenAI response content-type: {}", content_type);
+        }
+        
+        // Check for rate limiting headers
+        if let Some(remaining) = response.headers().get("x-ratelimit-remaining-requests")
+            .and_then(|v| v.to_str().ok()) {
+            debug!("Azure OpenAI remaining requests: {}", remaining);
+        }
+        
+        Ok(response)
     }
 }
 
