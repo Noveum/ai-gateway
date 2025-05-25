@@ -4,7 +4,7 @@ use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, Response},
 };
-use tracing::error;
+use tracing::{debug, error};
 
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -35,16 +35,17 @@ pub trait Provider: Send + Sync {
     /// Sign the final request if needed
     async fn sign_request(
         &self,
-        method: &str,
-        url: &str,
-        headers: &HeaderMap,
-        body: &[u8],
+        _method: &str,
+        _url: &str,
+        _headers: &HeaderMap,
+        _body: &[u8],
     ) -> Result<HeaderMap, AppError> {
-        Ok(headers.clone())
+        // Default implementation returns the headers unchanged
+        Ok(HeaderMap::new())
     }
 
     /// Process any operations needed before the request is sent
-    async fn before_request(&self, headers: &HeaderMap, body: &Bytes) -> Result<(), AppError> {
+    async fn before_request(&self, _headers: &HeaderMap, _body: &Bytes) -> Result<(), AppError> {
         Ok(())
     }
 
@@ -68,6 +69,7 @@ pub trait Provider: Send + Sync {
 
 // Use pub instead of mod to make the modules and their contents public
 pub mod anthropic;
+pub mod azure_openai;
 pub mod bedrock;
 pub mod fireworks;
 pub mod groq;
@@ -76,6 +78,7 @@ pub mod together;
 pub mod utils;
 
 pub use anthropic::AnthropicProvider;
+pub use azure_openai::AzureOpenAIProvider;
 pub use bedrock::BedrockProvider;
 pub use fireworks::FireworksProvider;
 pub use groq::GroqProvider;
@@ -87,6 +90,13 @@ pub fn create_provider(provider_name: &str) -> Result<Box<dyn Provider>, AppErro
     match provider_name.to_lowercase().as_str() {
         "openai" => Ok(Box::new(OpenAIProvider::new())),
         "anthropic" => Ok(Box::new(AnthropicProvider::new())),
+        "azure-openai" => {
+            // Create Azure provider with relaxed validation for header-based configuration
+            let config = azure_openai::AzureOpenAIProviderConfig::default()
+                .allow_empty_resource_name(true)
+                .allow_empty_deployment_id(true);
+            Ok(Box::new(AzureOpenAIProvider::with_config(config)?))
+        },
         "groq" => Ok(Box::new(GroqProvider::new())),
         "fireworks" => Ok(Box::new(FireworksProvider::new())),
         "together" => Ok(Box::new(TogetherProvider::new())),

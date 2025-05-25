@@ -115,6 +115,56 @@ pub async fn send_provider_request(
         .send()
         .await?;
 
+    // Check for error status codes and handle provider-specific errors
+    if !response.status().is_success() {
+        debug!("Received error status: {} from provider: {}", response.status(), provider.name());
+        
+        // Handle Azure OpenAI-specific errors
+        if provider.name() == "azure-openai" {
+            // Import the AzureOpenAIProvider to access error handling
+            use crate::providers::azure_openai::{AzureOpenAIProvider, AzureOpenAIProviderConfig};
+            
+            // We need to downcast the provider to access Azure-specific methods
+            // Since we can't downcast trait objects easily, we'll create a temporary instance
+            // This is a temporary solution - in a more sophisticated design, we'd add error handling to the trait
+            let config = AzureOpenAIProviderConfig::default();
+            match AzureOpenAIProvider::with_config(config) {
+                Ok(azure_provider) => {
+                    let error = azure_provider.handle_azure_error(response).await;
+                    return Err(error);
+                }
+                Err(e) => {
+                    error!("Failed to create temporary Azure provider for error handling: {}", e);
+                    // Fall through to generic error handling
+                }
+            }
+        }
+        
+        // For other providers, use a generic error handling approach
+        let status_code = response.status().as_u16();
+        let error_body = response.text().await.unwrap_or_default();
+        
+        return Err(match status_code {
+            401 => AppError::MissingApiKey,
+            429 => AppError::RequestError("Rate limit exceeded".to_string()),
+            400..=499 => AppError::RequestError(format!(
+                "Client error ({}): {}", 
+                status_code, 
+                if error_body.is_empty() { "No details provided" } else { &error_body }
+            )),
+            500..=599 => AppError::HttpError(format!(
+                "Server error ({}): {}", 
+                status_code, 
+                if error_body.is_empty() { "No details provided" } else { &error_body }
+            )),
+            _ => AppError::HttpError(format!(
+                "HTTP error ({}): {}", 
+                status_code, 
+                if error_body.is_empty() { "No details provided" } else { &error_body }
+            )),
+        });
+    }
+
     process_response(response, config).await
 }
 

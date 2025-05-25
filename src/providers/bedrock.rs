@@ -387,7 +387,7 @@ impl Provider for BedrockProvider {
         Ok(())
     }
 
-    fn transform_path(&self, path: &str) -> String {
+    fn transform_path(&self, _path: &str) -> String {
         let model = self.current_model.read();
         let is_streaming = *self.is_streaming.read();
         

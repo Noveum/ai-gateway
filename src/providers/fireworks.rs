@@ -120,7 +120,6 @@ pub struct FireworksMetricsExtractor;
 
 impl MetricsExtractor for FireworksMetricsExtractor {
     fn extract_metrics(&self, response_body: &serde_json::Value) -> ProviderMetrics {
-        debug!("Extracting Fireworks metrics from response: {}", response_body);
         let mut metrics = ProviderMetrics::default();
         
         // Extract token information from usage field (OpenAI compatible format)

@@ -16,6 +16,7 @@
 pub mod common;
 pub mod openai_test;
 pub mod anthropic_test;
+pub mod azure_openai_test;
 pub mod groq_test;
 pub mod fireworks_test;
 pub mod together_test;

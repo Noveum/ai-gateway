@@ -2,7 +2,7 @@
 
 # Noveum AI Gateway
 
-🚀 The world's fastest AI Gateway proxy, written in Rust and optimized for maximum performance. This high-performance API gateway routes requests to various AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together, AWS Bedrock) with streaming support, making it perfect for developers who need reliable and blazing-fast AI API access.
+🚀 The world's fastest AI Gateway proxy, written in Rust and optimized for maximum performance. This high-performance API gateway routes requests to various AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together, AWS Bedrock, Azure OpenAI) with streaming support, making it perfect for developers who need reliable and blazing-fast AI API access.
 
 [![Rust](https://github.com/Noveum/ai-gateway/actions/workflows/rust.yml/badge.svg)](https://github.com/Noveum/ai-gateway/actions/workflows/rust.yml)
 [![Crates.io](https://img.shields.io/crates/v/noveum-ai-gateway.svg)](https://crates.io/crates/noveum-ai-gateway)
@@ -28,6 +28,7 @@
   - GROQ
   - Fireworks
   - Together AI
+  - Azure OpenAI
 - 📡 **Real-time Streaming**: Optimized for minimal latency
 - 🛡️ **Production Ready**: Battle-tested in high-load environments
 - 🔍 **Health Checking**: Built-in monitoring
@@ -191,6 +192,22 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     "top_p": 0.7,
     "top_k": 50,
     "repetition_penalty": 1
+  }'
+```
+
+#### Example: Azure OpenAI Request
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-provider: azure-openai" \
+  -H "api-key: your-azure-api-key" \
+  -H "x-azure-resource-name: your-resource-name" \
+  -d '{
+    "model": "gpt-4.1",
+    "messages": [{"role": "user", "content": "Hello! Can you tell me a short joke?"}],
+    "max_tokens": 300,
+    "stream": true
   }'
 ```
 

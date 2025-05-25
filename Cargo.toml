@@ -76,3 +76,7 @@ serial_test = "3.2.0"
 name = "run_integration_tests"
 path = "tests/run_integration_tests.rs"
 required-features = []
+
+[lib]
+name = "noveum_ai_gateway"
+path = "src/lib.rs"

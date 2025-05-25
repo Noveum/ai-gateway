@@ -87,10 +87,26 @@ impl MetricsExtractor for OpenAIMetricsExtractor {
             metrics.model = model.to_string();
         }
 
-        if let (Some(total_tokens), Some(model)) = (metrics.total_tokens, response_body.get("model")) {
-            metrics.cost = Some(calculate_cost(model.as_str().unwrap_or(""), total_tokens));
-            debug!("Calculated cost: {:?} for model {} and {} tokens", 
-                metrics.cost, metrics.model, total_tokens);
+        // Calculate cost if we have tokens
+        let cost = if metrics.input_tokens.is_some() && metrics.output_tokens.is_some() {
+            Some(calculate_cost(&metrics.model, metrics.input_tokens.unwrap_or(0), metrics.output_tokens.unwrap_or(0)))
+        } else if metrics.total_tokens.is_some() {
+            // Fallback: estimate 50/50 split for input/output when only total is available
+            let total = metrics.total_tokens.unwrap_or(0);
+            let estimated_input = total / 2;
+            let estimated_output = total - estimated_input;
+            Some(calculate_cost(&metrics.model, estimated_input, estimated_output))
+        } else {
+            None
+        };
+
+        metrics.cost = cost;
+        
+        if let Some(cost_value) = cost {
+            debug!("Calculated cost: ${:.6} for model {} with input: {} tokens, output: {} tokens", 
+                cost_value, metrics.model, 
+                metrics.input_tokens.unwrap_or(0), 
+                metrics.output_tokens.unwrap_or(0));
         }
 
         debug!("Final extracted metrics: {:?}", metrics);
@@ -126,11 +142,38 @@ impl MetricsExtractor for OpenAIMetricsExtractor {
     }
 }
 
-// Helper function to calculate cost based on model and tokens
-fn calculate_cost(model: &str, total_tokens: u32) -> f64 {
-    match model {
-        m if m.contains("gpt-4") => (total_tokens as f64) * 0.00003,
-        m if m.contains("gpt-3.5") => (total_tokens as f64) * 0.000002,
-        _ => 0.0,
-    }
+// Helper function to calculate cost based on model and tokens with 2024 pricing
+fn calculate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
+    let (input_cost_per_1k, output_cost_per_1k) = match model {
+        // GPT-4o models (latest flagship)
+        m if m.contains("gpt-4o") && !m.contains("mini") => (0.005, 0.015), // $5/$15 per 1M tokens
+        
+        // GPT-4o-mini models (cost-effective)
+        m if m.contains("gpt-4o-mini") => (0.0004, 0.0016), // $0.40/$1.60 per 1M tokens
+        
+        // GPT-4 Turbo models
+        m if m.contains("gpt-4-turbo") || m.contains("gpt-4-1106") || m.contains("gpt-4-0125") => {
+            (0.01, 0.03) // $10/$30 per 1M tokens
+        },
+        
+        // GPT-4 32k models
+        m if m.contains("gpt-4-32k") => (0.06, 0.12), // $60/$120 per 1M tokens
+        
+        // Standard GPT-4 models
+        m if m.contains("gpt-4") => (0.03, 0.06), // $30/$60 per 1M tokens
+        
+        // GPT-3.5 Turbo models (current pricing)
+        m if m.contains("gpt-3.5-turbo") => (0.0005, 0.0015), // $0.50/$1.50 per 1M tokens
+        
+        // O1 reasoning models (when available via OpenAI API)
+        m if m.contains("o1-preview") => (0.015, 0.06), // $15/$60 per 1M tokens
+        m if m.contains("o1-mini") => (0.003, 0.012), // $3/$12 per 1M tokens
+        
+        // Default fallback for unknown models
+        _ => (0.0, 0.0),
+    };
+    
+    let input_cost = (input_tokens as f64 / 1000.0) * input_cost_per_1k;
+    let output_cost = (output_tokens as f64 / 1000.0) * output_cost_per_1k;
+    input_cost + output_cost
 }
