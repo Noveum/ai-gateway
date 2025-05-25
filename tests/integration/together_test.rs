@@ -39,8 +39,8 @@ async fn search_elasticsearch(request_id: &str) -> Result<Value, reqwest::Error>
 
 #[tokio::test]
 async fn test_together_non_streaming() {
-    // Add delay to avoid rate limiting
-    sleep(Duration::from_secs(2)).await;
+    // Add delay to avoid rate limiting and allow services to be ready
+    sleep(Duration::from_secs(3)).await;
     
     let config = ProviderTestConfig::new("together", "TOGETHER_API_KEY", "deepseek-ai/DeepSeek-V3")
         .with_max_tokens(512);
@@ -49,8 +49,8 @@ async fn test_together_non_streaming() {
 
 #[tokio::test]
 async fn test_together_streaming() {
-    // Add delay to avoid rate limiting
-    sleep(Duration::from_secs(5)).await;
+    // Add longer delay for streaming test to avoid conflicts
+    sleep(Duration::from_secs(8)).await;
     
     let config = ProviderTestConfig::new("together", "TOGETHER_API_KEY", "deepseek-ai/DeepSeek-V3")
         .with_max_tokens(512);

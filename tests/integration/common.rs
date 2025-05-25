@@ -8,6 +8,44 @@ use uuid::Uuid;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 
+/// Custom error type for test operations
+#[derive(Debug)]
+pub enum TestError {
+    Reqwest(reqwest::Error),
+    Io(std::io::Error),
+    Custom(String),
+}
+
+impl From<reqwest::Error> for TestError {
+    fn from(err: reqwest::Error) -> Self {
+        TestError::Reqwest(err)
+    }
+}
+
+impl From<std::io::Error> for TestError {
+    fn from(err: std::io::Error) -> Self {
+        TestError::Io(err)
+    }
+}
+
+impl From<String> for TestError {
+    fn from(err: String) -> Self {
+        TestError::Custom(err)
+    }
+}
+
+impl std::fmt::Display for TestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TestError::Reqwest(e) => write!(f, "Request error: {}", e),
+            TestError::Io(e) => write!(f, "IO error: {}", e),
+            TestError::Custom(e) => write!(f, "Custom error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for TestError {}
+
 /// Configuration for a provider test
 pub struct ProviderTestConfig {
     pub provider_name: String,
@@ -69,6 +107,99 @@ pub fn generate_request_id() -> String {
     format!("test-{}", Uuid::new_v4().to_string())
 }
 
+/// Retry wrapper for async operations with exponential backoff
+async fn retry_async<F, Fut, T, E>(
+    operation_name: &str,
+    max_attempts: u32,
+    mut operation: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Debug,
+{
+    let mut last_error = None;
+    
+    for attempt in 1..=max_attempts {
+        match operation().await {
+            Ok(result) => {
+                if attempt > 1 {
+                    println!("✅ {} succeeded on attempt {}/{}", operation_name, attempt, max_attempts);
+                }
+                return Ok(result);
+            }
+            Err(e) => {
+                println!("⚠️  {} failed on attempt {}/{}: {:?}", operation_name, attempt, max_attempts, e);
+                last_error = Some(e);
+                
+                if attempt < max_attempts {
+                    let delay = Duration::from_millis(1000 * (2_u64.pow(attempt - 1))); // Exponential backoff
+                    println!("Retrying {} in {:?}...", operation_name, delay);
+                    sleep(delay).await;
+                }
+            }
+        }
+    }
+    
+    Err(last_error.unwrap())
+}
+
+/// Check if services are healthy before running tests
+async fn check_service_health() -> Result<(), Box<dyn std::error::Error>> {
+    let gateway_url = env::var("GATEWAY_URL")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    
+    println!("🔍 Checking service health...");
+    
+    // Check AI Gateway health
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    
+    retry_async("Gateway health check", 3, || async {
+        let response = client
+            .get(&format!("{}/health", gateway_url))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        
+        if response.status().is_success() {
+            println!("✅ AI Gateway is healthy");
+            Ok(())
+        } else {
+            Err(format!("Gateway health check failed with status: {}", response.status()))
+        }
+    }).await.map_err(|e| format!("Gateway health check failed: {:?}", e))?;
+    
+    // Check ElasticSearch health if configured
+    if let (Ok(es_url), Ok(es_username), Ok(es_password)) = (
+        env::var("ELASTICSEARCH_URL"),
+        env::var("ELASTICSEARCH_USERNAME"),
+        env::var("ELASTICSEARCH_PASSWORD")
+    ) {
+        retry_async("ElasticSearch health check", 3, || async {
+            let response = client
+                .get(&format!("{}/_cluster/health", es_url))
+                .basic_auth(&es_username, Some(&es_password))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            
+            if response.status().is_success() {
+                let health: Value = response.json().await.map_err(|e| e.to_string())?;
+                let status = health.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+                println!("✅ ElasticSearch is healthy (status: {})", status);
+                Ok(())
+            } else {
+                Err(format!("ElasticSearch health check failed with status: {}", response.status()))
+            }
+        }).await.map_err(|e| format!("ElasticSearch health check failed: {:?}", e))?;
+    }
+    
+    println!("✅ All services are healthy");
+    Ok(())
+}
+
 /// Search ElasticSearch for a document with the given gateway request ID
 pub async fn search_elasticsearch(gateway_request_id: &str) -> Result<Value, reqwest::Error> {
     // Ensure environment variables are loaded
@@ -83,7 +214,9 @@ pub async fn search_elasticsearch(gateway_request_id: &str) -> Result<Value, req
     let es_index = env::var("ELASTICSEARCH_INDEX")
         .expect("ELASTICSEARCH_INDEX must be set in .env.test file");
     
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let search_url = format!("{}/{}/_search", es_url, es_index);
     
     let query = json!({
@@ -96,18 +229,34 @@ pub async fn search_elasticsearch(gateway_request_id: &str) -> Result<Value, req
     
     println!("Searching ElasticSearch with query: {}", query);
     
-    let response = client
-        .post(&search_url)
-        .basic_auth(es_username, Some(es_password))
-        .json(&query)
-        .send()
-        .await?;
-    
-    response.json::<Value>().await
+    // Use retry logic for ElasticSearch search
+    retry_async("ElasticSearch search", 5, || async {
+        let response = client
+            .post(&search_url)
+            .basic_auth(&es_username, Some(&es_password))
+            .json(&query)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?;
+        
+        let response_json = response.json::<Value>().await?;
+        
+        // Check if we found any results
+        let hits = response_json.get("hits").and_then(|h| h.get("hits"));
+        if let Some(hits_array) = hits.and_then(|h| h.as_array()) {
+            if hits_array.is_empty() {
+                // Since we can't create a reqwest::Error directly, we'll use a different approach
+                // For now, we'll just continue and let the caller handle the empty results
+                println!("Warning: No documents found in ElasticSearch - data may not be indexed yet");
+            }
+        }
+        
+        Ok(response_json)
+    }).await
 }
 
 /// Set up request headers for a provider test
-pub fn setup_test_headers(provider: &str, api_key: &str, request_id: &str) -> HeaderMap {
+pub fn setup_test_headers(provider: &str, api_key: &str, _request_id: &str) -> HeaderMap {
     // Load environment variables from test config
     init_test_env();
     
@@ -199,6 +348,12 @@ fn get_api_key(env_var_name: &str) -> String {
 
 /// Run a non-streaming test for a provider
 pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
+    // Check service health before running the test
+    if let Err(e) = check_service_health().await {
+        println!("⚠️  Service health check failed: {}", e);
+        println!("Proceeding with test anyway...");
+    }
+    
     // Get the API key for the provider
     let api_key = get_api_key(&config.api_key_env_var);
     
@@ -221,49 +376,59 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
     let request_body = create_test_request_body(config, false);
     println!("Request body: {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()));
     
-    // Send request to the gateway
-    let client = Client::new();
-    let response = client
-        .post(&format!("{}/v1/chat/completions", gateway_url))
-        .headers(headers.clone())
-        .json(&request_body)
-        .send()
-        .await
-        .expect("Failed to send request");
+    // Create client with robust configuration
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to create HTTP client");
     
-    // Print the status code
-    println!("Response status: {}", response.status());
-    
-    // If we got a 403 Forbidden error, print the response body to debug
-    if response.status() == StatusCode::FORBIDDEN {
-        let error_body = response.text().await.expect("Failed to read error response body");
-        println!("Error response from gateway: {}", error_body);
-        panic!("Request failed with status: 403 Forbidden - Make sure your AWS credentials have the correct permissions for AWS Bedrock");
-    }
-    
-    // If we got a 400 Bad Request, print the response body to debug
-    if response.status() == StatusCode::BAD_REQUEST {
-        let error_body = response.text().await.expect("Failed to read error response body");
-        println!("Error response from gateway (400): {}", error_body);
-        panic!("Request failed with status: 400 Bad Request - Check API key and request format. Error: {}", error_body);
-    }
-    
-    // Ensure the request was successful
-    assert!(response.status().is_success(), 
-            "Request failed with status: {} - Make sure the AI Gateway is running with ENABLE_ELASTICSEARCH=true", 
-            response.status());
-    
-    // Extract gateway request ID from headers
-    let response_headers = response.headers().clone();
-    let gateway_request_id = response_headers.get("x-request-id")
-        .expect("x-request-id header not found in response")
-        .to_str()
-        .expect("Invalid x-request-id header value");
-    
-    println!("Gateway request ID from headers: {}", gateway_request_id);
-    
-    // Get the response body
-    let response_body = response.json::<Value>().await.expect("Failed to parse response as JSON");
+    // Send request to the gateway with retry logic
+    let (response_headers, response_body) = retry_async("Gateway request", 3, || async {
+        let response = client
+            .post(&format!("{}/v1/chat/completions", gateway_url))
+            .headers(headers.clone())
+            .json(&request_body)
+            .send()
+            .await?;
+        
+        // Print the status code
+        println!("Response status: {}", response.status());
+        
+        // If we got a 403 Forbidden error, print the response body to debug
+        if response.status() == StatusCode::FORBIDDEN {
+            let error_body = response.text().await?;
+            println!("Error response from gateway: {}", error_body);
+            panic!("Request failed with status: 403 Forbidden - Make sure your AWS credentials have the correct permissions for AWS Bedrock");
+        }
+        
+        // If we got a 400 Bad Request, print the response body to debug
+        if response.status() == StatusCode::BAD_REQUEST {
+            let error_body = response.text().await?;
+            println!("Error response from gateway (400): {}", error_body);
+            panic!("Request failed with status: 400 Bad Request - Check API key and request format. Error: {}", error_body);
+        }
+        
+        // Ensure the request was successful
+        if !response.status().is_success() {
+            panic!("Request failed with status: {} - Make sure the AI Gateway is running with ENABLE_ELASTICSEARCH=true", response.status());
+        }
+        
+        // Extract gateway request ID from headers
+        let response_headers = response.headers().clone();
+        let gateway_request_id = response_headers.get("x-request-id")
+            .expect("x-request-id header not found in response")
+            .to_str()
+            .expect("Invalid x-request-id header value");
+        
+        println!("Gateway request ID from headers: {}", gateway_request_id);
+        
+        // Get the response body
+        let response_body: Value = response.json().await?;
+        
+        Ok::<(HeaderMap, Value), reqwest::Error>((response_headers, response_body))
+    }).await.expect("Failed to send request after retries");
     
     // Print response for debugging
     // println!("Response: {:#?}", response_body);
@@ -283,7 +448,13 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
     assert!(completion_tokens > 0, "completion_tokens should be greater than 0");
     assert_eq!(prompt_tokens + completion_tokens, total_tokens, "Total tokens should equal prompt + completion tokens");
     
-    // Wait for data to be indexed in ElasticSearch
+    // Extract gateway request ID for ES search
+    let gateway_request_id = response_headers.get("x-request-id")
+        .expect("x-request-id header not found in response")
+        .to_str()
+        .expect("Invalid x-request-id header value");
+    
+    // Wait for data to be indexed in ElasticSearch with progressive delays
     println!("Waiting for data to be indexed in ElasticSearch...");
     sleep(Duration::from_secs(3)).await;
     
@@ -330,7 +501,7 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
         &config.provider_name,
         &config.model,
         &request_id,
-        &headers,
+        &response_headers,
         &response_body,
         &es_response
     ).await;
@@ -343,6 +514,12 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
 
 /// Run a streaming test for a provider
 pub async fn run_streaming_test(config: &ProviderTestConfig) {
+    // Check service health before running the test
+    if let Err(e) = check_service_health().await {
+        println!("⚠️  Service health check failed: {}", e);
+        println!("Proceeding with test anyway...");
+    }
+    
     // Get the API key for the provider
     let api_key = get_api_key(&config.api_key_env_var);
     
@@ -367,93 +544,123 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
     // Print the request body for debugging
     println!("Request body: {}", serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()));
     
-    // Send request to the gateway
-    let client = Client::new();
-    let response = client
-        .post(&format!("{}/v1/chat/completions", gateway_url))
-        .headers(headers.clone())
-        .json(&request_body)
-        .send()
-        .await
-        .expect("Failed to send request");
+    // Create client with robust configuration
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120)) // Longer timeout for streaming
+        .connect_timeout(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to create HTTP client");
     
-    // Print the status code
-    println!("Response status: {}", response.status());
-    
-    // If we got a 403 Forbidden error, print the response body to debug
-    if response.status() == StatusCode::FORBIDDEN {
-        let error_body = response.text().await.expect("Failed to read error response body");
-        println!("Error response from gateway: {}", error_body);
-        panic!("Request failed with status: 403 Forbidden - Make sure your AWS credentials have the correct permissions for AWS Bedrock");
-    }
-    
-    // If we got a 400 Bad Request, print the response body to debug
-    if response.status() == StatusCode::BAD_REQUEST {
-        let error_body = response.text().await.expect("Failed to read error response body");
-        println!("Error response from gateway (400): {}", error_body);
-        panic!("Request failed with status: 400 Bad Request - Check API key and request format. Error: {}", error_body);
-    }
-    
-    // Ensure the request was successful
-    assert!(response.status().is_success(), 
-            "Request failed with status: {} - Make sure the AI Gateway is running with ENABLE_ELASTICSEARCH=true", 
-            response.status());
-    
-    // Extract gateway request ID from headers
-    let response_headers = response.headers().clone();
-    let gateway_request_id = response_headers.get("x-request-id")
-        .expect("x-request-id header not found in response")
-        .to_str()
-        .expect("Invalid x-request-id header value");
-    
-    println!("Gateway request ID from headers: {}", gateway_request_id);
-    
-    // Get a reference to the response body stream
-    let mut stream = response.bytes_stream();
-    
-    // Consume the streaming response
-    let mut stream_data = Vec::new();
-    let mut provider_request_id = String::new();
-    
-    // Process stream chunks
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.expect("Failed to read chunk");
-        let chunk_str = std::str::from_utf8(&chunk).expect("Invalid UTF-8");
+    // Send request to the gateway with retry logic
+    let (response_headers, stream_data) = retry_async("Gateway streaming request", 3, || async {
+        let response = client
+            .post(&format!("{}/v1/chat/completions", gateway_url))
+            .headers(headers.clone())
+            .json(&request_body)
+            .send()
+            .await?;
         
-        // Process each line in the chunk
-        for line in chunk_str.lines() {
-            // Skip empty lines or data: [DONE]
-            if line.trim().is_empty() || line == "data: [DONE]" {
-                continue;
+        // Print the status code
+        println!("Response status: {}", response.status());
+        
+        // If we got a 403 Forbidden error, print the response body to debug
+        if response.status() == StatusCode::FORBIDDEN {
+            let error_body = response.text().await?;
+            println!("Error response from gateway: {}", error_body);
+            panic!("Request failed with status: 403 Forbidden - Make sure your AWS credentials have the correct permissions for AWS Bedrock");
+        }
+        
+        // If we got a 400 Bad Request, print the response body to debug
+        if response.status() == StatusCode::BAD_REQUEST {
+            let error_body = response.text().await?;
+            println!("Error response from gateway (400): {}", error_body);
+            panic!("Request failed with status: 400 Bad Request - Check API key and request format. Error: {}", error_body);
+        }
+        
+        // Ensure the request was successful
+        if !response.status().is_success() {
+            panic!("Request failed with status: {} - Make sure the AI Gateway is running with ENABLE_ELASTICSEARCH=true", response.status());
+        }
+        
+        // Extract gateway request ID from headers
+        let response_headers = response.headers().clone();
+        let gateway_request_id = response_headers.get("x-request-id")
+            .expect("x-request-id header not found in response")
+            .to_str()
+            .expect("Invalid x-request-id header value");
+        
+        println!("Gateway request ID from headers: {}", gateway_request_id);
+        
+        // Get a reference to the response body stream
+        let mut stream = response.bytes_stream();
+        
+        // Consume the streaming response with error handling
+        let mut stream_data = Vec::new();
+        let mut provider_request_id = String::new();
+        
+        // Process stream chunks with timeout protection
+        let stream_timeout = Duration::from_secs(60);
+        let start_time = std::time::Instant::now();
+        
+        while let Some(chunk_result) = stream.next().await {
+            if start_time.elapsed() > stream_timeout {
+                panic!("Stream reading timed out");
             }
             
-            // Process chunk (remove "data: " prefix and parse JSON)
-            if let Some(json_str) = line.strip_prefix("data: ") {
-                if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                    stream_data.push(json.clone());
-                    
-                    // Extract provider request ID from chunk if available and not already set
-                    if provider_request_id.is_empty() && json.get("id").is_some() {
-                        provider_request_id = json.get("id")
-                            .unwrap()
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
+            let chunk = chunk_result.map_err(|e| {
+                println!("Failed to read chunk: {:?}", e);
+                e
+            })?;
+            
+            let chunk_str = std::str::from_utf8(&chunk).expect("Invalid UTF-8 in chunk");
+            
+            // Process each line in the chunk
+            for line in chunk_str.lines() {
+                // Skip empty lines or data: [DONE]
+                if line.trim().is_empty() || line == "data: [DONE]" {
+                    continue;
+                }
+                
+                // Process chunk (remove "data: " prefix and parse JSON)
+                if let Some(json_str) = line.strip_prefix("data: ") {
+                    if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                        stream_data.push(json.clone());
                         
-                        println!("Provider request ID from stream: {}", provider_request_id);
+                        // Extract provider request ID from chunk if available and not already set
+                        if provider_request_id.is_empty() && json.get("id").is_some() {
+                            provider_request_id = json.get("id")
+                                .unwrap()
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            
+                            println!("Provider request ID from stream: {}", provider_request_id);
+                        }
                     }
                 }
             }
         }
-    }
+        
+        // Validate we received some streaming chunks
+        if stream_data.is_empty() {
+            panic!("No streaming data chunks received");
+        }
+        
+        Ok::<(HeaderMap, Vec<Value>), reqwest::Error>((response_headers, stream_data))
+    }).await.expect("Failed to complete streaming request after retries");
     
-    // Validate we received some streaming chunks
-    assert!(!stream_data.is_empty(), "No streaming data chunks received");
-    
+    // Wait for data to be indexed in ElasticSearch
     sleep(Duration::from_secs(3)).await;
     
     // Load environment variables (to make it clear in the logs)
     dotenv::from_filename(".env.test").ok();
+    
+    // Extract gateway request ID for ES search
+    let gateway_request_id = response_headers.get("x-request-id")
+        .expect("x-request-id header not found in response")
+        .to_str()
+        .expect("Invalid x-request-id header value");
     
     // Search ElasticSearch for the request using gateway request ID
     let es_response = search_elasticsearch(gateway_request_id).await.expect("Failed to search ElasticSearch");
@@ -608,7 +815,7 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
         &config.provider_name,
         &config.model,
         &request_id,
-        &headers,
+        &response_headers,
         &reconstructed_response,
         &es_response
     ).await;
@@ -711,38 +918,42 @@ pub async fn validate_with_llm(
         "temperature": 0
     });
     
-    // Send request to OpenAI
-    let client = Client::new();
-    let openai_response = client
-        .post("https://gateway.noveum.ai/v1/chat/completions")
-        // .post("https://api.openai.com/v1/chat/completions")
-        .header("provider", "openai")
-        .header("x-project-id", "noveum-integration-test")
-        .header("x-organization-id", "noveumtest")
-        .header("x-experiment-id", "eval_job_1")
-        .header("x-user-id", "shashank")
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", openai_api_key))
-        .json(&openai_request)
-        .send()
-        .await
-        .expect("Failed to send request to OpenAI");
-    
-    // Parse OpenAI response
-    let openai_result = openai_response
-        .json::<Value>()
-        .await
-        .expect("Failed to parse OpenAI response");
-    
-    // Extract and parse the validation result
-    let validation_result = openai_result
-        .get("choices")
-        .and_then(|choices| choices.get(0))
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .and_then(|content| content.as_str())
-        .and_then(|content_str| serde_json::from_str::<Value>(content_str).ok())
-        .expect("Failed to parse validation result from OpenAI");
+    // Send request to OpenAI with retry logic
+    let validation_result = retry_async("LLM validation", 3, || async {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+            
+        let openai_response = client
+            .post("https://gateway.noveum.ai/v1/chat/completions")
+            // .post("https://api.openai.com/v1/chat/completions")
+            .header("provider", "openai")
+            .header("x-project-id", "noveum-integration-test")
+            .header("x-organization-id", "noveumtest")
+            .header("x-experiment-id", "eval_job_1")
+            .header("x-user-id", "shashank")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", openai_api_key))
+            .json(&openai_request)
+            .send()
+            .await?;
+        
+        // Parse OpenAI response
+        let openai_result = openai_response.json::<Value>().await?;
+        
+        // Extract and parse the validation result
+        let validation_result = openai_result
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+            .and_then(|content_str| serde_json::from_str::<Value>(content_str).ok())
+            .expect("Failed to parse validation result from OpenAI");
+        
+        Ok::<Value, reqwest::Error>(validation_result)
+    }).await.expect("Failed to get LLM validation after retries");
     
     // Print the full validation result for debugging
     println!("LLM validation result: {:#?}", validation_result);
