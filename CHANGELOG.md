@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Azure OpenAI provider support with full enterprise integration
+  - Complete Azure-hosted OpenAI models support via `x-provider: azure-openai`
+  - Enterprise-grade security and compliance features
+  - Built-in Azure content filtering with detailed results in responses
+  - Regional deployment options for data residency requirements
+  - Azure-specific authentication using `api-key` header instead of `Authorization: Bearer`
+  - Automatic deployment-to-model mapping for accurate metrics and cost tracking
+  - Support for latest Azure OpenAI models including GPT-4.1, O3, O4 series
+  - Automatic parameter transformation for newer models (max_tokens → max_completion_tokens)
+  - Azure-specific error handling with detailed error categorization
+  - Request ID tracking for Azure OpenAI debugging and telemetry
+  - Cost calculation based on Azure OpenAI pricing model
+- Comprehensive Azure OpenAI documentation in `docs/providers/azure-openai.md`
+  - Configuration examples and usage patterns
+  - Model support matrix and pricing information
+  - Troubleshooting guide for common Azure-specific issues
+  - SDK integration examples with Node.js OpenAI client
+
+### Enhanced
+- Provider architecture extended to support Azure-specific URL construction and authentication
+- Telemetry system enhanced with Azure-specific metrics collection including content filtering results
+- Error handling improved with Azure-specific error types and detailed error messages
+- Improved ElasticSearch integration with more reliable data indexing
+- Enhanced telemetry data formatting for better analytics
+- Performance optimizations for high-volume request handling
+- Code cleanup and formatting improvements throughout the codebase
+- Documentation updates with clearer examples and instructions
+
+### Fixed
+- Connection handling issues with ElasticSearch during high load
+- Memory leak in streaming response handling for long-running requests
+- Inconsistent error reporting in provider-specific handlers
+- Timeout issues with slow-responding upstream providers
+- Race condition in concurrent request processing
+
 ## [1.0.1] - 2024-12-09
 ### Enhanced
 - Improved ElasticSearch integration with more reliable data indexing

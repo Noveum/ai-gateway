@@ -563,11 +563,11 @@ docker-compose up -d
 ### 2. Git Commands
 ```bash
 # Create and switch to a release branch
-git checkout -b release/v0.1.6
+git checkout -b release/v1.0.2
 
 # Stage and commit changes
 git add Cargo.toml CHANGELOG.md
-git commit -m "chore: release v0.1.6"
+git commit -m "chore: release v1.0.2"
 
 # Create a git tag
 git tag -a v0.1.7 -m "Release v0.1.7"
