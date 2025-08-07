@@ -1,3 +1,4 @@
+use std::env;
 use super::Provider;
 use super::utils::log_tracking_headers;
 use crate::error::AppError;
@@ -33,11 +34,13 @@ pub struct BedrockProvider {
     is_streaming: Arc<RwLock<bool>>,
     system_fingerprint: Arc<RwLock<String>>,
     first_chunk: Arc<RwLock<bool>>,
+    aws_key: Option<Arc<RwLock<String>>>,
+    aws_secret: Option<Arc<RwLock<String>>>,
 }
 
 impl BedrockProvider {
     pub fn new() -> Self {
-        let region = DEFAULT_REGION.to_string();
+        let region = env::var("AWS_REGION").unwrap_or_else(|_| DEFAULT_REGION.to_string());
         debug!("Initializing BedrockProvider with region: {}", region);
         
         // Create a random system fingerprint that will be reused across chunks
@@ -53,6 +56,12 @@ impl BedrockProvider {
             is_streaming: Arc::new(RwLock::new(false)),
             system_fingerprint: Arc::new(RwLock::new(fingerprint)),
             first_chunk: Arc::new(RwLock::new(true)),
+            aws_key: env::var("AWS_ACCESS_KEY_ID")
+                .ok()
+                .map(|key| Arc::new(RwLock::new(key))),
+            aws_secret: env::var("AWS_SECRET_ACCESS_KEY")
+                .ok()
+                .map(|key| Arc::new(RwLock::new(key))),
         }
     }
 
@@ -79,19 +88,26 @@ impl BedrockProvider {
                 AppError::InvalidRequestFormat
             })?;
 
-        let transformed_messages = messages
-            .iter()
-            .map(|msg| {
-                let content = msg["content"].as_str().unwrap_or_default();
-                json!({
-                    "role": msg["role"].as_str().unwrap_or("user"),
+        let mut transformed_messages = Vec::new();
+        let mut system_messages = Vec::new();
+
+        for msg in messages {
+            let role = msg["role"].as_str().unwrap_or("user");
+            let content = msg["content"].as_str().unwrap_or_default();
+
+            if role == "system" {
+                system_messages.push(json!({ "text": content }));
+            } else {
+                transformed_messages.push(json!({
+                    "role": role,
                     "content": [{ "text": content }]
-                })
-            })
-            .collect::<Vec<_>>();
+                }));
+            }
+        }
 
         let transformed = json!({
             "messages": transformed_messages,
+            "system": system_messages,
             "inferenceConfig": {
                 "maxTokens": body.get("max_tokens")
                     .and_then(Value::as_u64)
@@ -272,6 +288,11 @@ impl BedrockProvider {
     // Helper method to transform Bedrock response to OpenAI format
     fn transform_bedrock_to_openai_format(&self, bedrock_response: Value) -> Result<Value, AppError> {
         debug!("Transforming Bedrock response to OpenAI format");
+
+        let metrics = bedrock_response
+            .get("metrics")
+            .cloned()
+            .unwrap_or_else(|| json!({}));        
         
         // Extract content from Bedrock response
         let content = bedrock_response
@@ -307,6 +328,7 @@ impl BedrockProvider {
         
         // Create OpenAI format response
         let openai_response = json!({
+            "metrics":metrics,
             "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().to_string().replace("-", "").chars().take(10).collect::<String>()),
             "object": "chat.completion",
             "created": chrono::Utc::now().timestamp(),
@@ -431,17 +453,31 @@ impl Provider for BedrockProvider {
     fn requires_signing(&self) -> bool {
         true
     }
+    
+
 
     fn get_signing_credentials(&self, headers: &HeaderMap) -> Option<(String, String, String)> {
-        let access_key = headers.get("x-aws-access-key-id")?.to_str().ok()?;
-        let secret_key = headers.get("x-aws-secret-access-key")?.to_str().ok()?;
         let region = headers
             .get("x-aws-region")
             .and_then(|h| h.to_str().ok())
             .map(String::from)
             .unwrap_or_else(|| self.region.read().clone());
 
-        Some((access_key.to_string(), secret_key.to_string(), region))
+        let access_key = headers
+            .get("x-aws-access-key-id")
+            .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+            .or_else(|| self.aws_key.as_ref().map(|arc| arc.read().clone()))?;
+
+        let secret_key = headers
+            .get("x-aws-secret-access-key")
+            .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+            .or_else(|| self.aws_secret.as_ref().map(|arc| arc.read().clone()))?;
+        
+        debug!( //
+            "AWS credentials - Access Key: {} s: {}, Region: {}", 
+            mask_key(access_key.as_str()), mask_key(secret_key.as_str()), region,
+        );
+        Some((access_key, secret_key, region))
     }
 
     fn get_signing_host(&self) -> String {
@@ -688,4 +724,11 @@ fn calculate_bedrock_cost(model: &str, total_tokens: u32) -> f64 {
         m if m.contains("llama2") => (total_tokens as f64) * 0.00001,
         _ => 0.0,
     }
+}
+
+
+fn mask_key(key: &str) -> String {
+    let visible = 6.min(key.len());
+    let masked_len = key.len().saturating_sub(visible);
+    format!("{}{}", &key[..visible], "*".repeat(masked_len))
 }
