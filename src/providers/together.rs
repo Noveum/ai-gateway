@@ -173,3 +173,46 @@ impl Provider for TogetherProvider {
         Ok(Response::from_parts(parts, Body::from(bytes)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(auth: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(a) = auth {
+            h.insert("authorization", a.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn base_url_and_name() {
+        let p = TogetherProvider::new();
+        assert_eq!(p.base_url(), "https://api.together.xyz");
+        assert_eq!(p.name(), "together");
+        // No /v1 strip -> .../together.xyz/v1/chat/completions
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn process_headers_validates_bearer() {
+        let p = TogetherProvider::new();
+        assert!(p.process_headers(&hdr(Some("Bearer tok"))).is_ok());
+        assert!(matches!(
+            p.process_headers(&hdr(None)),
+            Err(AppError::MissingApiKey)
+        ));
+        assert!(matches!(
+            p.process_headers(&hdr(Some("Token tok"))),
+            Err(AppError::InvalidHeader)
+        ));
+        assert!(matches!(
+            p.process_headers(&hdr(Some("Bearer "))),
+            Err(AppError::InvalidHeader)
+        ));
+    }
+}

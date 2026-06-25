@@ -774,3 +774,67 @@ impl MetricsExtractor for BedrockMetricsExtractor {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn transform_path_url_encodes_slash_in_arn_model() {
+        // Inference-profile ARNs contain '/', which must be percent-encoded so it
+        // stays within the single `/model/{id}/converse` path segment.
+        let p = BedrockProvider::new();
+        *p.current_model.write() =
+            "arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude".to_string();
+        *p.is_streaming.write() = false;
+        let path = p.transform_path("/v1/chat/completions");
+        assert!(path.starts_with("/model/"));
+        assert!(path.ends_with("/converse"));
+        assert!(path.contains("%2F"), "slash must be encoded: {path}");
+        assert!(
+            !path.contains("profile/us"),
+            "raw slash must not remain: {path}"
+        );
+    }
+
+    #[test]
+    fn transform_path_plain_model_is_unencoded_and_streams() {
+        let p = BedrockProvider::new();
+        *p.current_model.write() = "anthropic.claude-3-5-sonnet-20240620-v1:0".to_string();
+        *p.is_streaming.write() = false;
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse"
+        );
+        *p.is_streaming.write() = true;
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream"
+        );
+    }
+
+    #[test]
+    fn extract_metrics_reads_bedrock_token_fields() {
+        let body = json!({
+            "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "usage": {"inputTokens": 80, "outputTokens": 20, "totalTokens": 100}
+        });
+        let m = BedrockMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(80));
+        assert_eq!(m.output_tokens, Some(20));
+        assert_eq!(m.total_tokens, Some(100));
+    }
+
+    #[test]
+    fn extract_metrics_openai_shape_fallback() {
+        let body = json!({
+            "model": "x",
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        });
+        let m = BedrockMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(7));
+        assert_eq!(m.output_tokens, Some(3));
+        assert_eq!(m.total_tokens, Some(10));
+    }
+}

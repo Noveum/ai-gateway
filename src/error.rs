@@ -168,3 +168,45 @@ impl From<Infallible> for AppError {
         unreachable!("Infallible error cannot occur")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    async fn status_and_body(e: AppError) -> (StatusCode, serde_json::Value) {
+        let resp = e.into_response();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn maps_client_errors_to_4xx() {
+        assert_eq!(
+            status_and_body(AppError::UnsupportedProvider).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_and_body(AppError::MissingApiKey).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_and_body(AppError::InvalidHeader).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_and_body(AppError::InvalidRequestFormat).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn error_body_has_message_and_type() {
+        let (status, body) = status_and_body(AppError::UnsupportedProvider).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["message"], "Unsupported AI provider");
+        assert_eq!(body["error"]["type"], "UnsupportedProvider");
+    }
+}

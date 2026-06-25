@@ -523,3 +523,89 @@ fn transform_anthropic_to_openai_format(anthropic_response: Value) -> Value {
 
     transformed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(auth: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(a) = auth {
+            h.insert("authorization", a.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn base_url_and_name() {
+        let p = AnthropicProvider::new();
+        assert_eq!(p.base_url(), "https://api.anthropic.com");
+        assert_eq!(p.name(), "anthropic");
+    }
+
+    #[test]
+    fn transform_path_maps_chat_completions_to_messages() {
+        let p = AnthropicProvider::new();
+        assert_eq!(p.transform_path("/v1/chat/completions"), "/v1/messages");
+        // Non chat-completions paths are unchanged.
+        assert_eq!(p.transform_path("/v1/models"), "/v1/models");
+    }
+
+    #[test]
+    fn process_headers_converts_bearer_to_x_api_key_and_sets_version() {
+        let p = AnthropicProvider::new();
+        let out = p.process_headers(&hdr(Some("Bearer sk-ant-xyz"))).unwrap();
+        assert_eq!(out.get("x-api-key").unwrap(), "sk-ant-xyz");
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+        assert!(out.get(http::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn process_headers_missing_auth_errors() {
+        let p = AnthropicProvider::new();
+        assert!(matches!(
+            p.process_headers(&hdr(None)),
+            Err(AppError::MissingApiKey)
+        ));
+    }
+
+    #[test]
+    fn extract_metrics_reads_anthropic_usage_fields() {
+        // Anthropic native shape: usage.input_tokens / output_tokens (no total).
+        let body = json!({
+            "model": "claude-sonnet-4-5-20250929",
+            "usage": {"input_tokens": 100, "output_tokens": 40}
+        });
+        let m = AnthropicMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(100));
+        assert_eq!(m.output_tokens, Some(40));
+        assert_eq!(
+            m.total_tokens,
+            Some(140),
+            "total computed from input+output"
+        );
+        // claude-sonnet-4-5 family: 3.0 in / 15.0 out per 1M
+        let expected = (100.0 / 1e6) * 3.0 + (40.0 / 1e6) * 15.0;
+        assert!((m.cost.unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transform_to_openai_shape_flattens_content_and_usage() {
+        let anthropic = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5-20250929",
+            "content": [{"type": "text", "text": "Hello "}, {"type": "text", "text": "world"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 2}
+        });
+        let out = transform_anthropic_to_openai_format(anthropic);
+        assert_eq!(out["object"], "chat.completion");
+        assert_eq!(out["choices"][0]["message"]["content"], "Hello world");
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+        assert_eq!(out["usage"]["prompt_tokens"], 5);
+        assert_eq!(out["usage"]["completion_tokens"], 2);
+        assert_eq!(out["usage"]["total_tokens"], 7);
+    }
+}

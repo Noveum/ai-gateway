@@ -515,4 +515,120 @@ mod tests {
         assert!(rewrite_output_text("anthropic", &mut j, "[X]"));
         assert_eq!(j["content"][0]["text"], "[X]");
     }
+
+    fn redact_email_engine() -> PolicyEngine {
+        let bundle = crate::policy::config::PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"red","type":"pii_detection","mode":"enforce",
+            "config":{"phase":"input","entities":["EMAIL_ADDRESS"],"action":"redact"}}]}"#,
+        )
+        .unwrap();
+        PolicyEngine::from_bundle(&bundle, crate::policy::engine::EngineOptions::default())
+    }
+
+    #[test]
+    fn apply_input_transforms_redacts_string_content() {
+        let e = redact_email_engine();
+        let mut j = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "mail me at a@b.com"}]
+        });
+        assert!(apply_input_transforms(&e, "gpt-4o", &mut j));
+        assert_eq!(j["messages"][0]["content"], "mail me at [REDACTED]");
+    }
+
+    #[test]
+    fn apply_input_transforms_redacts_array_multimodal_parts() {
+        // H2: array-form (multimodal) content parts must be redacted, not just scanned.
+        let e = redact_email_engine();
+        let mut j = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "reach me: a@b.com"},
+                    {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+                    {"type": "text", "text": "or c@d.io"}
+                ]
+            }]
+        });
+        assert!(apply_input_transforms(&e, "gpt-4o", &mut j));
+        assert_eq!(
+            j["messages"][0]["content"][0]["text"],
+            "reach me: [REDACTED]"
+        );
+        assert_eq!(j["messages"][0]["content"][2]["text"], "or [REDACTED]");
+        // Non-text part is untouched.
+        assert_eq!(
+            j["messages"][0]["content"][1]["image_url"]["url"],
+            "https://x/y.png"
+        );
+    }
+
+    #[test]
+    fn apply_input_transforms_redacts_array_system_blocks() {
+        // H2: Anthropic array-form `system` blocks must also be redacted.
+        let e = redact_email_engine();
+        let mut j = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "system": [{"type": "text", "text": "owner is admin@corp.com"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(apply_input_transforms(&e, "claude-sonnet-4-5", &mut j));
+        assert_eq!(j["system"][0]["text"], "owner is [REDACTED]");
+    }
+
+    #[test]
+    fn apply_input_transforms_noop_without_match() {
+        let e = redact_email_engine();
+        let mut j = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "no pii here"}]
+        });
+        assert!(!apply_input_transforms(&e, "gpt-4o", &mut j));
+    }
+
+    #[test]
+    fn is_guardable_only_for_post_json_v1() {
+        use axum::http::{header, Method, Request};
+        let mk = |method: Method, path: &str, ct: Option<&str>| {
+            let mut b = Request::builder().method(method).uri(path);
+            if let Some(ct) = ct {
+                b = b.header(header::CONTENT_TYPE, ct);
+            }
+            b.body(()).unwrap()
+        };
+        assert!(is_guardable(&mk(
+            Method::POST,
+            "/v1/chat/completions",
+            Some("application/json")
+        )));
+        // wrong method
+        assert!(!is_guardable(&mk(
+            Method::GET,
+            "/v1/chat/completions",
+            Some("application/json")
+        )));
+        // not anchored to /v1/
+        assert!(!is_guardable(&mk(
+            Method::POST,
+            "/health",
+            Some("application/json")
+        )));
+        assert!(!is_guardable(&mk(
+            Method::POST,
+            "/api/v1/x",
+            Some("application/json")
+        )));
+        // non-json
+        assert!(!is_guardable(&mk(
+            Method::POST,
+            "/v1/chat/completions",
+            Some("text/plain")
+        )));
+        assert!(!is_guardable(&mk(
+            Method::POST,
+            "/v1/chat/completions",
+            None
+        )));
+    }
 }

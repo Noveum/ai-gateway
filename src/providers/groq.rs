@@ -344,3 +344,49 @@ impl MetricsExtractor for GroqMetricsExtractor {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn base_url_keeps_openai_segment() {
+        let p = GroqProvider::new();
+        assert_eq!(p.base_url(), "https://api.groq.com/openai");
+        assert_eq!(p.name(), "groq");
+        // No /v1 strip: /v1/chat/completions stays, yielding .../openai/v1/chat/completions
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn extract_metrics_prefers_x_groq_usage() {
+        let body = json!({
+            "model": "openai/gpt-oss-20b",
+            "x_groq": {"usage": {"prompt_tokens": 72, "completion_tokens": 10, "total_tokens": 82, "total_time": 0.25}},
+            "usage": {"prompt_tokens": 999, "completion_tokens": 999, "total_tokens": 1998}
+        });
+        let m = GroqMetricsExtractor.extract_metrics(&body);
+        assert_eq!(
+            m.input_tokens,
+            Some(72),
+            "x_groq.usage wins over root usage"
+        );
+        assert_eq!(m.output_tokens, Some(10));
+        assert_eq!(m.total_tokens, Some(82));
+        assert!(m.provider_latency.as_millis() >= 250);
+    }
+
+    #[test]
+    fn extract_metrics_falls_back_to_root_usage() {
+        let body = json!({
+            "model": "openai/gpt-oss-20b",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+        });
+        let m = GroqMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.total_tokens, Some(8));
+    }
+}

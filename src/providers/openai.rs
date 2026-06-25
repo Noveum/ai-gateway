@@ -170,3 +170,90 @@ impl MetricsExtractor for OpenAIMetricsExtractor {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn hdr(auth: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(a) = auth {
+            h.insert("authorization", a.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn base_url_and_name() {
+        let p = OpenAIProvider::new();
+        assert_eq!(p.base_url(), "https://api.openai.com");
+        assert_eq!(p.name(), "openai");
+    }
+
+    #[test]
+    fn default_transform_path_is_identity() {
+        let p = OpenAIProvider::new();
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn process_headers_forwards_auth_and_sets_json() {
+        let p = OpenAIProvider::new();
+        let out = p.process_headers(&hdr(Some("Bearer sk-test"))).unwrap();
+        assert_eq!(
+            out.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-test"
+        );
+        assert_eq!(
+            out.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn process_headers_missing_auth_errors() {
+        let p = OpenAIProvider::new();
+        assert!(matches!(
+            p.process_headers(&hdr(None)),
+            Err(AppError::MissingApiKey)
+        ));
+    }
+
+    #[test]
+    fn extract_metrics_reads_usage_and_costs() {
+        let body = json!({
+            "model": "gpt-4o-mini",
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500}
+        });
+        let m = OpenAIMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(1000));
+        assert_eq!(m.output_tokens, Some(500));
+        assert_eq!(m.total_tokens, Some(1500));
+        assert_eq!(m.model, "gpt-4o-mini");
+        // gpt-4o-mini: 0.15 in / 0.60 out per 1M (dual-rate)
+        let expected = (1000.0 / 1e6) * 0.15 + (500.0 / 1e6) * 0.60;
+        assert!((m.cost.unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn extract_metrics_unknown_model_no_cost() {
+        let body = json!({
+            "model": "made-up-model",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        assert!(OpenAIMetricsExtractor.extract_metrics(&body).cost.is_none());
+    }
+
+    #[test]
+    fn streaming_chunk_with_usage_is_extracted() {
+        let chunk = r#"{"model":"gpt-4o","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#;
+        let m = OpenAIMetricsExtractor
+            .try_extract_provider_specific_streaming_metrics(chunk)
+            .expect("usage chunk should yield metrics");
+        assert_eq!(m.total_tokens, Some(5));
+    }
+}

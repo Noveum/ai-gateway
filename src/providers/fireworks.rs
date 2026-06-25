@@ -184,3 +184,40 @@ impl MetricsExtractor for FireworksMetricsExtractor {
         metrics
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn base_url_includes_v1_and_path_is_stripped() {
+        let p = FireworksProvider::new();
+        assert_eq!(p.base_url(), "https://api.fireworks.ai/inference/v1");
+        assert_eq!(p.name(), "fireworks");
+        // base already carries /v1, so the incoming /v1 prefix is stripped.
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/chat/completions"
+        );
+    }
+
+    #[test]
+    fn extract_metrics_reads_usage_and_costs() {
+        // Regression: Fireworks cost used to always be None despite the model
+        // being in the pricing table.
+        let body = json!({
+            "id": "abc",
+            "model": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000}
+        });
+        let m = FireworksMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(1000));
+        assert_eq!(m.output_tokens, Some(1000));
+        assert_eq!(m.request_id.as_deref(), Some("abc"));
+        // llama-v3p3-70b-instruct: 0.90 in / 0.90 out per 1M
+        let expected = (1000.0 / 1e6) * 0.90 + (1000.0 / 1e6) * 0.90;
+        assert!(m.cost.is_some(), "Fireworks cost must be computed");
+        assert!((m.cost.unwrap() - expected).abs() < 1e-9);
+    }
+}
