@@ -1,8 +1,9 @@
 //! Fireworks AI provider adapter.
 //!
 //! Forwards to Fireworks' OpenAI-compatible API
-//! (`https://api.fireworks.ai/inference`). Token usage comes from the standard
-//! `usage` object and cost is priced via the shared table.
+//! (`https://api.fireworks.ai/inference/v1`; the incoming `/v1` prefix is
+//! stripped since the base URL already carries it). Token usage comes from the
+//! standard `usage` object and cost is priced via the shared table.
 
 use super::utils::log_tracking_headers;
 use super::Provider;
@@ -16,7 +17,7 @@ use axum::{
 use tracing::{debug, error};
 
 /// Provider adapter for Fireworks AI (`x-provider: fireworks`). Base URL
-/// `https://api.fireworks.ai/inference`; OpenAI-compatible wire format.
+/// `https://api.fireworks.ai/inference/v1`; OpenAI-compatible wire format.
 pub struct FireworksProvider {
     base_url: String,
 }

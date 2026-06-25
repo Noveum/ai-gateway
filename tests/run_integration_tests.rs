@@ -9,12 +9,6 @@
 //! # Gateway URL (default: http://localhost:3000)
 //! GATEWAY_URL=http://localhost:3000
 //!
-//! # ElasticSearch Configuration
-//! ELASTICSEARCH_URL=http://localhost:9200
-//! ELASTICSEARCH_USERNAME=elastic
-//! ELASTICSEARCH_PASSWORD=your_password
-//! ELASTICSEARCH_INDEX=ai-gateway-metrics
-//!
 //! # Provider API Keys
 //! OPENAI_API_KEY=your_openai_api_key
 //! ANTHROPIC_API_KEY=your_anthropic_api_key
@@ -31,8 +25,8 @@
 //! # Running the tests
 //!
 //! ```bash
-//! # Start the gateway with ElasticSearch in one terminal
-//! ENABLE_ELASTICSEARCH=true cargo run
+//! # Start the gateway in one terminal
+//! cargo run
 //!
 //! # In another terminal, run the tests
 //! cargo test --test run_integration_tests -- --nocapture

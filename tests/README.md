@@ -20,8 +20,7 @@ To run these tests, you need:
 
 1. A running instance of the AI Gateway (either locally or in a development environment)
 2. API keys for the providers you want to test
-3. A configured ElasticSearch instance for metrics collection
-4. A `.env.test` file with the required environment variables
+3. A `.env.test` file with the required environment variables
 
 ## Environment Setup
 
@@ -45,12 +44,6 @@ For running tests, creating a `.env.test` file is recommended to keep your test 
    ```
    # Gateway URL (default: http://localhost:3000)
    GATEWAY_URL=http://localhost:3000
-
-   # ElasticSearch Configuration
-   ELASTICSEARCH_URL=http://localhost:9200
-   ELASTICSEARCH_USERNAME=elastic
-   ELASTICSEARCH_PASSWORD=your_password
-   ELASTICSEARCH_INDEX=ai-gateway-metrics
 
    # Provider API Keys
    OPENAI_API_KEY=your_openai_api_key
@@ -80,17 +73,16 @@ The AWS Bedrock integration test uses the Claude 3 Sonnet model (`anthropic.clau
 The test validates that:
 1. Request IDs are properly extracted from the AWS Bedrock response headers
 2. Streaming and non-streaming modes work correctly
-3. Token usage and metrics are properly captured in ElasticSearch
+3. Token usage is present and correct in the gateway response
 
 ## Running the Tests
 
 ### Start the Gateway
 
-First, start the AI Gateway in a separate terminal with ElasticSearch enabled:
+First, start the AI Gateway in a separate terminal:
 
 ```bash
-# Start the gateway with ElasticSearch enabled
-ENABLE_ELASTICSEARCH=true cargo run
+cargo run
 ```
 
 ### Using the Test Runner Script
@@ -136,9 +128,9 @@ The `--nocapture` flag ensures that test output (e.g., request/response details)
    nano .env.test
    ```
 
-2. Start the gateway with ElasticSearch enabled:
+2. Start the gateway:
    ```bash
-   ENABLE_ELASTICSEARCH=true cargo run
+   cargo run
    ```
 
 3. Run the integration tests:
@@ -161,11 +153,9 @@ If you encounter test failures, check the following:
 
 1. **Environment Variables**: Ensure your `.env.test` file exists and contains valid API keys for the providers you're testing. The test output will show which file was loaded.
 
-2. **Gateway Status**: Make sure the AI Gateway is running with `ENABLE_ELASTICSEARCH=true`.
+2. **Gateway Status**: Make sure the AI Gateway is running.
 
-3. **ElasticSearch Setup**: Verify that ElasticSearch is properly configured and accessible.
-
-4. **Console Output**: Look at the test output for detailed error messages, which often point to specific configuration issues.
+3. **Console Output**: Look at the test output for detailed error messages, which often point to specific configuration issues.
 
 5. **Environment File Not Found**: The tests will show which environment file was loaded. If you see "Warning: Neither .env.test nor .env files were found", you need to create one of these files with your test configuration.
 
@@ -211,9 +201,7 @@ pub mod groq_test; // Add the new module here
 
 2. **Authentication Errors**: Make sure your API keys in `.env.test` are valid and have the necessary permissions.
 
-3. **ElasticSearch Connectivity**: Verify that ElasticSearch is properly configured and accessible. Check the gateway logs for any connection errors.
-
-4. **Test Failures**: The tests validate a variety of metrics and response fields. If tests fail, review the test output for details on which validation failed.
+3. **Test Failures**: The tests validate the gateway's proxied response (status, OpenAI-compatible shape, token usage). If tests fail, review the test output for details on which validation failed.
 
 5. **Environment File Not Found**: The tests will show which environment file was loaded. If you see "Warning: Neither .env.test nor .env files were found", you need to create one of these files with your test configuration.
 
@@ -222,10 +210,10 @@ pub mod groq_test; // Add the new module here
 To see detailed logs from the gateway during test execution, adjust the log level when starting the gateway:
 
 ```bash
-RUST_LOG=debug ENABLE_ELASTICSEARCH=true cargo run
+RUST_LOG=debug cargo run
 ```
 
-This will provide more information about request processing, metric extraction, and ElasticSearch integration.
+This will provide more information about request processing and metric extraction.
 
 ## Adding Custom Test Cases
 

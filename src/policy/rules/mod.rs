@@ -4,7 +4,7 @@
 //! [`Policy`] definition (parsing its type-specific `config`) and, at request
 //! time, produces a [`RuleOutcome`] describing what it detected and what action
 //! it would take. The engine wraps that outcome with the policy's mode
-//! (shadow/enforce) to produce the final [`PolicyDecision`].
+//! (shadow/enforce) to produce the final [`PolicyDecision`](super::decision::PolicyDecision).
 //!
 //! Adding a new policy type is intentionally local: implement [`PolicyRule`],
 //! add a `parse` arm in [`compile_rule`], and the engine, middleware, and

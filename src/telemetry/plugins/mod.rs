@@ -2,7 +2,8 @@
 //!
 //! A "plugin" is a [`crate::telemetry::metrics::MetricsExporter`] that ships
 //! per-request metrics somewhere. The console plugin (debug logging) lives here;
-//! the Noveum trace exporter lives in [`crate::telemetry::exporters`].
+//! add new exporters as `MetricsExporter` implementations and register them in
+//! `main.rs`.
 
 pub mod console;
 

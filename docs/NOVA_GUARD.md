@@ -3,14 +3,12 @@
 Nova Guard is the policy-enforcement layer built into the Noveum AI Gateway. It
 inspects every LLM request and response flowing through the gateway and can
 **block**, **redact / mask**, or **flag** based on policies you define. It runs
-the deterministic policy types entirely in-process (no network dependency), so
-the gateway enforces guardrails standalone (BYOK mode) as well as when wired to
-the Noveum control plane for hosted policies and atomic budget reservation.
+the deterministic policy types entirely in-process (no network dependency), from
+a **local policy bundle** (file or inline env) — the gateway enforces guardrails
+standalone (BYOK mode) with no external service.
 
-> Nova Guard in the gateway is one of three enforcement surfaces (the others are
-> the `noveum-trace` Python SDK and the litellm patch) that share one control
-> plane. A policy authored once enforces identically on whichever surface your
-> traffic uses.
+> Hosted policy distribution and budget reservation via the Noveum control plane
+> are planned future work; today the gateway loads policies locally.
 
 ## Quick start
 
@@ -35,8 +33,6 @@ the Noveum control plane for hosted policies and atomic budget reservation.
 | `NOVEUM_GUARD_POLICIES_FILE` | _(unset)_ | Path to a `nova-guard.json` bundle. |
 | `NOVEUM_GUARD_POLICIES` | _(unset)_ | Inline JSON bundle (used if no file is set). |
 | `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` (HTTP 200 with a refusal completion) or `provider_error` (HTTP 403 with the provider's error envelope). |
-| `NOVEUM_ENDPOINT` / `NOVEUM_API_KEY` | _(unset)_ | Control-plane endpoint + key (enables hosted policy fetch + budget reservation). |
-| `ENABLE_NOVEUM_TRACES` | `false` | Ship per-request traces to the Noveum platform's `/v1/traces`. |
 
 When the engine is disabled or has zero active policies, the middleware
 short-circuits without buffering the body, so guardrails add **no overhead** when
@@ -44,8 +40,7 @@ unused.
 
 ## Policy bundle
 
-The bundle format (`nova-guard.json`) is shared with the Nova Guard SDK and
-control plane:
+The bundle format (`nova-guard.json`) is shared with the Nova Guard SDK:
 
 ```json
 {
@@ -97,15 +92,16 @@ control plane:
 
 ## Policy types
 
-Deterministic types are enforced in-process; the v1.5 classifier types
+All of the types below are enforced in-process. The classifier types
 (`scorer_gate`, `prompt_injection`, `topic_restriction`, `content_moderation`,
-`grounding_check`) are recognized and routed to the NovaEval scoring service
-(shared with the SDK).
+`grounding_check`) are reserved names that parse cleanly but are **not yet
+enforced** (they would require an external scoring service); a bundle containing
+them is accepted and those policies are skipped.
 
 | Type | Phase(s) | What it does |
 |---|---|---|
-| `cost_cap` | input | Block/flag when project spend over a window crosses a cap (soft + hard). Strict mode reserves atomically via the control plane. |
-| `rate_limit` | input | Block when requests/tokens over a window exceed a limit. |
+| `cost_cap` | input | Block/flag when project spend over a window crosses a cap (soft + hard). **Requires a cross-request state backend** (not bundled today); without one it fails open — see [Modes and fail-safety](#modes-and-fail-safety). |
+| `rate_limit` | input | Block when requests/tokens over a window exceed a limit. **Requires a cross-request state backend** (not bundled today); without one it fails open. |
 | `model_allowlist` | input | Allow only listed models (or deny specific ones); supports `gpt-4*` wildcards. |
 | `regex_match` | input/output/both | Block/redact/mask/flag on regex matches (linear-time, ReDoS-safe). |
 | `banned_substrings` | input/output/both | Block/redact a fixed list of literal terms (Aho-Corasick). |
@@ -133,9 +129,12 @@ regardless of the configured action.
 compose — each policy (in priority order) sees the previous policy's mutated
 text.
 
-For `cost_cap` / `rate_limit`, when live state is unavailable the policy fails
-**open** (allows) by default; set `failClosed: true` (or `enforcementMode:
-strict` with the control plane) to fail **closed** (block).
+`cost_cap` and `rate_limit` need a cross-request state backend (spend/rate
+counters) to evaluate. No backend is bundled today, so they **always fail open**
+(allow) — and a `failClosed: true` on those two types is neutralized at load time
+with a warning, so a stale bundle can't block 100% of traffic. (The stateless
+policy types — regex, PII, secrets, banned substrings, model allowlist, JSON
+schema, token caps — enforce fully with no backend.)
 
 ## Streaming
 

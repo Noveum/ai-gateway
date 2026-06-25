@@ -5,9 +5,9 @@
 //! (off/shadow/enforce), composes transforms (each policy sees the previous
 //! policy's mutated text), and short-circuits on the first enforced block.
 //!
-//! State is held behind an [`arc_swap::ArcSwap`] so a background refresh task
-//! (control-plane polling) can hot-swap the active policy set without locking
-//! the request hot path.
+//! State is held behind an [`arc_swap::ArcSwap`] so the active policy set can be
+//! hot-swapped at runtime ([`PolicyEngine::swap_bundle`]) without locking the
+//! request hot path.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -43,6 +43,23 @@ impl PolicyMeta {
             fail_closed: p.fail_closed,
         }
     }
+}
+
+/// `cost_cap` / `rate_limit` need a cross-request live-state backend to evaluate
+/// spend/rate. None is currently bundled, so they always fail open. A policy
+/// authored with `failClosed: true` would otherwise block 100% of traffic
+/// permanently (state can never arrive), so we neutralize that flag at compile
+/// time with a warning rather than ship a self-inflicted outage.
+fn neutralize_stateful_fail_closed(mut meta: PolicyMeta) -> PolicyMeta {
+    if meta.fail_closed {
+        warn!(
+            policy = %meta.id, kind = ?meta.policy_type,
+            "cost_cap/rate_limit `failClosed` has no live-state backend to enforce against; \
+             forcing fail-open to avoid blocking all traffic"
+        );
+        meta.fail_closed = false;
+    }
+    meta
 }
 
 /// A compiled text rule plus its policy metadata.
@@ -198,7 +215,7 @@ impl PolicyEngine {
                 PolicyType::CostCap => {
                     match serde_json::from_value::<CostCapConfig>(p.config.clone()) {
                         Ok(config) => cost_caps.push(CostCapPolicy {
-                            meta: PolicyMeta::from_policy(p),
+                            meta: neutralize_stateful_fail_closed(PolicyMeta::from_policy(p)),
                             config,
                         }),
                         Err(e) => {
@@ -209,7 +226,7 @@ impl PolicyEngine {
                 PolicyType::RateLimit => {
                     match serde_json::from_value::<RateLimitConfig>(p.config.clone()) {
                         Ok(config) => rate_limits.push(RateLimitPolicy {
-                            meta: PolicyMeta::from_policy(p),
+                            meta: neutralize_stateful_fail_closed(PolicyMeta::from_policy(p)),
                             config,
                         }),
                         Err(e) => {
@@ -243,7 +260,9 @@ impl PolicyEngine {
         }
     }
 
-    /// Replace the active policy set atomically (used by the control-plane refresh).
+    /// Replace the active policy set atomically at runtime (lock-free via
+    /// `ArcSwap`). Lets an embedder hot-reload policies without restarting; the
+    /// enabled/disabled flag is preserved.
     pub fn swap_bundle(&self, bundle: &PolicyBundle) {
         let enabled = self.state.load().enabled;
         self.state.store(Arc::new(Self::compile(bundle, enabled)));
@@ -741,13 +760,19 @@ mod tests {
     }
 
     #[test]
-    fn cost_cap_fail_closed_when_marked() {
+    fn cost_cap_fail_closed_is_neutralized_without_state_backend() {
+        // A `failClosed` cost_cap must NOT block when there is no live-state
+        // backend (which is always, currently) — otherwise it would block 100%
+        // of traffic forever. compile() neutralizes the flag with a warning.
         let e = engine(
             r#"{"policies":[{"name":"budget","type":"cost_cap","mode":"enforce","failClosed":true,
             "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
         );
         let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, None);
-        assert!(r.is_blocked(), "fail-closed cost_cap blocks without state");
+        assert!(
+            !r.is_blocked(),
+            "fail-closed cost_cap must fail open without a state backend"
+        );
     }
 
     #[test]

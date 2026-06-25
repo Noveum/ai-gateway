@@ -95,14 +95,15 @@ impl Policy {
     }
 }
 
-/// The set of policy types. Deterministic types are enforced in-process by the
-/// gateway; `ScorerGate` and the v1.5 classifier types are evaluated by calling
-/// the NovaEval scoring service (shared with the SDK); unrecognized types
-/// deserialize to `Unknown` and are skipped.
+/// The set of policy types. The deterministic types are enforced in-process by
+/// the gateway. The classifier types are reserved names that parse cleanly but
+/// are **not yet enforced** (they would require an external scoring service);
+/// they are accepted and skipped, like `Unknown`, so a forward-looking bundle
+/// does not error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyType {
-    // --- v1 deterministic (enforced in-process) ---
+    // --- deterministic, enforced in-process ---
     CostCap,
     RateLimit,
     ModelAllowlist,
@@ -112,7 +113,7 @@ pub enum PolicyType {
     SecretsDetection,
     JsonSchema,
     TokenLengthCap,
-    // --- v1.5 (evaluated via NovaEval scorer-gate; recognized but routed out) ---
+    // --- reserved classifier types: parsed but not yet enforced (skipped) ---
     ScorerGate,
     PromptInjection,
     TopicRestriction,

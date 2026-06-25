@@ -1,11 +1,47 @@
 # Changelog
 
-All notable changes to MagicAPI AI Gateway will be documented in this file.
+All notable changes to Noveum AI Gateway will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.1.0] - 2026-06-25
+### Added
+- **Nova Guard** in-process policy enforcement, loaded from a **local** policy
+  bundle (file or inline): model allow/deny, regex, banned substrings, PII &
+  secrets detection, JSON-schema validation, and token caps — block, redact, or
+  flag requests/responses. (`cost_cap`/`rate_limit` are present but require a
+  cross-request state backend; without one they fail open.) See
+  [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md).
+- New providers: Mistral, Cohere, Google Gemini, DeepSeek, xAI (Grok), OpenRouter,
+  and Perplexity, served through a generic OpenAI-compatible adapter. See
+  [docs/providers/openai-compatible.md](docs/providers/openai-compatible.md).
+- Built-in, single-sourced model pricing table with per-request cost. See
+  [docs/PRICING.md](docs/PRICING.md).
+- Pluggable `MetricsExporter` trait with a console exporter (`DEBUG_METRICS`).
+
+### Changed
+- **Cost is now computed with dual (input/output) rates** from the shared pricing
+  table for every provider, replacing per-provider single-rate estimates.
+- Google and Cohere now route through their OpenAI-compatibility endpoints.
+- Provider-name dispatch for metrics is case-insensitive.
+
+### Removed
+- **Elasticsearch exporter** and its configuration/dependencies.
+- Unused configuration knobs and dead code; unused dependencies
+  (`elasticsearch`, `tokio-retry`, `opentelemetry`, `metrics`, `backon`).
+
+### Deferred (future work, not in this release)
+- Noveum platform integration: trace export to the Noveum trace API, hosted
+  Nova Guard policy distribution, and atomic budget reservation. The gateway runs
+  self-contained with local policies; these will be added once the platform-side
+  endpoints are available.
+
+### Fixed
+- `MAX_CONNECTIONS` is now honored (it was silently overridden by a hardcoded value).
+- Fireworks responses now report cost (previously always missing).
 
 ## [1.0.1] - 2024-12-09
 ### Enhanced
@@ -38,7 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optimized metrics middleware for performance monitoring
 - Updated documentation to reflect new features and capabilities
 - Console plugin for local metrics visualization
-- Elasticsearch exporter for advanced analytics and visualization (See [Elasticsearch Integration Guide](docs/elasticsearch-integration.md))
+- Elasticsearch exporter for advanced analytics and visualization (removed in 1.1.0)
 - Complete token usage tracking with cost estimation
 - Detailed performance metrics for each request including latency and TTFB
 - Provider-specific metrics for better monitoring and analysis
@@ -133,7 +169,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error handling
 - Basic documentation
 
-[Unreleased]: https://github.com/noveum/ai-gateway/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/Noveum/ai-gateway/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/Noveum/ai-gateway/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/noveum/ai-gateway/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/noveum/ai-gateway/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/noveum/ai-gateway/compare/v0.1.7...v0.2.0

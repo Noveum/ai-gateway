@@ -11,15 +11,14 @@ use std::{sync::Arc, time::Duration};
 
 use colored::*;
 use tokio::signal;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use noveum_ai_gateway::{
     build_router,
     config::{AppConfig, TelemetryConfig},
-    control_plane::{spawn_policy_refresh, ControlPlaneClient, ControlPlaneConfig},
     policy::PolicyEngine,
-    telemetry::{exporters::NoveumTraceExporter, ConsolePlugin, MetricsRegistry},
+    telemetry::{ConsolePlugin, MetricsRegistry},
     AppState,
 };
 
@@ -67,16 +66,10 @@ async fn main() {
             .await;
     }
 
-    // Noveum trace exporter — ships gateway traffic to the Noveum platform's
-    // trace-ingest endpoint so it appears alongside SDK traffic.
-    if let Some(exporter) = NoveumTraceExporter::from_env() {
-        metrics_registry.register_exporter(Box::new(exporter)).await;
-        info!("Noveum trace exporter registered");
-    }
-
-    // Nova Guard policy engine. Loads policies from the configured source
-    // (local file and/or the Noveum control plane). On any load failure it
-    // degrades to a transparent pass-through so the gateway never fails to boot.
+    // Nova Guard policy engine. Loads policies from the local source
+    // (`NOVEUM_GUARD_POLICIES_FILE` or inline `NOVEUM_GUARD_POLICIES`). On any
+    // load failure it degrades to a transparent pass-through so the gateway never
+    // fails to boot.
     info!("Initializing Nova Guard policy engine");
     let policy_engine = Arc::new(PolicyEngine::from_env().await);
     info!(
@@ -88,45 +81,6 @@ async fn main() {
             "disabled (pass-through)"
         }
     );
-
-    // Hosted policy distribution: when the Noveum control plane is configured
-    // (`NOVEUM_ENDPOINT` + `NOVEUM_API_KEY`) and a project id is set, poll the
-    // control plane for the project's policy bundle and hot-swap it into the
-    // engine. This is what makes hosted policies (and, server-side, strict budget
-    // reservation) active; without it the gateway runs local/standalone policies.
-    if let Some(cp_config) = ControlPlaneConfig::from_env() {
-        match std::env::var("NOVEUM_PROJECT_ID")
-            .or_else(|_| std::env::var("NOVEUM_PROJECT"))
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            Some(project_id) => {
-                let interval = std::env::var("NOVEUM_POLICY_REFRESH_SECS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .filter(|s| *s > 0)
-                    .map(Duration::from_secs)
-                    .unwrap_or_else(|| Duration::from_secs(30));
-                spawn_policy_refresh(
-                    policy_engine.clone(),
-                    ControlPlaneClient::new(cp_config),
-                    project_id.clone(),
-                    interval,
-                );
-                info!(
-                    "Nova Guard: hosted policy distribution enabled (project={}, every {}s)",
-                    project_id,
-                    interval.as_secs()
-                );
-            }
-            None => {
-                warn!(
-                    "NOVEUM_ENDPOINT/NOVEUM_API_KEY are set but NOVEUM_PROJECT_ID is missing; \
-                     hosted policy distribution is disabled (using local policies only)"
-                );
-            }
-        }
-    }
 
     // Build the router with the full middleware stack.
     info!("Registering request handlers and API routes");

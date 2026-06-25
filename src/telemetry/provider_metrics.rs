@@ -47,33 +47,6 @@ impl ProviderMetrics {
         estimated_tokens
     }
 
-    /// Creates partial metrics from accumulated text
-    ///
-    /// This is useful for streaming responses where we need to estimate tokens
-    /// from accumulated text when the provider doesn't give us metrics directly.
-    ///
-    /// # Arguments
-    /// * `model` - The model name
-    /// * `accumulated_text` - The accumulated text to estimate tokens from
-    ///
-    /// # Returns
-    /// A ProviderMetrics instance with estimated output tokens
-    pub fn create_partial_metrics(model: String, accumulated_text: &str) -> Self {
-        let output_tokens = if !accumulated_text.is_empty() {
-            Some(Self::estimate_tokens_from_text(accumulated_text))
-        } else {
-            None
-        };
-
-        ProviderMetrics {
-            model,
-            provider_latency: Duration::from_millis(0),
-            output_tokens,
-            // We don't have input tokens or total tokens
-            ..Default::default()
-        }
-    }
-
     /// Extract tracking headers from the original request headers
     pub fn extract_tracking_headers(headers: &HeaderMap) -> Self {
         let mut metrics = Self::default();
@@ -152,7 +125,7 @@ pub trait MetricsExtractor: Send + Sync {
     /// * `chunk` - A string containing a streaming chunk from the provider
     ///
     /// # Returns
-    /// Option<ProviderMetrics> with metrics if they could be extracted
+    /// `Option<ProviderMetrics>` with metrics if they could be extracted
     fn extract_streaming_metrics(&self, chunk: &str) -> Option<ProviderMetrics> {
         // First try provider-specific detection based on known patterns
         if let Some(metrics) = self.try_extract_provider_specific_streaming_metrics(chunk) {
@@ -172,7 +145,7 @@ pub trait MetricsExtractor: Send + Sync {
     /// * `chunk` - A string containing a streaming chunk from the provider
     ///
     /// # Returns
-    /// Option<ProviderMetrics> with metrics if they could be extracted
+    /// `Option<ProviderMetrics>` with metrics if they could be extracted
     fn try_extract_provider_specific_streaming_metrics(
         &self,
         _chunk: &str,
@@ -190,7 +163,7 @@ pub trait MetricsExtractor: Send + Sync {
     /// * `chunk` - A string containing a streaming chunk from the provider
     ///
     /// # Returns
-    /// Option<ProviderMetrics> with metrics if they could be extracted
+    /// `Option<ProviderMetrics>` with metrics if they could be extracted
     fn try_extract_common_streaming_metrics(&self, chunk: &str) -> Option<ProviderMetrics> {
         debug!("Attempting common streaming metrics extraction for chunk");
 
@@ -251,11 +224,10 @@ pub fn get_metrics_extractor(provider: &str) -> Box<dyn MetricsExtractor> {
         "bedrock" => Box::new(BedrockMetricsExtractor),
         "groq" => Box::new(GroqMetricsExtractor),
         "fireworks" => Box::new(FireworksMetricsExtractor), // Fireworks-specific extractor
-        "together" => Box::new(OpenAIMetricsExtractor),     // OpenAI-compatible format
         // All generic OpenAI-compatible providers share one extractor that reads
         // the standard `usage` object and costs via the shared pricing table.
-        "mistral" | "cohere" | "google" | "gemini" | "deepseek" | "xai" | "grok" | "openrouter"
-        | "perplexity" => Box::new(OpenAICompatibleMetricsExtractor),
+        "together" | "mistral" | "cohere" | "google" | "gemini" | "deepseek" | "xai" | "grok"
+        | "openrouter" | "perplexity" => Box::new(OpenAICompatibleMetricsExtractor),
         _ => Box::new(OpenAIMetricsExtractor), // Default to OpenAI format
     }
 }

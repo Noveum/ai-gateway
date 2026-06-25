@@ -4,8 +4,8 @@
 //! June 2026 (verified against official provider pricing pages). Cached-input,
 //! batch, and Gemini's >200K tier are NOT represented here — callers that need
 //! exact cached/batch billing must adjust separately. This table exists to
-//! support `cost_cap` reservation estimates and per-request cost annotation, not
-//! to be the system of record for billing.
+//! support per-request cost annotation and the `cost_cap` policy, not to be the
+//! system of record for billing.
 
 /// `(model_id, input_usd_per_1m, output_usd_per_1m)`.
 pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
@@ -149,13 +149,6 @@ pub fn estimate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 
     }
 }
 
-/// Worst-case cost of a call for budget reservation: known input tokens priced
-/// as input, plus `max_tokens` priced as output. This is the value a strict
-/// `cost_cap` reserves before the call (see the budget-reservation design).
-pub fn reservation_cost(model: &str, input_tokens: u32, max_output_tokens: u32) -> f64 {
-    estimate_cost(model, input_tokens, max_output_tokens)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,14 +218,6 @@ mod tests {
     #[test]
     fn unknown_model_cost_zero() {
         assert_eq!(estimate_cost("nope", 1000, 1000), 0.0);
-    }
-
-    #[test]
-    fn reservation_uses_max_output() {
-        // reservation should price max_output as output tokens
-        let r = reservation_cost("gpt-4o", 1000, 4000);
-        let expected = (1000.0 / 1e6) * 2.50 + (4000.0 / 1e6) * 10.00;
-        assert!((r - expected).abs() < 1e-12);
     }
 
     #[test]

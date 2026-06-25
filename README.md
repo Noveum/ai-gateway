@@ -22,26 +22,20 @@
 - 🚀 **Blazing fast performance**: Built in Rust with zero-cost abstractions
 - ⚡ **Optimized for low latency and high throughput**
 - 🔄 **Unified API interface for multiple AI providers**:
-  - OpenAI
-  - AWS Bedrock
-  - Anthropic
-  - GROQ
-  - Fireworks
-  - Together AI
-  - Mistral
-  - Cohere
-  - Google Gemini
-  - DeepSeek
-  - xAI (Grok)
-  - OpenRouter
-  - Perplexity
+  - OpenAI — [guide](docs/providers/openai.md)
+  - AWS Bedrock — [guide](docs/providers/bedrock.md)
+  - Anthropic — [guide](docs/providers/anthropic.md)
+  - GROQ — [guide](docs/providers/groq.md)
+  - Fireworks — [guide](docs/providers/fireworks.md)
+  - Together AI — [guide](docs/providers/together.md)
+  - Mistral, Cohere, Google Gemini, DeepSeek, xAI (Grok), OpenRouter, Perplexity — [OpenAI-compatible providers guide](docs/providers/openai-compatible.md)
 - 💰 **Per-request cost tracking** across all providers from a built-in,
   single-sourced model pricing table — see [docs/PRICING.md](docs/PRICING.md).
 - 📡 **Real-time Streaming**: Optimized for minimal latency
-- 🛡️ **Nova Guard policy enforcement**: In-process guardrails — cost caps, rate limits, model allow/deny, regex, banned substrings, PII & secrets detection, JSON-schema validation, token caps — that block, redact, or flag requests and responses. Runs standalone (BYOK) or wired to the Noveum control plane for hosted policies and atomic budget reservation. See [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md).
+- 🛡️ **Nova Guard policy enforcement**: In-process guardrails — model allow/deny, regex, banned substrings, PII & secrets detection, JSON-schema validation, token caps — that block, redact, or flag requests and responses, loaded from a local policy bundle (file or inline). See [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md).
 - 🛡️ **Production Ready**: Battle-tested in high-load environments
 - 🔍 **Health Checking**: Built-in monitoring
-- 📊 **Telemetry & Metrics**: Per-request token usage and cost tracking, exported as span-based traces to the [Noveum platform](docs/NOVA_GUARD.md) (set `ENABLE_NOVEUM_TRACES=true`), plus an optional console exporter for local debugging
+- 📊 **Telemetry & Metrics**: Per-request token usage and cost tracking with a pluggable `MetricsExporter` trait; ships with a console exporter (set `DEBUG_METRICS=true`) for local debugging. See [docs/telemetry-plugins.md](docs/telemetry-plugins.md).
 - 🌐 **CORS Support**: Configurable cross-origin resource sharing
 - 🛠️ **SDK Compatibility**: Works with any OpenAI-compatible SDK
 
@@ -90,8 +84,6 @@ The server will start on `http://127.0.0.1:3000` by default.
 
 ### Running the Gateway
 
-You can configure the gateway using environment variables:
-
 ```bash
 # Basic configuration
 export RUST_LOG=info
@@ -102,6 +94,34 @@ noveum-ai-gateway
 # Or with custom port
 PORT=8080 noveum-ai-gateway
 ```
+
+### Configuration (environment variables)
+
+**Server / runtime**
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | TCP port to listen on |
+| `HOST` | `127.0.0.1` | Bind address |
+| `WORKER_THREADS` | derived from CPU cores | Tokio worker thread count |
+| `MAX_CONNECTIONS` | `10000` | Max idle HTTP connections kept per upstream host |
+| `RUST_LOG` | `info` | Log filter (e.g. `info`, `debug`, `noveum_ai_gateway=debug`) |
+
+**Telemetry (optional)**
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEBUG_METRICS` | `false` | Register the console metrics exporter (prints each request's token/cost metrics) |
+| `DEPLOYMENT_ENVIRONMENT` | `development` | Value for the `deployment.environment` resource tag |
+
+**Nova Guard policy enforcement (optional)** — see [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md):
+
+| Variable | Default | Description |
+|---|---|---|
+| `NOVEUM_GUARD_ENABLED` | `true` | Master switch for Nova Guard (accepts `false`/`0`/`no`/`off`/`disabled`) |
+| `NOVEUM_GUARD_POLICIES_FILE` | — | Path to a local `nova-guard.json` policy bundle |
+| `NOVEUM_GUARD_POLICIES` | — | Inline JSON policy bundle (alternative to the file) |
+| `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` or `provider_error` |
 
 ## 📚 Usage Examples
 
@@ -353,7 +373,7 @@ Noveum Developer AI Gateway is designed for maximum performance:
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+We welcome contributions! Please see our [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
 
 ### 🛠️ Development Setup
 
@@ -429,24 +449,18 @@ docker run -p 3000:3000 \
   noveum/noveum-ai-gateway:latest
 ```
 
-### Using Pre-built Docker Image with Noveum trace export
+### Using Pre-built Docker Image with Nova Guard policies
 
-Export per-request token/cost traces to the Noveum platform by setting the
-Noveum env vars (see [Nova Guard docs](docs/NOVA_GUARD.md)):
+Mount a local policy bundle and point Nova Guard at it:
 
 ```bash
 docker pull noveum/noveum-ai-gateway:latest  --platform linux/amd64
 docker run --platform linux/amd64 -p 3000:3000 \
   -e RUST_LOG=info \
-  -e ENABLE_NOVEUM_TRACES=true \
-  -e NOVEUM_ENDPOINT=https://api.noveum.ai/api \
-  -e NOVEUM_API_KEY=nv_your_api_key \
-  -e NOVEUM_PROJECT=your-project-id \
+  -e NOVEUM_GUARD_POLICIES_FILE=/etc/nova-guard.json \
+  -v "$(pwd)/nova-guard.json:/etc/nova-guard.json:ro" \
   noveum/noveum-ai-gateway:latest
 ```
-
-> **Note**: Per-request project attribution can also be set with the
-> `x-project-id` request header, which overrides `NOVEUM_PROJECT`.
 
 ### Docker Compose
 
@@ -491,9 +505,9 @@ Then run either option with:
 docker-compose up -d
 ```
 
-#### Option 3: Use Prebuilt Image with Noveum trace export
+#### Option 3: Use Prebuilt Image with Nova Guard policies
 
-Create a `docker-compose.yml` that ships token/cost traces to the Noveum platform:
+Create a `docker-compose.yml` that mounts a local policy bundle:
 
 ```yaml
 version: '3.8'
@@ -505,10 +519,9 @@ services:
       - "3000:3000"
     environment:
       - RUST_LOG=info
-      - ENABLE_NOVEUM_TRACES=true
-      - NOVEUM_ENDPOINT=https://api.noveum.ai/api
-      - NOVEUM_API_KEY=nv_your_api_key
-      - NOVEUM_PROJECT=your-project-id
+      - NOVEUM_GUARD_POLICIES_FILE=/etc/nova-guard.json
+    volumes:
+      - ./nova-guard.json:/etc/nova-guard.json:ro
     restart: unless-stopped
 ```
 
@@ -626,8 +639,6 @@ Noveum Gateway includes comprehensive integration tests for all supported provid
 2. Start the gateway:
    ```bash
    cargo run
-   # optionally export traces to Noveum:
-   # ENABLE_NOVEUM_TRACES=true NOVEUM_ENDPOINT=https://api.noveum.ai/api NOVEUM_API_KEY=nv_... cargo run
    ```
 
 3. Run the integration tests:

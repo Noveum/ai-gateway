@@ -11,15 +11,15 @@ ids from headers). The [`MetricsRegistry`] fans that value out to every register
 [`MetricsExporter`] concurrently, so adding a destination is just implementing one
 trait and registering it at startup.
 
-- `RequestMetrics` and the serializers (`to_otel_log`, `to_noveum_trace`) —
-  `src/telemetry/mod.rs`
+- `RequestMetrics` and the `to_otel_log` serializer — `src/telemetry/mod.rs`
 - `MetricsExporter` trait + `MetricsRegistry` — `src/telemetry/metrics.rs`
 - Built-in exporters:
   - **Console** (`src/telemetry/plugins/console.rs`) — pretty-prints metrics for
     local debugging. Enabled with `DEBUG_METRICS=true`.
-  - **Noveum trace** (`src/telemetry/exporters/noveum_trace.rs`) — ships traffic to
-    the Noveum platform as a span-based trace batch. Enabled with
-    `ENABLE_NOVEUM_TRACES=true` plus `NOVEUM_ENDPOINT` and `NOVEUM_API_KEY`.
+
+  Shipping traffic to an external observability backend (e.g. a Noveum trace
+  exporter) is a matter of implementing `MetricsExporter` and registering it in
+  `main.rs` — see below.
 
 ## The `MetricsExporter` trait
 
@@ -57,8 +57,7 @@ telemetry only — never the proxied request.
    impl MetricsExporter for DatadogExporter {
        async fn export_metrics(&self, metrics: RequestMetrics) -> Result<(), Box<dyn std::error::Error>> {
            // Map RequestMetrics -> your wire format and POST it.
-           // metrics.to_noveum_trace(project, env) and metrics.to_otel_log() are
-           // available if a span/otel shape helps.
+           // metrics.to_otel_log() is available if an OTel-log shape helps.
            Ok(())
        }
        fn name(&self) -> &str { "datadog" }
@@ -74,8 +73,8 @@ telemetry only — never the proxied request.
    }
    ```
 
-4. **Test it** with a `wiremock` mock server, asserting the request shape and that
-   failures surface as `Err` (see `noveum_trace.rs` tests for the pattern).
+4. **Test it** with a mock HTTP server (e.g. `wiremock`), asserting the request
+   shape and that failures surface as `Err`.
 
 ## Project / org attribution
 

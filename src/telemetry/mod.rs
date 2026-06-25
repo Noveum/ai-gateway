@@ -1,4 +1,3 @@
-pub mod exporters;
 pub mod metrics;
 pub mod middleware;
 pub mod plugins;
@@ -13,7 +12,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceInfo {
+pub(crate) struct ResourceInfo {
     #[serde(rename = "service.name")]
     pub service_name: String,
     #[serde(rename = "service.version")]
@@ -34,7 +33,7 @@ impl Default for ResourceInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogAttributes {
+pub(crate) struct LogAttributes {
     // Basic identifying fields
     pub id: String,
     pub thread_id: String,
@@ -58,7 +57,7 @@ pub struct LogAttributes {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogMetadata {
+pub(crate) struct LogMetadata {
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub latency: u128,
@@ -81,7 +80,7 @@ pub struct LogMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenInfo {
+pub(crate) struct TokenInfo {
     pub input: Option<u32>,
     pub output: Option<u32>,
     pub total: Option<u32>,
@@ -239,162 +238,6 @@ impl RequestMetrics {
             "resource": resource,
             "name": "ai_gateway_request_log",
             "attributes": attributes
-        })
-    }
-
-    /// Serialize this request as a single Noveum-platform **trace** object,
-    /// matching the `noveum-trace` Python SDK wire format so gateway traffic
-    /// lands in the same project view as SDK traffic.
-    ///
-    /// The shape mirrors the SDK's `Trace.to_dict()` plus the transport layer's
-    /// injected fields (`project`, `environment`, `sdk`): a trace with one span
-    /// representing the LLM call, carrying `llm.*` attributes (model, usage, cost,
-    /// finish/latency) so the Noveum UI parses it identically to SDK spans.
-    /// `project` is the project id the trace is attributed to (the ingest API
-    /// requires it). Wrap the result in `{ "traces": [...], "timestamp": ... }`.
-    pub fn to_noveum_trace(&self, project: &str, environment: &str) -> Value {
-        let now = chrono::Utc::now();
-        let dur_ms = self.total_latency.as_millis() as u64;
-        let start = now - chrono::Duration::milliseconds(dur_ms as i64);
-        let start_s = start.to_rfc3339();
-        let end_s = now.to_rfc3339();
-
-        // A trace is an error if the gateway recorded an error, or if either the
-        // gateway or the upstream provider returned a 4xx/5xx status. This keeps
-        // the trace/span status honest for proxied provider failures (e.g. a
-        // provider 404/429) that don't otherwise bump the error counters.
-        let http_failed = self.status_code >= 400 || self.provider_status_code >= 400;
-        let is_error = self.error_count > 0 || self.provider_error_count > 0 || http_failed;
-        let status = if is_error { "error" } else { "ok" };
-        let counted_errors = self.error_count + self.provider_error_count;
-        let error_count = if is_error {
-            counted_errors.max(1)
-        } else {
-            counted_errors
-        };
-
-        let trace_id = self
-            .id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let span_id = Uuid::new_v4().to_string();
-
-        // Span attributes follow the noveum-trace SDK `llm.*` convention so the
-        // Noveum UI parses model/usage/cost identically to SDK-emitted spans.
-        let mut attrs = serde_json::Map::new();
-        attrs.insert("llm.provider".into(), json!(self.provider));
-        attrs.insert("llm.model".into(), json!(self.model));
-        attrs.insert("llm.operation".into(), json!("chat"));
-        attrs.insert("llm.streaming".into(), json!(self.is_streaming));
-        if let Some(t) = self.input_tokens {
-            attrs.insert("llm.input_tokens".into(), json!(t));
-            attrs.insert("llm.usage.input_tokens".into(), json!(t));
-            attrs.insert("llm.usage.prompt_tokens".into(), json!(t));
-        }
-        if let Some(t) = self.output_tokens {
-            attrs.insert("llm.output_tokens".into(), json!(t));
-            attrs.insert("llm.usage.output_tokens".into(), json!(t));
-            attrs.insert("llm.usage.completion_tokens".into(), json!(t));
-        }
-        if let Some(t) = self.total_tokens {
-            attrs.insert("llm.total_tokens".into(), json!(t));
-            attrs.insert("llm.usage.total_tokens".into(), json!(t));
-        }
-        if let Some(c) = self.cost {
-            attrs.insert("llm.cost.total".into(), json!(c));
-            attrs.insert("llm.cost.currency".into(), json!("USD"));
-        }
-        attrs.insert(
-            "llm.latency_ms".into(),
-            json!(self.provider_latency.as_millis()),
-        );
-        if self.ttfb.as_millis() > 0 {
-            attrs.insert(
-                "llm.time_to_first_token_ms".into(),
-                json!(self.ttfb.as_millis()),
-            );
-        }
-        if let Some(rid) = &self.provider_request_id {
-            attrs.insert("llm.request_id".into(), json!(rid));
-        }
-        // Transport / HTTP attributes.
-        attrs.insert("http.method".into(), json!(self.method));
-        attrs.insert("http.route".into(), json!(self.path));
-        attrs.insert("http.status_code".into(), json!(self.status_code));
-        attrs.insert("http.request.size".into(), json!(self.request_size));
-        attrs.insert("http.response.size".into(), json!(self.response_size));
-        attrs.insert(
-            "gateway.provider_status_code".into(),
-            json!(self.provider_status_code),
-        );
-        if let Some(et) = &self.error_type {
-            attrs.insert("error.type".into(), json!(et));
-        }
-        // Request / response payloads (sanitized to avoid deeply-nested content).
-        if let Some(req) = &self.request_body {
-            attrs.insert(
-                "llm.request".into(),
-                self.sanitize_json_for_export(req.clone()),
-            );
-        }
-        if self.is_streaming && self.streamed_data.is_some() {
-            let mut resp = self.response_body.clone().unwrap_or_else(|| json!({}));
-            if let Some(chunks) = &self.streamed_data {
-                resp["streamed_data"] = json!(chunks);
-            }
-            attrs.insert("llm.response".into(), self.sanitize_json_for_export(resp));
-        } else if let Some(resp) = &self.response_body {
-            attrs.insert(
-                "llm.response".into(),
-                self.sanitize_json_for_export(resp.clone()),
-            );
-        }
-
-        let span = json!({
-            "span_id": span_id,
-            "trace_id": trace_id,
-            "parent_span_id": null,
-            "name": format!("{} {}", self.provider, self.model),
-            "start_time": start_s,
-            "end_time": end_s,
-            "duration_ms": dur_ms,
-            "status": status,
-            "status_message": self.error_type,
-            "attributes": Value::Object(attrs),
-            "events": [],
-            "links": [],
-        });
-
-        json!({
-            "trace_id": trace_id,
-            "name": format!("ai_gateway {} {}", self.provider, self.model),
-            "start_time": start_s,
-            "end_time": end_s,
-            "duration_ms": dur_ms,
-            "status": status,
-            "status_message": self.error_type,
-            "span_count": 1,
-            "error_count": error_count,
-            "project": project,
-            "environment": environment,
-            "sdk": { "name": "noveum-ai-gateway", "version": env!("CARGO_PKG_VERSION") },
-            "attributes": {
-                "llm.provider": self.provider,
-                "llm.model": self.model,
-                "service.name": "noveum-ai-gateway",
-            },
-            "metadata": {
-                "user_id": self.user_id,
-                "session_id": null,
-                "request_id": self.provider_request_id,
-                "tags": {},
-                "custom_attributes": {
-                    "org_id": self.org_id,
-                    "experiment_id": self.experiment_id,
-                    "thread_id": self.thread_id,
-                },
-            },
-            "spans": [span],
         })
     }
 

@@ -1,14 +1,12 @@
 //! Policy bundle sources.
 //!
-//! v1 supports loading the active [`PolicyBundle`] from:
+//! The active [`PolicyBundle`] is loaded locally from:
 //! * a local file (`NOVEUM_GUARD_POLICIES_FILE`) — for dev, CI, self-hosted, and
-//!   air-gapped deployments, mirroring the SDK's file source; and
+//!   air-gapped deployments; or
 //! * an inline env var (`NOVEUM_GUARD_POLICIES`) — convenient for containers.
 //!
-//! The control-plane HTTP source (ETag-conditional polling of
-//! `GET /v1/projects/:id/policies`) is implemented in [`crate::control_plane`]
-//! and swapped into the engine by a background task; this module is the local
-//! bootstrap source.
+//! Returns an empty (pass-through) bundle when neither is set. Policies can also
+//! be replaced at runtime via [`crate::policy::PolicyEngine::swap_bundle`].
 
 use super::config::PolicyBundle;
 

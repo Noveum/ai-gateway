@@ -31,7 +31,7 @@ fi
 echo -e "${BLUE}Checking if AI Gateway is running...${NC}"
 if ! curl -s http://localhost:3000/health > /dev/null; then
     echo -e "${RED}Error: AI Gateway does not appear to be running. Please start it with:${NC}"
-    echo -e "${YELLOW}ENABLE_ELASTICSEARCH=true cargo run${NC}"
+    echo -e "${YELLOW}cargo run${NC}"
     exit 1
 fi
 

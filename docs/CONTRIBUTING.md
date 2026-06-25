@@ -1,6 +1,6 @@
-# Contributing to MagicAPI AI Gateway
+# Contributing to Noveum AI Gateway
 
-Thank you for considering contributing to the MagicAPI AI Gateway! We welcome contributions from the community to help improve and expand the project. This document outlines the process for contributing and provides some guidelines to ensure a smooth collaboration.
+Thank you for considering contributing to the Noveum AI Gateway! We welcome contributions from the community to help improve and expand the project. This document outlines the process for contributing and provides some guidelines to ensure a smooth collaboration.
 
 ## Getting Started
 
@@ -9,7 +9,7 @@ Thank you for considering contributing to the MagicAPI AI Gateway! We welcome co
    - Explore the codebase to get a sense of the project's structure and coding style.
 
 2. **Check Open Issues**:
-   - Visit the [GitHub Issues](https://github.com/MagicAPI/ai-gateway/issues) page to see if there are any existing issues you can help with.
+   - Visit the [GitHub Issues](https://github.com/Noveum/ai-gateway/issues) page to see if there are any existing issues you can help with.
    - Feel free to comment on issues if you need more information or want to express interest in working on them.
 
 3. **Fork the Repository**:
@@ -71,4 +71,4 @@ Here are some areas where contributions would be particularly valuable:
 
 ## Thank You!
 
-Your contributions are greatly appreciated and help make MagicAPI AI Gateway better for everyone. We look forward to your input and collaboration! 
+Your contributions are greatly appreciated and help make Noveum AI Gateway better for everyone. We look forward to your input and collaboration! 
