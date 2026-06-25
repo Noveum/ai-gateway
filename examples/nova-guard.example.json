@@ -1,0 +1,122 @@
+{
+  "bundleVersion": "1.0",
+  "scope": { "organizationId": "org_example", "projectId": "proj_example" },
+  "policies": [
+    {
+      "name": "Production model allowlist",
+      "type": "model_allowlist",
+      "mode": "enforce",
+      "priority": 10,
+      "config": {
+        "allowed": ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4-6", "claude-haiku-4-5"],
+        "action": "block"
+      }
+    },
+    {
+      "name": "Monthly LLM budget",
+      "type": "cost_cap",
+      "mode": "enforce",
+      "failClosed": true,
+      "priority": 20,
+      "config": {
+        "window": "1mo_calendar",
+        "maxUsd": 1500,
+        "softUsd": 1200,
+        "action": "block",
+        "enforcementMode": "strict"
+      }
+    },
+    {
+      "name": "Per-minute rate limit",
+      "type": "rate_limit",
+      "mode": "enforce",
+      "priority": 30,
+      "config": {
+        "windows": [
+          { "period": "1m", "maxRequests": 120, "action": "block" },
+          { "period": "1d", "maxTokens": 50000000, "action": "block" }
+        ]
+      }
+    },
+    {
+      "name": "Strip PII from prompts and responses",
+      "type": "pii_detection",
+      "mode": "enforce",
+      "priority": 40,
+      "config": {
+        "phase": "both",
+        "entities": ["EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "CREDIT_CARD_NUMBER", "IP_ADDRESS"],
+        "action": "mask",
+        "maskChar": "*"
+      }
+    },
+    {
+      "name": "Block leaked credentials",
+      "type": "secrets_detection",
+      "mode": "enforce",
+      "failClosed": true,
+      "priority": 50,
+      "config": {
+        "phase": "both",
+        "detectors": ["aws_access_key", "github_pat", "openai_key", "anthropic_key", "private_key_pem", "jwt"],
+        "action": "block"
+      }
+    },
+    {
+      "name": "Block US SSN in output",
+      "type": "regex_match",
+      "mode": "enforce",
+      "priority": 60,
+      "config": {
+        "phase": "output",
+        "patterns": [
+          { "name": "ssn_us", "regex": "\\b\\d{3}-\\d{2}-\\d{4}\\b" }
+        ],
+        "action": "block"
+      }
+    },
+    {
+      "name": "Internal codenames",
+      "type": "banned_substrings",
+      "mode": "shadow",
+      "priority": 70,
+      "config": {
+        "phase": "both",
+        "words": ["project_atlas", "internal_codename"],
+        "caseInsensitive": true,
+        "action": "redact",
+        "redactWith": "[REDACTED]"
+      }
+    },
+    {
+      "name": "Cheap-model input cap",
+      "type": "token_length_cap",
+      "mode": "enforce",
+      "priority": 80,
+      "config": {
+        "phase": "input",
+        "maxTokens": 8000,
+        "scopeToModels": ["gpt-4o-mini"],
+        "action": "block"
+      }
+    },
+    {
+      "name": "Tool output must be valid JSON",
+      "type": "json_schema",
+      "mode": "shadow",
+      "priority": 90,
+      "config": {
+        "phase": "output",
+        "allowMarkdownCodeFences": true,
+        "schema": {
+          "type": "object",
+          "required": ["status"],
+          "properties": {
+            "status": { "type": "string", "enum": ["ok", "error"] }
+          }
+        },
+        "action": "block"
+      }
+    }
+  ]
+}

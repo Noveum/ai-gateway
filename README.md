@@ -28,10 +28,14 @@
   - GROQ
   - Fireworks
   - Together AI
+  - Mistral
+  - Cohere
+  - Google Gemini
 - 📡 **Real-time Streaming**: Optimized for minimal latency
+- 🛡️ **Nova Guard policy enforcement**: In-process guardrails — cost caps, rate limits, model allow/deny, regex, banned substrings, PII & secrets detection, JSON-schema validation, token caps — that block, redact, or flag requests and responses. Runs standalone (BYOK) or wired to the Noveum control plane for hosted policies and atomic budget reservation. See [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md).
 - 🛡️ **Production Ready**: Battle-tested in high-load environments
 - 🔍 **Health Checking**: Built-in monitoring
-- 📊 **Telemetry & Metrics**: Supports [Elasticsearch integration](docs/elasticsearch-integration.md) with periodic status logs for operational insights
+- 📊 **Telemetry & Metrics**: Supports [Elasticsearch integration](docs/elasticsearch-integration.md) and [Noveum trace ingest](docs/NOVA_GUARD.md) with periodic status logs for operational insights
 - 🌐 **CORS Support**: Configurable cross-origin resource sharing
 - 🛠️ **SDK Compatibility**: Works with any OpenAI-compatible SDK
 
