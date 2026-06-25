@@ -439,10 +439,19 @@ impl Provider for BedrockProvider {
             *model, is_streaming
         );
 
+        // Bedrock model identifiers may be inference-profile ARNs containing '/'
+        // (e.g. `arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic...`).
+        // A raw '/' would split the `/model/{id}/converse` path into extra
+        // segments and corrupt the request, so encode it to keep the id within a
+        // single segment. The same URL string is used for both SigV4 signing and
+        // the outbound request, so the signature stays consistent. Foundation
+        // model ids without a slash are left byte-for-byte unchanged.
+        let model_path = model.replace('/', "%2F");
+
         if is_streaming {
-            format!("/model/{}/converse-stream", *model)
+            format!("/model/{}/converse-stream", model_path)
         } else {
-            format!("/model/{}/converse", *model)
+            format!("/model/{}/converse", model_path)
         }
     }
 

@@ -77,15 +77,26 @@ impl ElasticsearchPlugin {
 
         let index = self.index.clone();
         let client = self.client.clone();
-        let _request_id = request_id.to_string(); // Clone for use in async block
+
+        // Use the stable per-request id as the Elasticsearch document id so that a
+        // retried write (after a timeout where the first attempt may already have
+        // landed) overwrites the same document instead of creating a duplicate.
+        // Fall back to ES auto-generated ids when we have no usable id, since a
+        // shared placeholder ("unknown") would otherwise collapse distinct
+        // requests into a single document.
+        let doc_id: Option<String> = match request_id {
+            "" | "unknown" => None,
+            id => Some(id.to_string()),
+        };
 
         let result = Retry::start(retry_strategy, || async {
+            let index_parts = match &doc_id {
+                Some(id) => IndexParts::IndexId(&index, id),
+                None => IndexParts::Index(&index),
+            };
             match timeout(
                 Duration::from_secs(10),
-                client
-                    .index(IndexParts::Index(&index))
-                    .body(document.clone())
-                    .send(),
+                client.index(index_parts).body(document.clone()).send(),
             )
             .await
             {
