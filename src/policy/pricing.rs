@@ -124,10 +124,10 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
     for &(id, i, o) in MODEL_PRICING {
         if m.len() > id.len() && m.starts_with(id) {
             let boundary = m.as_bytes()[id.len()];
-            if matches!(boundary, b'-' | b':' | b'.' | b'@' | b'/') {
-                if best.is_none_or(|(blen, _, _)| id.len() > blen) {
-                    best = Some((id.len(), i, o));
-                }
+            if matches!(boundary, b'-' | b':' | b'.' | b'@' | b'/')
+                && best.is_none_or(|(blen, _, _)| id.len() > blen)
+            {
+                best = Some((id.len(), i, o));
             }
         }
     }

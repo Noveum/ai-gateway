@@ -133,14 +133,20 @@ mod tests {
     #[test]
     fn strip_v1_prefix_rewrites_path() {
         let p = OpenAICompatibleProvider::new("gemini", "https://x/v1beta/openai", true);
-        assert_eq!(p.transform_path("/v1/chat/completions"), "/chat/completions");
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/chat/completions"
+        );
         assert_eq!(p.transform_path("/v1/embeddings"), "/embeddings");
     }
 
     #[test]
     fn no_strip_keeps_path() {
         let p = OpenAICompatibleProvider::new("deepseek", "https://api.deepseek.com", false);
-        assert_eq!(p.transform_path("/v1/chat/completions"), "/v1/chat/completions");
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -166,7 +172,10 @@ mod tests {
         h.insert("authorization", "Bearer sk-x".parse().unwrap());
         let out = p.process_headers(&h).unwrap();
         assert_eq!(out.get(http::header::AUTHORIZATION).unwrap(), "Bearer sk-x");
-        assert_eq!(out.get(http::header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(
+            out.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
     }
 
     #[test]

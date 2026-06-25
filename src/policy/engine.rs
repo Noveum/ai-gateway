@@ -155,7 +155,12 @@ impl PolicyEngine {
         // trimmed) so a kill-switch like `NOVEUM_GUARD_ENABLED=Off` actually
         // disables enforcement.
         let enabled = std::env::var("NOVEUM_GUARD_ENABLED")
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off" | "disabled" | ""))
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "false" | "0" | "no" | "off" | "disabled" | ""
+                )
+            })
             .unwrap_or(true);
         let block_mode = std::env::var("NOVEUM_GUARD_BLOCK_RESPONSE_MODE")
             .map(|v| BlockResponseMode::from_env_str(&v))
@@ -795,7 +800,9 @@ mod tests {
         let out = e.apply_text_transforms(Phase::Input, "gpt-4o", "mail a@b.com");
         assert_eq!(out.as_deref(), Some("mail [REDACTED]"));
         // text with no email -> no transform
-        assert!(e.apply_text_transforms(Phase::Input, "gpt-4o", "nothing here").is_none());
+        assert!(e
+            .apply_text_transforms(Phase::Input, "gpt-4o", "nothing here")
+            .is_none());
     }
 
     #[test]
@@ -804,7 +811,9 @@ mod tests {
             r#"{"policies":[{"name":"red","type":"pii_detection","mode":"shadow",
             "config":{"phase":"input","entities":["EMAIL_ADDRESS"],"action":"redact"}}]}"#,
         );
-        assert!(e.apply_text_transforms(Phase::Input, "gpt-4o", "mail a@b.com").is_none());
+        assert!(e
+            .apply_text_transforms(Phase::Input, "gpt-4o", "mail a@b.com")
+            .is_none());
     }
 
     #[test]

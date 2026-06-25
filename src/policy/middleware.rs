@@ -197,7 +197,11 @@ fn apply_input_transforms(engine: &PolicyEngine, model: &str, json: &mut Value) 
     let transform = |s: &str| engine.apply_text_transforms(Phase::Input, model, s);
 
     // Mutate one JSON string field in place if a transform changed it.
-    fn rewrite_string(v: &mut Value, transform: &dyn Fn(&str) -> Option<String>, changed: &mut bool) {
+    fn rewrite_string(
+        v: &mut Value,
+        transform: &dyn Fn(&str) -> Option<String>,
+        changed: &mut bool,
+    ) {
         if let Value::String(s) = v {
             if let Some(t) = transform(s) {
                 if &t != s {
@@ -209,7 +213,11 @@ fn apply_input_transforms(engine: &PolicyEngine, model: &str, json: &mut Value) 
     }
 
     // Mutate either a string field or every `.text` in an array-of-parts.
-    fn rewrite_content(v: &mut Value, transform: &dyn Fn(&str) -> Option<String>, changed: &mut bool) {
+    fn rewrite_content(
+        v: &mut Value,
+        transform: &dyn Fn(&str) -> Option<String>,
+        changed: &mut bool,
+    ) {
         match v {
             Value::String(_) => rewrite_string(v, transform, changed),
             Value::Array(parts) => {

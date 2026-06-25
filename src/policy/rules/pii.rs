@@ -103,7 +103,7 @@ fn luhn_valid(s: &str) -> bool {
     let mut sum = 0u32;
     for (i, d) in digits.iter().rev().enumerate() {
         let mut v = *d;
-        if i % 2 == 1 {
+        if !i.is_multiple_of(2) {
             v *= 2;
             if v > 9 {
                 v -= 9;
@@ -111,7 +111,7 @@ fn luhn_valid(s: &str) -> bool {
         }
         sum += v;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 impl PolicyRule for PiiRule {

@@ -78,7 +78,13 @@ pub fn block_response(
     let policy_header: String = decision
         .policy_id
         .chars()
-        .map(|c| if c.is_ascii_graphic() && c != '\u{7f}' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '\u{7f}' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(128)
         .collect();
 

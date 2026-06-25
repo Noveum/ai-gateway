@@ -74,7 +74,9 @@ impl PolicyRule for TokenLengthCapRule {
             .filter(|_| self.phase == Phase::Input)
             .unwrap_or_else(|| {
                 let text = ctx.text.as_ref();
-                let cap_chars = (self.max_tokens as usize).saturating_add(1).saturating_mul(8);
+                let cap_chars = (self.max_tokens as usize)
+                    .saturating_add(1)
+                    .saturating_mul(8);
                 let slice = if text.len() > cap_chars {
                     // Truncate on a char boundary at or before cap_chars.
                     let mut end = cap_chars.min(text.len());
