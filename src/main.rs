@@ -18,7 +18,10 @@ use noveum_ai_gateway::{
     build_router,
     config::{AppConfig, TelemetryConfig},
     policy::PolicyEngine,
-    telemetry::{plugins::elasticsearch::ElasticsearchPlugin, ConsolePlugin, MetricsRegistry},
+    telemetry::{
+        exporters::NoveumTraceExporter, plugins::elasticsearch::ElasticsearchPlugin, ConsolePlugin,
+        MetricsRegistry,
+    },
     AppState,
 };
 
@@ -89,6 +92,13 @@ async fn main() {
                 error!("Failed to initialize Elasticsearch exporter: {}", e);
             }
         }
+    }
+
+    // Noveum trace exporter — ships gateway traffic to the Noveum platform's
+    // trace-ingest endpoint so it appears alongside SDK traffic.
+    if let Some(exporter) = NoveumTraceExporter::from_env() {
+        metrics_registry.register_exporter(Box::new(exporter)).await;
+        info!("Noveum trace exporter registered");
     }
 
     // Nova Guard policy engine. Loads policies from the configured source
