@@ -66,10 +66,27 @@ impl PolicyRule for TokenLengthCapRule {
         }
 
         // Prefer a known token count if the engine supplied one; else estimate.
+        // Bound the text we tokenize to ~8 chars per allowed token: that slice
+        // always yields well over `max_tokens` tokens for real text, so if the
+        // input is longer we can flag without tokenizing megabytes synchronously.
         let tokens = ctx
             .input_tokens
             .filter(|_| self.phase == Phase::Input)
-            .unwrap_or_else(|| estimate_tokens(ctx.text.as_ref()));
+            .unwrap_or_else(|| {
+                let text = ctx.text.as_ref();
+                let cap_chars = (self.max_tokens as usize).saturating_add(1).saturating_mul(8);
+                let slice = if text.len() > cap_chars {
+                    // Truncate on a char boundary at or before cap_chars.
+                    let mut end = cap_chars.min(text.len());
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &text[..end]
+                } else {
+                    text
+                };
+                estimate_tokens(slice)
+            });
 
         if tokens > self.max_tokens {
             let score = (tokens as f32 / self.max_tokens as f32 - 1.0).clamp(0.0, 1.0);

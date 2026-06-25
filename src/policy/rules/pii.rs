@@ -35,8 +35,9 @@ static ENTITIES: Lazy<Vec<EntityPattern>> = Lazy::new(|| {
         ),
         // US SSN: 3-2-4 with separators; avoids all-zero groups loosely.
         ("US_SSN", r"\b\d{3}-\d{2}-\d{4}\b"),
-        // Credit card: 13-16 digits, optional spaces/dashes in 4-groups.
-        ("CREDIT_CARD_NUMBER", r"\b(?:\d[ -]*?){13,16}\b"),
+        // Credit card: 13-19 digits with optional single space/dash separators.
+        // A Luhn check (applied at match time) filters out arbitrary numeric IDs.
+        ("CREDIT_CARD_NUMBER", r"\b\d(?:[ -]?\d){12,18}\b"),
         // North American phone numbers (loose).
         (
             "PHONE_NUMBER",
@@ -91,6 +92,28 @@ impl PiiRule {
     }
 }
 
+/// Luhn checksum over the digits in `s` (non-digits ignored). Requires at least
+/// 13 digits. Used to keep `CREDIT_CARD_NUMBER` from matching arbitrary numeric
+/// identifiers (phone numbers, order ids, etc.).
+fn luhn_valid(s: &str) -> bool {
+    let digits: Vec<u32> = s.chars().filter_map(|c| c.to_digit(10)).collect();
+    if digits.len() < 13 {
+        return false;
+    }
+    let mut sum = 0u32;
+    for (i, d) in digits.iter().rev().enumerate() {
+        let mut v = *d;
+        if i % 2 == 1 {
+            v *= 2;
+            if v > 9 {
+                v -= 9;
+            }
+        }
+        sum += v;
+    }
+    sum % 10 == 0
+}
+
 impl PolicyRule for PiiRule {
     fn policy_type(&self) -> PolicyType {
         PolicyType::PiiDetection
@@ -109,25 +132,39 @@ impl PolicyRule for PiiRule {
             if !self.is_active(entity.name) {
                 continue;
             }
-            if entity.re.is_match(text) {
-                found.push(entity.name.to_string());
-                if self.action.is_transform() {
-                    transformed = entity
-                        .re
-                        .replace_all(&transformed, |caps: &regex::Captures| {
-                            let matched = &caps[0];
-                            match self.action {
-                                PolicyAction::Mask => {
-                                    self.mask_char.repeat(matched.chars().count().min(16))
-                                }
-                                PolicyAction::Redact => "[REDACTED]".to_string(),
-                                PolicyAction::Hash => "[HASHED]".to_string(),
-                                PolicyAction::Replace => format!("[{}]", entity.name),
-                                _ => matched.to_string(),
+            let is_cc = entity.name == "CREDIT_CARD_NUMBER";
+
+            // Detection: credit cards additionally require a valid Luhn checksum.
+            let detected = if is_cc {
+                entity.re.find_iter(text).any(|m| luhn_valid(m.as_str()))
+            } else {
+                entity.re.is_match(text)
+            };
+            if !detected {
+                continue;
+            }
+
+            found.push(entity.name.to_string());
+            if self.action.is_transform() {
+                transformed = entity
+                    .re
+                    .replace_all(&transformed, |caps: &regex::Captures| {
+                        let matched = &caps[0];
+                        // For credit cards, leave non-Luhn-valid runs untouched.
+                        if is_cc && !luhn_valid(matched) {
+                            return matched.to_string();
+                        }
+                        match self.action {
+                            PolicyAction::Mask => {
+                                self.mask_char.repeat(matched.chars().count().min(16))
                             }
-                        })
-                        .into_owned();
-                }
+                            PolicyAction::Redact => "[REDACTED]".to_string(),
+                            PolicyAction::Hash => "[HASHED]".to_string(),
+                            PolicyAction::Replace => format!("[{}]", entity.name),
+                            _ => matched.to_string(),
+                        }
+                    })
+                    .into_owned();
             }
         }
 
@@ -176,6 +213,39 @@ mod tests {
         let r =
             PiiRule::parse(serde_json::json!({"entities": ["US_SSN"], "action": "block"})).unwrap();
         assert!(r.evaluate(&ctx("ssn 123-45-6789")).flagged);
+    }
+
+    #[test]
+    fn luhn_helper() {
+        assert!(luhn_valid("4242424242424242")); // Stripe test Visa
+        assert!(luhn_valid("4111 1111 1111 1111")); // with spaces
+        assert!(!luhn_valid("4242424242424243")); // bad checksum
+        assert!(!luhn_valid("123456789012")); // too short
+    }
+
+    #[test]
+    fn credit_card_requires_luhn() {
+        let r = PiiRule::parse(
+            serde_json::json!({"entities": ["CREDIT_CARD_NUMBER"], "action": "block"}),
+        )
+        .unwrap();
+        // Valid Luhn card -> detected
+        assert!(r.evaluate(&ctx("card 4242 4242 4242 4242 ok")).flagged);
+        // A 16-digit non-card numeric id (fails Luhn) -> NOT flagged
+        assert!(!r.evaluate(&ctx("order 1234567890123456 shipped")).flagged);
+    }
+
+    #[test]
+    fn credit_card_mask_leaves_non_luhn_runs() {
+        let r = PiiRule::parse(serde_json::json!({
+            "entities": ["CREDIT_CARD_NUMBER"], "action": "redact"
+        }))
+        .unwrap();
+        let out = r.evaluate(&ctx("pay 4242424242424242 not 1111111111111111"));
+        // valid card redacted; non-Luhn run preserved
+        let t = out.transformed_text.unwrap();
+        assert!(t.contains("[REDACTED]"));
+        assert!(t.contains("1111111111111111"));
     }
 
     #[test]

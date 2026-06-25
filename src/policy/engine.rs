@@ -151,8 +151,11 @@ impl PolicyEngine {
     /// Any load/parse error degrades to an empty (pass-through) engine with a
     /// warning; the gateway never fails to boot because of policy config.
     pub async fn from_env() -> Self {
+        // Treat a broad set of falsey values as "disabled" (case-insensitive,
+        // trimmed) so a kill-switch like `NOVEUM_GUARD_ENABLED=Off` actually
+        // disables enforcement.
         let enabled = std::env::var("NOVEUM_GUARD_ENABLED")
-            .map(|v| v != "false" && v != "0")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off" | "disabled" | ""))
             .unwrap_or(true);
         let block_mode = std::env::var("NOVEUM_GUARD_BLOCK_RESPONSE_MODE")
             .map(|v| BlockResponseMode::from_env_str(&v))
@@ -297,6 +300,14 @@ impl PolicyEngine {
         input_tokens: Option<u32>,
         live_state: Option<&LiveState>,
     ) -> EvaluationResult {
+        // `Phase::Both` is a *policy* attribute, not an evaluation axis. The
+        // middleware must call this with `Input` or `Output` only; evaluating
+        // with `Both` would run input- and output-only policies together and
+        // double-apply `Both` transforms.
+        debug_assert!(
+            phase != Phase::Both,
+            "evaluate() must be called with Phase::Input or Phase::Output, not Both"
+        );
         let state = self.state.load();
         let mut result = EvaluationResult::default();
         if !state.enabled {
@@ -366,6 +377,54 @@ impl PolicyEngine {
         }
 
         result
+    }
+
+    /// Apply only enforce-mode *transform* actions (redact/mask/hash/replace)
+    /// from text rules matching `phase` to a single text segment, composing in
+    /// priority order. Returns `Some(new_text)` when a transform changed the
+    /// text, else `None`.
+    ///
+    /// This deliberately does NOT evaluate cost/rate/token/block policies — the
+    /// aggregate block decision is made once by [`Self::evaluate`] over the full
+    /// flattened payload; this method only rewrites individual structured
+    /// segments (chat message contents) so the forwarded body stays valid and
+    /// blocking is never re-litigated per segment.
+    pub fn apply_text_transforms(&self, phase: Phase, model: &str, text: &str) -> Option<String> {
+        let state = self.state.load();
+        if !state.enabled {
+            return None;
+        }
+        let model_lc = model.to_lowercase();
+        let mut working = text.to_string();
+        let mut changed = false;
+
+        for cp in &state.text_policies {
+            if cp.meta.mode != PolicyMode::Enforce {
+                continue;
+            }
+            if !cp.rule.phase().applies_to(phase) {
+                continue;
+            }
+            let ctx = EvalContext {
+                phase,
+                model: &model_lc,
+                text: Cow::Borrowed(&working),
+                json: None,
+                input_tokens: None,
+                live_state: None,
+            };
+            let outcome = cp.rule.evaluate(&ctx);
+            if outcome.flagged && outcome.action.is_transform() {
+                if let Some(t) = outcome.transformed_text {
+                    if t != working {
+                        working = t;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        changed.then_some(working)
     }
 
     fn eval_cost_cap(
@@ -719,6 +778,33 @@ mod tests {
         .unwrap();
         e.swap_bundle(&b);
         assert_eq!(e.active_policy_count(), 1);
+    }
+
+    #[test]
+    fn apply_text_transforms_only_runs_transforms_not_blocks() {
+        // A block policy + a redact policy. apply_text_transforms must apply the
+        // redact and ignore the block (no re-litigating blocking per segment).
+        let e = engine(
+            r#"{"policies":[
+              {"name":"blk","type":"regex_match","mode":"enforce","priority":10,
+               "config":{"phase":"input","patterns":[{"name":"ssn","regex":"\\d{3}-\\d{2}-\\d{4}"}],"action":"block"}},
+              {"name":"red","type":"pii_detection","mode":"enforce","priority":20,
+               "config":{"phase":"input","entities":["EMAIL_ADDRESS"],"action":"redact"}}
+            ]}"#,
+        );
+        let out = e.apply_text_transforms(Phase::Input, "gpt-4o", "mail a@b.com");
+        assert_eq!(out.as_deref(), Some("mail [REDACTED]"));
+        // text with no email -> no transform
+        assert!(e.apply_text_transforms(Phase::Input, "gpt-4o", "nothing here").is_none());
+    }
+
+    #[test]
+    fn apply_text_transforms_skips_shadow_mode() {
+        let e = engine(
+            r#"{"policies":[{"name":"red","type":"pii_detection","mode":"shadow",
+            "config":{"phase":"input","entities":["EMAIL_ADDRESS"],"action":"redact"}}]}"#,
+        );
+        assert!(e.apply_text_transforms(Phase::Input, "gpt-4o", "mail a@b.com").is_none());
     }
 
     #[test]

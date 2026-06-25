@@ -149,6 +149,12 @@ impl ControlPlaneClient {
             request_id,
         };
 
+        // `reserve` mutates budget, so it is only safe to retry on errors that
+        // prove the request never reached the server (connection failures).
+        // Timeouts, resets after send, and 5xx might have committed a
+        // reservation server-side; retrying those risks double-reserving, so
+        // they are terminal here and the caller decides fail-open/closed. The
+        // server is expected to dedupe on `request_id` for the connect-retry case.
         let call = || async {
             let resp = self
                 .http
@@ -157,7 +163,13 @@ impl ControlPlaneClient {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| ControlPlaneError::Transient(e.to_string()))?;
+                .map_err(|e| {
+                    if e.is_connect() {
+                        ControlPlaneError::Transient(format!("connect failed: {e}"))
+                    } else {
+                        ControlPlaneError::Fatal(format!("send failed (not retried): {e}"))
+                    }
+                })?;
 
             match resp.status() {
                 StatusCode::OK => resp
@@ -167,16 +179,15 @@ impl ControlPlaneClient {
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                     Err(ControlPlaneError::Unauthorized)
                 }
-                s if s.is_server_error() || s == StatusCode::TOO_MANY_REQUESTS => {
-                    Err(ControlPlaneError::Transient(format!("status {s}")))
-                }
+                // Server-side errors are NOT retried for the budget-mutating
+                // reserve (the reservation may already have committed).
                 s => Err(ControlPlaneError::Fatal(format!("status {s}"))),
             }
         };
 
         call.retry(self.backoff())
             .when(|e: &ControlPlaneError| e.is_transient())
-            .notify(|e, d| warn!(?d, error=%e, "control-plane reserve retry"))
+            .notify(|e, d| warn!(?d, error=%e, "control-plane reserve retry (connect-only)"))
             .await
     }
 
@@ -310,26 +321,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserve_retries_transient_then_succeeds() {
+    async fn reserve_does_not_retry_5xx_budget_mutation() {
+        // A 5xx on the budget-mutating reserve is terminal: the server may have
+        // already committed the reservation, so retrying would risk a
+        // double-reserve. Assert the server is hit exactly once and we error out.
         let server = MockServer::start().await;
-        // First a 503 (transient), then a 200. wiremock serves mounts in order
-        // with `up_to_n_times`.
         Mock::given(method("POST"))
             .and(path("/v1/projects/p/budget/reserve"))
             .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/projects/p/budget/reserve"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"admit": true})))
+            .expect(1) // exactly once — no retry
             .mount(&server)
             .await;
 
         let c = client_for(&server);
-        let r = c.reserve("p", 1.0, "m", "rid").await.unwrap();
-        assert!(r.admit);
+        let err = c.reserve("p", 1.0, "m", "rid").await.unwrap_err();
+        assert!(matches!(err, ControlPlaneError::Fatal(_)));
+        // `.expect(1)` is verified on server drop.
     }
 
     #[tokio::test]

@@ -101,10 +101,13 @@ pub struct ModelPrice {
 
 /// Look up pricing for a model id.
 ///
-/// Matching is case-insensitive and tolerant: an exact match wins; otherwise the
-/// longest-prefix family match is used (e.g. `gpt-4o-2024-11-20` → `gpt-4o`),
-/// which handles dated snapshots and provider-prefixed ids. Returns `None` when
-/// no family matches.
+/// Matching is case-insensitive: an exact match wins; otherwise the input may be
+/// a *dated snapshot* of a known family (e.g. `gpt-4o-2024-11-20` → `gpt-4o`), in
+/// which case the longest table id that is a prefix of the input wins, but only
+/// when the next character is a version separator (`-`, `:`, `.`, `@`) so that
+/// `gpt-4` cannot match `gpt-4o`. A short or garbage id that is merely a prefix
+/// of a table entry returns `None` (never the other direction). Returns `None`
+/// when no family matches.
 pub fn lookup(model: &str) -> Option<ModelPrice> {
     let m = model.to_lowercase();
 
@@ -116,13 +119,15 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
         });
     }
 
-    // Longest-prefix family match (handles dated snapshots / suffixes).
+    // Longest known family that the input *extends* at a version boundary.
     let mut best: Option<(usize, f64, f64)> = None;
     for &(id, i, o) in MODEL_PRICING {
-        if m.starts_with(id) || id.starts_with(&m) {
-            let common = id.len().min(m.len());
-            if best.is_none_or(|(blen, _, _)| common > blen) {
-                best = Some((common, i, o));
+        if m.len() > id.len() && m.starts_with(id) {
+            let boundary = m.as_bytes()[id.len()];
+            if matches!(boundary, b'-' | b':' | b'.' | b'@' | b'/') {
+                if best.is_none_or(|(blen, _, _)| id.len() > blen) {
+                    best = Some((id.len(), i, o));
+                }
             }
         }
     }
@@ -179,6 +184,27 @@ mod tests {
     #[test]
     fn unknown_model_is_none() {
         assert!(lookup("totally-made-up-model-xyz").is_none());
+    }
+
+    #[test]
+    fn short_or_garbage_ids_do_not_mismatch() {
+        // Prefix-of-a-table-entry must NOT resolve (the bug: "g" -> gpt-5).
+        assert!(lookup("g").is_none());
+        assert!(lookup("gpt").is_none());
+        assert!(lookup("gpt-").is_none());
+        // "gpt-4" is shorter than "gpt-4o" and not an exact entry -> None.
+        assert!(lookup("gpt-4").is_none());
+        assert!(lookup("claude").is_none());
+        assert!(lookup("o").is_none());
+    }
+
+    #[test]
+    fn family_match_requires_version_boundary() {
+        // "gpt-4ox" is not a dated snapshot of gpt-4o (no separator) -> None.
+        assert!(lookup("gpt-4oxyz").is_none());
+        // but a real separator resolves to the family
+        assert_eq!(lookup("gpt-4o:free").unwrap().input_per_1m, 2.50);
+        assert_eq!(lookup("gpt-4o-mini-2024-07-18").unwrap().input_per_1m, 0.15);
     }
 
     #[test]

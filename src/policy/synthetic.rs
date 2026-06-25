@@ -72,13 +72,23 @@ pub fn block_response(
         BlockResponseMode::SyntheticSuccess => StatusCode::OK,
     };
 
+    // Policy ids come from user/control-plane config and may contain characters
+    // that are invalid in an HTTP header value; sanitize to a safe ASCII token so
+    // building the response can never panic.
+    let policy_header: String = decision
+        .policy_id
+        .chars()
+        .map(|c| if c.is_ascii_graphic() && c != '\u{7f}' { c } else { '_' })
+        .take(128)
+        .collect();
+
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-noveum-guard-blocked", "true")
-        .header("x-noveum-guard-policy", decision.policy_id.clone())
+        .header("x-noveum-guard-policy", policy_header)
         .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
-        .expect("static synthetic response is always valid")
+        .expect("synthetic response with sanitized header is always valid")
 }
 
 fn reason_text(decision: &PolicyDecision) -> String {

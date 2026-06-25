@@ -72,6 +72,7 @@ pub async fn guard_middleware(
         .to_string();
 
     let mut forward_bytes = bytes.clone();
+    let mut body_mutated = false;
 
     if let Some(mut body_json) = json.clone() {
         let input_text = flatten_input_text(&body_json);
@@ -101,10 +102,17 @@ pub async fn guard_middleware(
         {
             if let Ok(v) = serde_json::to_vec(&body_json) {
                 forward_bytes = v.into();
+                body_mutated = true;
             }
         }
     }
 
+    let mut parts = parts;
+    if body_mutated {
+        // The body length changed; drop the stale Content-Length so the
+        // downstream layer/provider recomputes it (avoids truncation/hang).
+        parts.headers.remove(header::CONTENT_LENGTH);
+    }
     let forwarded = Request::from_parts(parts, Body::from(forward_bytes));
     let response = next.run(forwarded).await;
 
@@ -117,7 +125,9 @@ fn is_guardable<B>(req: &Request<B>) -> bool {
     if req.method() != axum::http::Method::POST {
         return false;
     }
-    if !req.uri().path().contains("/v1/") {
+    // Anchor to the proxy route prefix so unrelated JSON POSTs that merely
+    // contain "/v1/" elsewhere in the path are not buffered/scanned.
+    if !req.uri().path().starts_with("/v1/") {
         return false;
     }
     req.headers()
@@ -174,42 +184,56 @@ pub fn flatten_input_text(json: &Value) -> String {
     out
 }
 
-/// Apply input transforms to each string segment in the body in place.
-/// Returns true if anything was mutated.
+/// Apply input transforms to every text segment in the body in place, including
+/// array-form (multimodal) content parts and array-form `system` blocks so that
+/// PII/secret redaction is never silently skipped for structured content.
+///
+/// Returns true if anything was mutated. Uses the engine's transform-only path
+/// (the aggregate block decision was already made over the flattened text), so
+/// blocking is not re-litigated per segment and cost/rate/token policies do not
+/// re-run here.
 fn apply_input_transforms(engine: &PolicyEngine, model: &str, json: &mut Value) -> bool {
     let mut changed = false;
+    let transform = |s: &str| engine.apply_text_transforms(Phase::Input, model, s);
 
-    let transform_segment = |s: &str| -> Option<String> {
-        let r = engine.evaluate(Phase::Input, model, s, None, None, None);
-        r.transformed_text
-    };
-
-    if let Some(system) = json.get("system").and_then(|s| s.as_str()) {
-        if let Some(t) = transform_segment(system) {
-            if t != system {
-                json["system"] = Value::String(t);
-                changed = true;
+    // Mutate one JSON string field in place if a transform changed it.
+    fn rewrite_string(v: &mut Value, transform: &dyn Fn(&str) -> Option<String>, changed: &mut bool) {
+        if let Value::String(s) = v {
+            if let Some(t) = transform(s) {
+                if &t != s {
+                    *v = Value::String(t);
+                    *changed = true;
+                }
             }
         }
     }
-    if let Some(prompt) = json.get("prompt").and_then(|p| p.as_str()) {
-        if let Some(t) = transform_segment(prompt) {
-            if t != prompt {
-                json["prompt"] = Value::String(t);
-                changed = true;
+
+    // Mutate either a string field or every `.text` in an array-of-parts.
+    fn rewrite_content(v: &mut Value, transform: &dyn Fn(&str) -> Option<String>, changed: &mut bool) {
+        match v {
+            Value::String(_) => rewrite_string(v, transform, changed),
+            Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    if let Some(text) = part.get_mut("text") {
+                        rewrite_string(text, transform, changed);
+                    }
+                }
             }
+            _ => {}
         }
+    }
+
+    if let Some(prompt) = json.get_mut("prompt") {
+        rewrite_string(prompt, &transform, &mut changed);
+    }
+    if let Some(system) = json.get_mut("system") {
+        // Anthropic `system` may be a string or an array of text blocks.
+        rewrite_content(system, &transform, &mut changed);
     }
     if let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) {
         for msg in messages.iter_mut() {
-            if let Some(Value::String(s)) = msg.get("content") {
-                let s = s.clone();
-                if let Some(t) = transform_segment(&s) {
-                    if t != s {
-                        msg["content"] = Value::String(t);
-                        changed = true;
-                    }
-                }
+            if let Some(content) = msg.get_mut("content") {
+                rewrite_content(content, &transform, &mut changed);
             }
         }
     }
@@ -285,15 +309,34 @@ async fn enforce_output(
         return response;
     }
 
+    // If the response declares a length beyond our inspection cap, pass it
+    // through untouched rather than buffering it (avoids corrupting large
+    // legitimate completions and avoids an OOM vector).
+    let declared_len = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    if matches!(declared_len, Some(n) if n > MAX_BODY) {
+        debug!("Nova Guard: response exceeds inspection cap; passing through unchanged");
+        return response;
+    }
+
     let (parts, body) = response.into_parts();
     let bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
         Err(_) => {
-            warn!("Nova Guard: response body too large to inspect; passing through");
-            return Response::from_parts(
-                parts,
-                Body::from("response body exceeded inspection limit"),
-            );
+            // Chunked response with no declared length exceeded the cap mid-read;
+            // the original body is no longer recoverable. Return an honest error
+            // envelope with a correct status rather than a 200 carrying a string.
+            warn!("Nova Guard: chunked response exceeded inspection cap; returning 502");
+            return Response::builder()
+                .status(axum::http::StatusCode::BAD_GATEWAY)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"error":{"message":"upstream response exceeded gateway inspection limit","type":"gateway_error"}}"#,
+                ))
+                .expect("static error response is valid");
         }
     };
 
