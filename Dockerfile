@@ -1,5 +1,7 @@
 # Build stage
-FROM --platform=linux/amd64 rust:1.82-slim-bookworm as builder
+# Rust 1.96 (>= the crate's MSRV of 1.91); 1.82 is too old — some transitive
+# dependencies now ship `edition = "2024"` manifests that need Cargo >= 1.85.
+FROM --platform=linux/amd64 rust:1.96-slim-bookworm AS builder
 
 # Install required dependencies
 RUN apt-get update && apt-get install -y \
