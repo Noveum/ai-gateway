@@ -69,16 +69,22 @@ pub trait Provider: Send + Sync {
 // Use pub instead of mod to make the modules and their contents public
 pub mod anthropic;
 pub mod bedrock;
+pub mod cohere;
 pub mod fireworks;
+pub mod google;
 pub mod groq;
+pub mod mistral;
 pub mod openai;
 pub mod together;
 pub mod utils;
 
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
+pub use cohere::CohereProvider;
 pub use fireworks::FireworksProvider;
+pub use google::GoogleProvider;
 pub use groq::GroqProvider;
+pub use mistral::MistralProvider;
 pub use openai::OpenAIProvider;
 pub use together::TogetherProvider;
 
@@ -91,6 +97,9 @@ pub fn create_provider(provider_name: &str) -> Result<Box<dyn Provider>, AppErro
         "fireworks" => Ok(Box::new(FireworksProvider::new())),
         "together" => Ok(Box::new(TogetherProvider::new())),
         "bedrock" => Ok(Box::new(BedrockProvider::new())),
+        "mistral" => Ok(Box::new(MistralProvider::new())),
+        "cohere" => Ok(Box::new(CohereProvider::new())),
+        "google" | "gemini" => Ok(Box::new(GoogleProvider::new())),
         unknown => {
             error!("Attempted to use unsupported provider: {}", unknown);
             Err(AppError::UnsupportedProvider)

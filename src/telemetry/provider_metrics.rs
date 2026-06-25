@@ -224,16 +224,21 @@ pub trait MetricsExtractor: Send + Sync {
 pub fn get_metrics_extractor(provider: &str) -> Box<dyn MetricsExtractor> {
     use crate::providers::anthropic::AnthropicMetricsExtractor;
     use crate::providers::bedrock::BedrockMetricsExtractor;
+    use crate::providers::cohere::CohereMetricsExtractor;
     use crate::providers::fireworks::FireworksMetricsExtractor;
+    use crate::providers::google::GoogleMetricsExtractor;
     use crate::providers::groq::GroqMetricsExtractor;
     use crate::providers::openai::OpenAIMetricsExtractor;
-    
+
     match provider {
         "anthropic" => Box::new(AnthropicMetricsExtractor),
         "bedrock" => Box::new(BedrockMetricsExtractor),
         "groq" => Box::new(GroqMetricsExtractor),
         "fireworks" => Box::new(FireworksMetricsExtractor), // Now using Fireworks-specific extractor
-        "together" => Box::new(OpenAIMetricsExtractor),  // Together uses OpenAI-compatible format
-        _ => Box::new(OpenAIMetricsExtractor),           // Default to OpenAI format
+        "together" => Box::new(OpenAIMetricsExtractor), // Together uses OpenAI-compatible format
+        "mistral" => Box::new(OpenAIMetricsExtractor),  // Mistral is OpenAI-compatible
+        "cohere" => Box::new(CohereMetricsExtractor),
+        "google" | "gemini" => Box::new(GoogleMetricsExtractor),
+        _ => Box::new(OpenAIMetricsExtractor), // Default to OpenAI format
     }
 } 
