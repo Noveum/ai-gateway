@@ -1,27 +1,10 @@
-use super::RequestMetrics;
-use async_trait::async_trait;
-use std::error::Error;
+//! Telemetry plugins.
+//!
+//! A "plugin" is a [`crate::telemetry::metrics::MetricsExporter`] that ships
+//! per-request metrics somewhere. The console plugin (debug logging) lives here;
+//! add new exporters as `MetricsExporter` implementations and register them in
+//! `main.rs`.
 
-#[async_trait]
-pub trait TelemetryPlugin: Send + Sync {
-    async fn export(&self, metrics: &RequestMetrics) -> Result<(), Box<dyn Error>>;
-    fn name(&self) -> &str;
-}
-
-// Example plugin stubs (to be implemented later)
-pub mod elasticsearch;
 pub mod console;
 
 pub use console::ConsolePlugin;
-
-#[async_trait]
-impl TelemetryPlugin for ConsolePlugin {
-    async fn export(&self, metrics: &RequestMetrics) -> Result<(), Box<dyn Error>> {
-        println!("Request Metrics:\n{:#?}", metrics);
-        Ok(())
-    }
-
-    fn name(&self) -> &str {
-        "console"
-    }
-} 

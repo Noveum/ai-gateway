@@ -1,7 +1,7 @@
 # GROQ Provider Integration
 
 ## Overview
-GROQ provider support in MagicAPI AI Gateway enables high-performance access to GROQ's inference infrastructure through an OpenAI-compatible API interface. This API also supports MultiModal vision models and tool use.
+GROQ provider support in Noveum AI Gateway enables high-performance access to GROQ's inference infrastructure through an OpenAI-compatible API interface. This API also supports MultiModal vision models and tool use.
 
 ## Supported Models
 

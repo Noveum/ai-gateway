@@ -1,16 +1,30 @@
+//! Runtime configuration loaded from the environment.
+//!
+//! [`AppConfig`] holds server/runtime settings (port, host, worker threads, HTTP
+//! connection pool size) and [`TelemetryConfig`] gates the optional telemetry
+//! exporters. All values are read once at startup via [`AppConfig::new`].
+
 use num_cpus;
 use std::env;
 use tracing::debug;
 use tracing::info;
 
+/// Server and runtime configuration, sourced from environment variables.
 pub struct AppConfig {
+    /// TCP port to listen on (`PORT`, default `3000`).
     pub port: u16,
+    /// Bind address (`HOST`, default `127.0.0.1`).
     pub host: String,
+    /// Tokio worker thread count (`WORKER_THREADS`, default derived from cores).
     pub worker_threads: usize,
+    /// Max idle HTTP connections kept per upstream host (`MAX_CONNECTIONS`).
     pub max_connections: usize,
-    pub tcp_keepalive_interval: u64,
-    pub tcp_nodelay: bool,
-    pub buffer_size: usize,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AppConfig {
@@ -43,18 +57,6 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
-            tcp_keepalive_interval: env::var("TCP_KEEPALIVE_INTERVAL")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
-            tcp_nodelay: env::var("TCP_NODELAY")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(true),
-            buffer_size: env::var("BUFFER_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8 * 1024), // 8KB default
         };
 
         info!(
@@ -62,31 +64,25 @@ impl AppConfig {
             config.port, config.host
         );
         debug!(
-            "Advanced settings: workers={}, max_conn={}, buffer_size={}",
-            config.worker_threads, config.max_connections, config.buffer_size
+            "Advanced settings: workers={}, max_conn={}",
+            config.worker_threads, config.max_connections
         );
 
         config
     }
 }
 
+/// Gates the optional telemetry exporters.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
+    /// When set (`DEBUG_METRICS=true`), register the console metrics exporter.
     pub debug_mode: bool,
-    pub elasticsearch_enabled: bool,
-    pub cloudwatch_enabled: bool,
 }
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             debug_mode: std::env::var("DEBUG_METRICS")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false),
-            elasticsearch_enabled: std::env::var("ENABLE_ELASTICSEARCH")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false),
-            cloudwatch_enabled: std::env::var("ENABLE_CLOUDWATCH")
                 .map(|v| v.parse().unwrap_or(false))
                 .unwrap_or(false),
         }

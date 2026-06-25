@@ -1,13 +1,14 @@
 [package]
 name = "noveum-ai-gateway"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
+rust-version = "1.91"
 description = "A high-performance AI Gateway proxy for routing requests to various AI providers, offering seamless integration and management of multiple AI providers."
-authors = ["MagicAPI Team <team@noveum.ai>"]
+authors = ["Noveum Team <team@noveum.ai>"]
 license = "MIT OR Apache-2.0"
 homepage = "https://noveum.ai"
-repository = "https://github.com/noveum/ai-gateway"
-documentation = "https://docs.noveum.ai"
+repository = "https://github.com/Noveum/ai-gateway"
+documentation = "https://docs.rs/noveum-ai-gateway"
 readme = "README.md"
 keywords = ["ai", "gateway", "proxy", "openai", "llm"]
 categories = ["web-programming", "api-bindings", "asynchronous"]
@@ -21,6 +22,10 @@ exclude = [
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -33,7 +38,6 @@ debug = false
 axum = { version = "0.7", features = ["http2", "tokio"] }
 tokio = { version = "1.0", features = ["full", "parking_lot", "rt-multi-thread"] }
 tokio-stream = "0.1"
-tokio-retry = "0.3"
 hyper = { version = "0.14", features = ["client", "runtime"] }
 tower-http = { version = "0.6.2", features = ["cors", "compression-full"] }
 tracing = { version = "0.1", features = ["attributes"] }
@@ -55,22 +59,26 @@ aws-credential-types = "1.2.1"
 chrono = { version = "0.4", features = ["serde"] }
 aws_event_stream_parser = "0.1.2"
 parking_lot = "0.12"
-metrics = "0.24.1"
-opentelemetry = { version = "0.27.1", features = ["metrics"] }
-elasticsearch = "8.16.0-alpha.1"
 uuid = { version = "1.15.1", features = ["serde", "v4"] }
 colored = "2.1.0"
 
+# --- Nova Guard policy-enforcement layer ---
+regex = "1.12"                 # linear-time, ReDoS-safe matching (RegexSet, size limits)
+aho-corasick = "1.1"           # fast multi-pattern banned-substring matching
+jsonschema = "0.46"            # JSON Schema validation for structured-output policies
+tiktoken-rs = "0.12"           # token counting for cost estimation / token-cap policies
+arc-swap = "1.7"               # lock-free read-mostly policy cache
+async-stream = "0.3"           # SSE tee for post-call streaming policy evaluation
+
 [dev-dependencies]
 noveum-ai-gateway = { path = "." }
-hex = "0.4"
-test-log = { version = "0.2", features = ["trace"] }
 uuid = { version = "1.15.1", features = ["serde", "v4"] }
 dotenv = "0.15"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 reqwest = { version = "0.12.9", features = ["stream", "json", "rustls-tls", "http2", "gzip", "brotli"], default-features = false }
 serde_json = "1.0"
-serial_test = "3.2.0"
+tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot for router tests
+http-body-util = "0.1"                              # BodyExt::collect for response-body assertions
 
 [[test]]
 name = "run_integration_tests"

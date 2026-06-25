@@ -26,7 +26,7 @@ pub async fn proxy_request_to_provider(
     let body = std::mem::replace(original_request.body_mut(), Body::empty());
     let body_bytes = to_bytes(body, usize::MAX)
         .await
-        .map_err(|e| AppError::AxumError(e.into()))?;
+        .map_err(|e| AppError::AxumError(e))?;
 
     // Call before_request first to set up any provider state
     provider
@@ -89,7 +89,7 @@ pub async fn send_provider_request(
     url: String,
     headers: HeaderMap,
     body: Bytes,
-    provider: &Box<dyn Provider>,
+    _provider: &Box<dyn Provider>,
     config: Arc<AppConfig>,
 ) -> Result<Response<Body>, AppError> {
     let client = &*CLIENT;
@@ -100,11 +100,7 @@ pub async fn send_provider_request(
             name.as_str()
                 .parse::<reqwest::header::HeaderName>()
                 .ok()
-                .and_then(|name_str| {
-                    reqwest::header::HeaderValue::from_bytes(value.as_bytes())
-                        .ok()
-                        .map(|v| (name_str, v))
-                })
+                .zip(reqwest::header::HeaderValue::from_bytes(value.as_bytes()).ok())
         })
         .collect::<reqwest::header::HeaderMap>();
 
@@ -120,7 +116,7 @@ pub async fn send_provider_request(
 
 async fn process_response(
     response: reqwest::Response,
-    config: Arc<AppConfig>,
+    _config: Arc<AppConfig>,
 ) -> Result<Response<Body>, AppError> {
     let status = StatusCode::from_u16(response.status().as_u16())?;
     let mut response_builder = Response::builder().status(status);
@@ -137,7 +133,7 @@ async fn process_response(
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| {
+        .is_some_and(|ct| {
             ct.contains("application/vnd.amazon.eventstream") || ct.contains("text/event-stream")
         })
     {
@@ -152,7 +148,7 @@ async fn process_response(
         Ok(bytes) => Ok(bytes),
         Err(e) => {
             error!("Stream error: {}", e);
-            Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+            Err(std::io::Error::other(e))
         }
     });
 

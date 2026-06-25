@@ -3,15 +3,15 @@ use tracing::debug;
 
 /// List of tracking headers that should be preserved and logged
 pub const TRACKING_HEADERS: [&str; 5] = [
-    "x-project-id", 
+    "x-project-id",
     "x-organization-id",
     "x-organisation-id", // British spelling
     "x-user-id",
-    "x-experiment-id"
+    "x-experiment-id",
 ];
 
 /// Utility function to log tracking headers for observability
-/// 
+///
 /// This function should be called by all providers in their `process_headers`
 /// implementation to ensure consistent handling of tracking headers.
 ///
@@ -23,4 +23,4 @@ pub fn log_tracking_headers(headers: &HeaderMap) {
             debug!("{}: {}", header, value);
         }
     }
-} 
+}

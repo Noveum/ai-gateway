@@ -11,7 +11,7 @@
 
 [Quick Start](#quick-start) • 
 [Documentation](docs/) • 
-[Monitoring](docs/elasticsearch-integration.md) • 
+[Pricing](docs/PRICING.md) • 
 [Docker](docs/deployment.md) • 
 [Contributing](docs/CONTRIBUTING.md)
 
@@ -22,18 +22,38 @@
 - 🚀 **Blazing fast performance**: Built in Rust with zero-cost abstractions
 - ⚡ **Optimized for low latency and high throughput**
 - 🔄 **Unified API interface for multiple AI providers**:
-  - OpenAI
-  - AWS Bedrock
-  - Anthropic
-  - GROQ
-  - Fireworks
-  - Together AI
+  - OpenAI — [guide](docs/providers/openai.md)
+  - AWS Bedrock — [guide](docs/providers/bedrock.md)
+  - Anthropic — [guide](docs/providers/anthropic.md)
+  - GROQ — [guide](docs/providers/groq.md)
+  - Fireworks — [guide](docs/providers/fireworks.md)
+  - Together AI — [guide](docs/providers/together.md)
+  - Mistral, Cohere, Google Gemini, DeepSeek, xAI (Grok), OpenRouter, Perplexity — [OpenAI-compatible providers guide](docs/providers/openai-compatible.md)
+- 💰 **Per-request cost tracking** across all providers from a built-in,
+  single-sourced model pricing table — see [docs/PRICING.md](docs/PRICING.md).
 - 📡 **Real-time Streaming**: Optimized for minimal latency
+- 🛡️ **Nova Guard policy enforcement**: In-process guardrails — model allow/deny, regex, banned substrings, PII & secrets detection, JSON-schema validation, token caps — that block, redact, or flag requests and responses, loaded from a local policy bundle (file or inline). See [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md).
 - 🛡️ **Production Ready**: Battle-tested in high-load environments
 - 🔍 **Health Checking**: Built-in monitoring
-- 📊 **Telemetry & Metrics**: Supports [Elasticsearch integration](docs/elasticsearch-integration.md) with periodic status logs for operational insights
+- 📊 **Telemetry & Metrics**: Per-request token usage and cost tracking with a pluggable `MetricsExporter` trait; ships with a console exporter (set `DEBUG_METRICS=true`) for local debugging. See [docs/telemetry-plugins.md](docs/telemetry-plugins.md).
 - 🌐 **CORS Support**: Configurable cross-origin resource sharing
 - 🛠️ **SDK Compatibility**: Works with any OpenAI-compatible SDK
+
+## ⚡ Performance
+
+Built in Rust (Axum + Tokio). The gateway adds negligible overhead on top of the
+upstream provider's own latency. Measured locally (release build, localhost,
+includes client + loopback round-trip):
+
+| Path | p50 | p99 |
+|---|---|---|
+| Health check (gateway processing only) | ~0.46 ms | ~0.87 ms |
+| Full Nova Guard path (JSON parse + regex + PII scan, request blocked, no upstream) | ~0.60 ms | ~1.08 ms |
+
+So Nova Guard policy evaluation adds roughly **~0.15 ms** at p50, and when the
+engine is disabled or has no active policies the middleware short-circuits with
+**zero** body buffering. (Numbers vary by hardware; reproduce with the steps in
+[docs/deployment.md](docs/deployment.md).)
 
 ## 🚀 Quick Start
 
@@ -80,8 +100,6 @@ The server will start on `http://127.0.0.1:3000` by default.
 
 ### Running the Gateway
 
-You can configure the gateway using environment variables:
-
 ```bash
 # Basic configuration
 export RUST_LOG=info
@@ -92,6 +110,34 @@ noveum-ai-gateway
 # Or with custom port
 PORT=8080 noveum-ai-gateway
 ```
+
+### Configuration (environment variables)
+
+**Server / runtime**
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | TCP port to listen on |
+| `HOST` | `127.0.0.1` | Bind address |
+| `WORKER_THREADS` | derived from CPU cores | Tokio worker thread count |
+| `MAX_CONNECTIONS` | `10000` | Max idle HTTP connections kept per upstream host |
+| `RUST_LOG` | `info` | Log filter (e.g. `info`, `debug`, `noveum_ai_gateway=debug`) |
+
+**Telemetry (optional)**
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEBUG_METRICS` | `false` | Register the console metrics exporter (prints each request's token/cost metrics) |
+| `DEPLOYMENT_ENVIRONMENT` | `development` | Value for the `deployment.environment` resource tag |
+
+**Nova Guard policy enforcement (optional)** — see [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md):
+
+| Variable | Default | Description |
+|---|---|---|
+| `NOVEUM_GUARD_ENABLED` | `true` | Master switch for Nova Guard (accepts `false`/`0`/`no`/`off`/`disabled`) |
+| `NOVEUM_GUARD_POLICIES_FILE` | — | Path to a local `nova-guard.json` policy bundle |
+| `NOVEUM_GUARD_POLICIES` | — | Inline JSON policy bundle (alternative to the file) |
+| `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` or `provider_error` |
 
 ## 📚 Usage Examples
 
@@ -343,7 +389,7 @@ Noveum Developer AI Gateway is designed for maximum performance:
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+We welcome contributions! Please see our [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
 
 ### 🛠️ Development Setup
 
@@ -419,21 +465,18 @@ docker run -p 3000:3000 \
   noveum/noveum-ai-gateway:latest
 ```
 
-### Using Pre-built Docker Image with Elasticsearch
+### Using Pre-built Docker Image with Nova Guard policies
+
+Mount a local policy bundle and point Nova Guard at it:
 
 ```bash
 docker pull noveum/noveum-ai-gateway:latest  --platform linux/amd64
 docker run --platform linux/amd64 -p 3000:3000 \
   -e RUST_LOG=info \
-  -e ENABLE_ELASTICSEARCH=true \
-  -e ELASTICSEARCH_URL=http://localhost:9200 \
-  -e ELASTICSEARCH_USERNAME=elastic \
-  -e ELASTICSEARCH_PASSWORD=your_secure_password \
-  -e ELASTICSEARCH_INDEX=ai-gateway-metrics \
+  -e NOVEUM_GUARD_POLICIES_FILE=/etc/nova-guard.json \
+  -v "$(pwd)/nova-guard.json:/etc/nova-guard.json:ro" \
   noveum/noveum-ai-gateway:latest
 ```
-
-> **Note**: When running with Elasticsearch, make sure your Elasticsearch instance is accessible from the Docker container. If running Elasticsearch locally, you may need to use `host.docker.internal` instead of `localhost` in the URL.
 
 ### Docker Compose
 
@@ -478,9 +521,9 @@ Then run either option with:
 docker-compose up -d
 ```
 
-#### Option 3: Use Prebuilt Image with Elasticsearch
+#### Option 3: Use Prebuilt Image with Nova Guard policies
 
-Create a `docker-compose.yml` file with Elasticsearch integration:
+Create a `docker-compose.yml` that mounts a local policy bundle:
 
 ```yaml
 version: '3.8'
@@ -492,40 +535,10 @@ services:
       - "3000:3000"
     environment:
       - RUST_LOG=info
-      - ENABLE_ELASTICSEARCH=true
-      - ELASTICSEARCH_URL=http://elasticsearch:9200
-      - ELASTICSEARCH_USERNAME=elastic
-      - ELASTICSEARCH_PASSWORD=your_secure_password
-      - ELASTICSEARCH_INDEX=ai-gateway-metrics
-    restart: unless-stopped
-    depends_on:
-      - elasticsearch
-
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=true
-      - "ELASTIC_PASSWORD=your_secure_password"
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    ports:
-      - "9200:9200"
+      - NOVEUM_GUARD_POLICIES_FILE=/etc/nova-guard.json
     volumes:
-      - es_data:/usr/share/elasticsearch/data
-
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.12.0
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-      - ELASTICSEARCH_USERNAME=elastic
-      - ELASTICSEARCH_PASSWORD=your_secure_password
-    ports:
-      - "5601:5601"
-    depends_on:
-      - elasticsearch
-
-volumes:
-  es_data:
+      - ./nova-guard.json:/etc/nova-guard.json:ro
+    restart: unless-stopped
 ```
 
 Then run with:
@@ -607,7 +620,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "x-provider: openai" \
   -H "Authorization: Bearer your-openai-api-key" \
   -H "x-project-id: your-project-id" \
-  -H "x-organisation-id: your-org-id" \
+  -H "x-organization-id: your-org-id" \
   -H "x-user-id: your-user-id" \
   -d '{
     "model": "gpt-4",
@@ -622,7 +635,7 @@ These headers will be included in the telemetry logs, allowing you to:
 - Analyze performance by user
 - Segment analytics by experiment
 
-For more details, see the [Elasticsearch Integration Guide](docs/elasticsearch-integration.md) and [Telemetry Plugins Guide](docs/telemetry-plugins.md).
+For more details, see the [Telemetry Exporters Guide](docs/telemetry-plugins.md).
 
 ## Testing
 
@@ -639,9 +652,9 @@ Noveum Gateway includes comprehensive integration tests for all supported provid
    nano .env.test
    ```
 
-2. Start the gateway with ElasticSearch enabled:
+2. Start the gateway:
    ```bash
-   ENABLE_ELASTICSEARCH=true cargo run
+   cargo run
    ```
 
 3. Run the integration tests:
@@ -665,12 +678,6 @@ Your `.env.test` file should include the following variables:
 ```bash
 # Gateway URL (default: http://localhost:3000)
 GATEWAY_URL=http://localhost:3000
-
-# ElasticSearch Configuration (required for tests)
-ELASTICSEARCH_URL=http://localhost:9200
-ELASTICSEARCH_USERNAME=elastic
-ELASTICSEARCH_PASSWORD=your_elasticsearch_password
-ELASTICSEARCH_INDEX=ai-gateway-metrics
 
 # Provider API Keys - Add keys for the providers you want to test
 OPENAI_API_KEY=your_openai_api_key

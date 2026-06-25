@@ -1,25 +1,31 @@
-use super::Provider;
+//! AWS Bedrock provider adapter.
+//!
+//! Translates OpenAI-style chat requests into Bedrock's Converse API
+//! (`/model/{id}/converse[-stream]`), signs them with AWS SigV4 (credentials and
+//! region taken from request headers), and transforms Converse responses and
+//! event-stream chunks back into OpenAI shape. Token usage is read from Bedrock's
+//! `usage.inputTokens`/`outputTokens` (with an OpenAI-shape fallback).
+
 use super::utils::log_tracking_headers;
+use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
 use aws_event_stream_parser::{parse_message, Message};
 use axum::{
     body::{Body, Bytes},
-    http::{HeaderMap, HeaderValue, Response, StatusCode},
+    http::{HeaderMap, Response, StatusCode},
 };
 use futures_util::StreamExt;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, error, warn};
 use uuid;
 
 /// Constants for default values
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
-const DEFAULT_FALLBACK_MODEL: &str = "mistral.mistral-7b-instruct-v0:2";
 const DEFAULT_MAX_TOKENS: u64 = 1000;
 const DEFAULT_TEMPERATURE: f64 = 0.7;
 const DEFAULT_TOP_P: f64 = 1.0;
@@ -35,13 +41,27 @@ pub struct BedrockProvider {
     first_chunk: Arc<RwLock<bool>>,
 }
 
+impl Default for BedrockProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BedrockProvider {
     pub fn new() -> Self {
         let region = DEFAULT_REGION.to_string();
         debug!("Initializing BedrockProvider with region: {}", region);
-        
+
         // Create a random system fingerprint that will be reused across chunks
-        let fingerprint = format!("fp_{}", uuid::Uuid::new_v4().to_string().replace("-", "").chars().take(8).collect::<String>());
+        let fingerprint = format!(
+            "fp_{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .replace("-", "")
+                .chars()
+                .take(8)
+                .collect::<String>()
+        );
 
         Self {
             base_url: Arc::new(RwLock::new(format!(
@@ -54,13 +74,6 @@ impl BedrockProvider {
             system_fingerprint: Arc::new(RwLock::new(fingerprint)),
             first_chunk: Arc::new(RwLock::new(true)),
         }
-    }
-
-    fn get_model_name(&self, path: &str) -> String {
-        path.split('/')
-            .last()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
     }
 
     fn transform_request_body(&self, body: Value) -> Result<Value, AppError> {
@@ -164,7 +177,7 @@ impl BedrockProvider {
     }
 
     /// Handles content block chunks from Bedrock and transforms them to the OpenAI streaming format.
-    /// 
+    ///
     /// For the first chunk, this includes the "role": "assistant" field in the delta.
     /// For all chunks, this includes the same system_fingerprint and required OpenAI fields
     /// for compatibility with OpenAI SDKs.
@@ -184,7 +197,7 @@ impl BedrockProvider {
         }
     }
 
-    /// Handles metadata chunks from Bedrock (typically the final chunk) and transforms them 
+    /// Handles metadata chunks from Bedrock (typically the final chunk) and transforms them
     /// to the OpenAI streaming format.
     ///
     /// The final chunk includes usage information and a finish_reason of "stop".
@@ -208,7 +221,7 @@ impl BedrockProvider {
         let mut delta_content = json!({
             "content": delta
         });
-        
+
         // For the first chunk, include the role: "assistant"
         let is_first = {
             let mut first = self.first_chunk.write();
@@ -220,11 +233,11 @@ impl BedrockProvider {
                 false
             }
         };
-        
+
         if is_first {
             delta_content["role"] = json!("assistant");
         }
-        
+
         json!({
             "id": "chatcmpl-bedrock",
             "object": "chat.completion.chunk",
@@ -242,17 +255,26 @@ impl BedrockProvider {
 
     fn create_final_response(&self, usage: &Value) -> Value {
         // Extract usage data and transform to OpenAI format
-        let input_tokens = usage.get("inputTokens").and_then(Value::as_u64).unwrap_or(0);
-        let output_tokens = usage.get("outputTokens").and_then(Value::as_u64).unwrap_or(0);
-        let total_tokens = usage.get("totalTokens").and_then(Value::as_u64).unwrap_or(0);
-        
+        let input_tokens = usage
+            .get("inputTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("outputTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let total_tokens = usage
+            .get("totalTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
         // Create transformed usage object
         let transformed_usage = json!({
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
             "total_tokens": total_tokens
         });
-        
+
         json!({
             "id": "chatcmpl-bedrock",
             "object": "chat.completion.chunk",
@@ -270,9 +292,12 @@ impl BedrockProvider {
     }
 
     // Helper method to transform Bedrock response to OpenAI format
-    fn transform_bedrock_to_openai_format(&self, bedrock_response: Value) -> Result<Value, AppError> {
+    fn transform_bedrock_to_openai_format(
+        &self,
+        bedrock_response: Value,
+    ) -> Result<Value, AppError> {
         debug!("Transforming Bedrock response to OpenAI format");
-        
+
         // Extract content from Bedrock response
         let content = bedrock_response
             .get("output")
@@ -283,20 +308,22 @@ impl BedrockProvider {
             .and_then(|first| first.get("text"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        
+
         // Extract usage metrics
-        let usage = bedrock_response.get("usage").cloned().unwrap_or_else(|| json!({
-            "inputTokens": 0,
-            "outputTokens": 0,
-            "totalTokens": 0
-        }));
-        
+        let usage = bedrock_response.get("usage").cloned().unwrap_or_else(|| {
+            json!({
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0
+            })
+        });
+
         // Get stop reason
         let finish_reason = bedrock_response
             .get("stopReason")
             .and_then(Value::as_str)
             .unwrap_or("stop");
-            
+
         // Map Bedrock finish reason to OpenAI format
         let openai_finish_reason = match finish_reason {
             "end_turn" => "stop",
@@ -304,7 +331,7 @@ impl BedrockProvider {
             "stop_sequence" => "stop",
             _ => "stop",
         };
-        
+
         // Create OpenAI format response
         let openai_response = json!({
             "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().to_string().replace("-", "").chars().take(10).collect::<String>()),
@@ -339,7 +366,7 @@ impl BedrockProvider {
             "service_tier": "default",
             "system_fingerprint": format!("fp_{}", uuid::Uuid::new_v4().to_string().replace("-", "").chars().take(10).collect::<String>())
         });
-        
+
         Ok(openai_response)
     }
 }
@@ -361,17 +388,31 @@ impl Provider for BedrockProvider {
                 debug!("Setting model from before_request: {}", model);
                 *self.current_model.write() = model.to_string();
             }
-            
+
             // Extract streaming flag from the request body
-            let is_streaming = request_body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-            debug!("Setting streaming flag from before_request: {}", is_streaming);
+            let is_streaming = request_body
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            debug!(
+                "Setting streaming flag from before_request: {}",
+                is_streaming
+            );
             *self.is_streaming.write() = is_streaming;
-            
+
             // For each new request, generate a new system fingerprint
-            let new_fingerprint = format!("fp_{}", uuid::Uuid::new_v4().to_string().replace("-", "").chars().take(8).collect::<String>());
+            let new_fingerprint = format!(
+                "fp_{}",
+                uuid::Uuid::new_v4()
+                    .to_string()
+                    .replace("-", "")
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            );
             debug!("Generated new system fingerprint: {}", new_fingerprint);
             *self.system_fingerprint.write() = new_fingerprint;
-            
+
             // Reset the first_chunk flag for a new request
             debug!("Resetting first_chunk flag for new request");
             *self.first_chunk.write() = true;
@@ -387,16 +428,28 @@ impl Provider for BedrockProvider {
         Ok(())
     }
 
-    fn transform_path(&self, path: &str) -> String {
+    fn transform_path(&self, _path: &str) -> String {
         let model = self.current_model.read();
         let is_streaming = *self.is_streaming.read();
-        
-        debug!("Transforming path with model: {}, streaming: {}", *model, is_streaming);
-        
+
+        debug!(
+            "Transforming path with model: {}, streaming: {}",
+            *model, is_streaming
+        );
+
+        // Bedrock model identifiers may be inference-profile ARNs containing '/'
+        // (e.g. `arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic...`).
+        // A raw '/' would split the `/model/{id}/converse` path into extra
+        // segments and corrupt the request, so encode it to keep the id within a
+        // single segment. The same URL string is used for both SigV4 signing and
+        // the outbound request, so the signature stays consistent. Foundation
+        // model ids without a slash are left byte-for-byte unchanged.
+        let model_path = model.replace('/', "%2F");
+
         if is_streaming {
-            format!("/model/{}/converse-stream", *model)
+            format!("/model/{}/converse-stream", model_path)
         } else {
-            format!("/model/{}/converse", *model)
+            format!("/model/{}/converse", model_path)
         }
     }
 
@@ -451,11 +504,12 @@ impl Provider for BedrockProvider {
 
     async fn process_response(&self, response: Response<Body>) -> Result<Response<Body>, AppError> {
         // Extract AWS request ID if present
-        let aws_request_id = response.headers()
+        let aws_request_id = response
+            .headers()
             .get("x-amzn-RequestId")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-            
+
         if let Some(request_id) = &aws_request_id {
             debug!("Extracted AWS Request ID: {}", request_id);
         }
@@ -464,9 +518,7 @@ impl Provider for BedrockProvider {
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map_or(false, |ct| {
-                ct.contains("application/vnd.amazon.eventstream")
-            })
+            .is_some_and(|ct| ct.contains("application/vnd.amazon.eventstream"))
         {
             debug!("Processing Bedrock event stream response");
 
@@ -480,10 +532,10 @@ impl Provider for BedrockProvider {
                         Ok(transformed) => Ok(transformed),
                         Err(e) => {
                             error!("Error transforming chunk: {}", e);
-                            Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                            Err(std::io::Error::other(e))
                         }
                     },
-                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                    Err(e) => Err(std::io::Error::other(e)),
                 });
 
             // Build response with transformed stream and all necessary headers
@@ -502,24 +554,26 @@ impl Provider for BedrockProvider {
                 // SSE specific headers for better client compatibility
                 .header("x-accel-buffering", "no")
                 .header("keep-alive", "timeout=600");
-                
+
             // Add the request ID header if we have one
             if let Some(id) = aws_request_id {
                 builder = builder.header("x-request-id", id);
             }
 
-            Ok(builder
-                .body(Body::from_stream(stream))
-                .unwrap())
+            Ok(builder.body(Body::from_stream(stream)).unwrap())
         } else {
             // For non-streaming responses, transform the body to OpenAI format
             debug!("Processing Bedrock non-streaming response");
-            
+
             // Get response body using axum-compatible approach
             let (parts, body) = response.into_parts();
             let bytes = match futures_util::StreamExt::collect::<Vec<Result<Bytes, _>>>(
-                body.into_data_stream()
-            ).await.into_iter().collect::<Result<Vec<_>, _>>() {
+                body.into_data_stream(),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            {
                 Ok(chunks) => {
                     let body_size = chunks.iter().map(|c| c.len()).sum();
                     let mut full_body = Vec::with_capacity(body_size);
@@ -527,29 +581,34 @@ impl Provider for BedrockProvider {
                         full_body.extend_from_slice(&chunk);
                     }
                     Bytes::from(full_body)
-                },
-                Err(e) => return Err(AppError::HttpError(format!("Failed to collect body: {}", e))),
+                }
+                Err(e) => {
+                    return Err(AppError::HttpError(format!(
+                        "Failed to collect body: {}",
+                        e
+                    )))
+                }
             };
-            
+
             // Parse the Bedrock response
             let bedrock_response: Value = serde_json::from_slice(&bytes)
                 .map_err(|e| AppError::JsonParseError(e.to_string()))?;
-            
+
             debug!("Original Bedrock response: {:?}", bedrock_response);
-            
+
             // Transform to OpenAI format
             let openai_response = self.transform_bedrock_to_openai_format(bedrock_response)?;
             debug!("Transformed to OpenAI format: {:?}", openai_response);
-            
+
             // Create new response with transformed body
             let transformed_body = serde_json::to_vec(&openai_response)
                 .map_err(|e| AppError::JsonSerializeError(e.to_string()))?;
-            
+
             // Build new response
             let mut builder = Response::builder()
                 .status(parts.status)
                 .header(http::header::CONTENT_TYPE, "application/json");
-                
+
             // Copy the original headers
             for (name, value) in parts.headers {
                 if let Some(name) = name {
@@ -559,19 +618,19 @@ impl Provider for BedrockProvider {
                     }
                 }
             }
-            
+
             // Add CORS headers
             builder = builder
                 .header("access-control-allow-origin", "*")
                 .header("access-control-allow-methods", "POST, OPTIONS")
                 .header("access-control-allow-headers", "content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region")
                 .header("access-control-expose-headers", "*");
-            
+
             // Add the request ID header if we have one
             if let Some(id) = aws_request_id {
                 builder = builder.header("x-request-id", id);
             }
-            
+
             Ok(builder
                 .body(Body::from(transformed_body))
                 .map_err(|e| AppError::HttpError(format!("Failed to build response: {}", e)))?)
@@ -584,41 +643,67 @@ pub struct BedrockMetricsExtractor;
 
 impl MetricsExtractor for BedrockMetricsExtractor {
     fn extract_metrics(&self, response_body: &Value) -> ProviderMetrics {
-        debug!("Extracting Bedrock metrics from response: {}", response_body);
+        debug!(
+            "Extracting Bedrock metrics from response: {}",
+            response_body
+        );
         let mut metrics = ProviderMetrics::default();
-        
+
         // Try extracting token information from Bedrock format first
         if let Some(usage) = response_body.get("usage") {
             debug!("Found usage data: {:?}", usage);
-            
+
             // Check for Bedrock token format
-            let input_tokens = usage.get("inputTokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            let output_tokens = usage.get("outputTokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            let total_tokens = usage.get("totalTokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            
+            let input_tokens = usage
+                .get("inputTokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let output_tokens = usage
+                .get("outputTokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let total_tokens = usage
+                .get("totalTokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+
             // If Bedrock format tokens weren't found, try OpenAI format
-            let input_tokens = input_tokens.or_else(|| 
-                usage.get("prompt_tokens").and_then(|v| v.as_u64()).map(|v| v as u32));
-            
-            let output_tokens = output_tokens.or_else(|| 
-                usage.get("completion_tokens").and_then(|v| v.as_u64()).map(|v| v as u32));
-            
-            let total_tokens = total_tokens.or_else(|| 
-                usage.get("total_tokens").and_then(|v| v.as_u64()).map(|v| v as u32));
-            
+            let input_tokens = input_tokens.or_else(|| {
+                usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+            });
+
+            let output_tokens = output_tokens.or_else(|| {
+                usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+            });
+
+            let total_tokens = total_tokens.or_else(|| {
+                usage
+                    .get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+            });
+
             metrics.input_tokens = input_tokens;
             metrics.output_tokens = output_tokens;
             metrics.total_tokens = total_tokens;
-            
-            debug!("Extracted tokens - input: {:?}, output: {:?}, total: {:?}", 
-                metrics.input_tokens, metrics.output_tokens, metrics.total_tokens);
+
+            debug!(
+                "Extracted tokens - input: {:?}, output: {:?}, total: {:?}",
+                metrics.input_tokens, metrics.output_tokens, metrics.total_tokens
+            );
         }
 
         if let Some(model) = response_body.get("model").and_then(|v| v.as_str()) {
             debug!("Found Bedrock model: {}", model);
             metrics.model = model.to_string();
         }
-        
+
         // Extract request ID if present in the response body
         if let Some(request_id) = response_body.get("id").and_then(|v| v.as_str()) {
             debug!("Found Bedrock request ID in response body: {}", request_id);
@@ -627,23 +712,30 @@ impl MetricsExtractor for BedrockMetricsExtractor {
             debug!("Found requestId in response body: {}", request_id);
             metrics.request_id = Some(request_id.to_string());
         }
-        
-        // Calculate cost if we have token information and a model
-        if let (Some(total_tokens), Some(model)) = (metrics.total_tokens, response_body.get("model")) {
-            let model_name = model.as_str().unwrap_or("");
-            metrics.cost = Some(calculate_bedrock_cost(model_name, total_tokens));
-            debug!("Calculated Bedrock cost: {:?} for model {} and {} tokens", 
-                metrics.cost, metrics.model, total_tokens);
+
+        // Cost via the shared dual-rate pricing table.
+        if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
+            let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
+            if cost > 0.0 {
+                metrics.cost = Some(cost);
+            }
+            debug!(
+                "Calculated Bedrock cost: {:?} for model {}",
+                metrics.cost, metrics.model
+            );
         }
 
         debug!("Final extracted Bedrock metrics: {:?}", metrics);
         metrics
     }
-    
+
     // Override with Bedrock-specific streaming metrics extraction
-    fn try_extract_provider_specific_streaming_metrics(&self, chunk: &str) -> Option<ProviderMetrics> {
+    fn try_extract_provider_specific_streaming_metrics(
+        &self,
+        chunk: &str,
+    ) -> Option<ProviderMetrics> {
         debug!("Attempting Bedrock-specific streaming metrics extraction for chunk");
-        
+
         // Try to parse the chunk as JSON
         if let Ok(json) = serde_json::from_str::<Value>(chunk) {
             // Check for indicators that this is a final message with metrics
@@ -651,41 +743,98 @@ impl MetricsExtractor for BedrockMetricsExtractor {
                 debug!("Found usage in Bedrock streaming chunk, extracting complete metrics");
                 return Some(self.extract_metrics(&json));
             }
-            
+
             // For ongoing chunks, extract what we can
             let mut partial_metrics = ProviderMetrics::default();
-            
+
             // Try to extract model information if available
             if let Some(model) = json.get("model").and_then(|m| m.as_str()) {
                 partial_metrics.model = model.to_string();
             }
-            
+
             // Try to extract request ID from various possible locations
             if let Some(request_id) = json.get("id").and_then(|v| v.as_str()) {
-                debug!("Found request ID in Bedrock streaming chunk: {}", request_id);
+                debug!(
+                    "Found request ID in Bedrock streaming chunk: {}",
+                    request_id
+                );
                 partial_metrics.request_id = Some(request_id.to_string());
             } else if let Some(request_id) = json.get("requestId").and_then(|v| v.as_str()) {
                 debug!("Found requestId in Bedrock streaming chunk: {}", request_id);
                 partial_metrics.request_id = Some(request_id.to_string());
             }
-            
+
             // Return partial metrics if we found anything useful
             if !partial_metrics.model.is_empty() || partial_metrics.request_id.is_some() {
                 debug!("Returning partial Bedrock metrics from streaming chunk");
                 return Some(partial_metrics);
             }
         }
-        
+
         None
     }
 }
 
-// Helper function for Bedrock-specific cost calculation
-fn calculate_bedrock_cost(model: &str, total_tokens: u32) -> f64 {
-    match model {
-        m if m.contains("claude") => (total_tokens as f64) * 0.00001102,
-        m if m.contains("titan") => (total_tokens as f64) * 0.00001,
-        m if m.contains("llama2") => (total_tokens as f64) * 0.00001,
-        _ => 0.0,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn transform_path_url_encodes_slash_in_arn_model() {
+        // Inference-profile ARNs contain '/', which must be percent-encoded so it
+        // stays within the single `/model/{id}/converse` path segment.
+        let p = BedrockProvider::new();
+        *p.current_model.write() =
+            "arn:aws:bedrock:us-east-1:123:inference-profile/us.anthropic.claude".to_string();
+        *p.is_streaming.write() = false;
+        let path = p.transform_path("/v1/chat/completions");
+        assert!(path.starts_with("/model/"));
+        assert!(path.ends_with("/converse"));
+        assert!(path.contains("%2F"), "slash must be encoded: {path}");
+        assert!(
+            !path.contains("profile/us"),
+            "raw slash must not remain: {path}"
+        );
+    }
+
+    #[test]
+    fn transform_path_plain_model_is_unencoded_and_streams() {
+        let p = BedrockProvider::new();
+        *p.current_model.write() = "anthropic.claude-3-5-sonnet-20240620-v1:0".to_string();
+        *p.is_streaming.write() = false;
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse"
+        );
+        *p.is_streaming.write() = true;
+        assert_eq!(
+            p.transform_path("/v1/chat/completions"),
+            "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream"
+        );
+    }
+
+    #[test]
+    fn extract_metrics_reads_bedrock_token_fields() {
+        let body = json!({
+            "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "usage": {"inputTokens": 80, "outputTokens": 20, "totalTokens": 100}
+        });
+        let m = BedrockMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(80));
+        assert_eq!(m.output_tokens, Some(20));
+        assert_eq!(m.total_tokens, Some(100));
+    }
+
+    #[test]
+    fn extract_metrics_openai_shape_fallback() {
+        let body = json!({
+            "model": "x",
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        });
+        let m = BedrockMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(7));
+        assert_eq!(m.output_tokens, Some(3));
+        assert_eq!(m.total_tokens, Some(10));
     }
 }

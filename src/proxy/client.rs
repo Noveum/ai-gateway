@@ -18,7 +18,6 @@ pub fn create_client(config: &AppConfig) -> reqwest::Client {
         .use_rustls_tls()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(3))
-        .pool_max_idle_per_host(32)
         .gzip(true)
         .brotli(true)
         .build()
