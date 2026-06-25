@@ -242,7 +242,11 @@ pub fn get_metrics_extractor(provider: &str) -> Box<dyn MetricsExtractor> {
     use crate::providers::openai::OpenAIMetricsExtractor;
     use crate::providers::openai_compatible::OpenAICompatibleMetricsExtractor;
 
-    match provider {
+    // Normalize the provider name (the `x-provider` header is forwarded as-is,
+    // but provider construction lowercases it) so a header like `Gemini` or
+    // `OpenRouter` dispatches to the right extractor instead of silently falling
+    // back to the OpenAI one and skewing telemetry.
+    match provider.to_lowercase().as_str() {
         "anthropic" => Box::new(AnthropicMetricsExtractor),
         "bedrock" => Box::new(BedrockMetricsExtractor),
         "groq" => Box::new(GroqMetricsExtractor),

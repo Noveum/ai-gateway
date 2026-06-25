@@ -1,3 +1,9 @@
+//! Fireworks AI provider adapter.
+//!
+//! Forwards to Fireworks' OpenAI-compatible API
+//! (`https://api.fireworks.ai/inference`). Token usage comes from the standard
+//! `usage` object and cost is priced via the shared table.
+
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
@@ -9,6 +15,8 @@ use axum::{
 };
 use tracing::{debug, error};
 
+/// Provider adapter for Fireworks AI (`x-provider: fireworks`). Base URL
+/// `https://api.fireworks.ai/inference`; OpenAI-compatible wire format.
 pub struct FireworksProvider {
     base_url: String,
 }
@@ -162,6 +170,14 @@ impl MetricsExtractor for FireworksMetricsExtractor {
         if let Some(id) = response_body.get("id").and_then(|v| v.as_str()) {
             debug!("Found request ID: {}", id);
             metrics.request_id = Some(id.to_string());
+        }
+
+        // Cost via the shared dual-rate pricing table (Fireworks models are in it).
+        if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
+            let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
+            if cost > 0.0 {
+                metrics.cost = Some(cost);
+            }
         }
 
         metrics

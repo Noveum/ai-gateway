@@ -1,3 +1,9 @@
+//! OpenAI provider adapter.
+//!
+//! Forwards Chat Completions requests to `https://api.openai.com` unchanged
+//! (the gateway speaks the OpenAI wire format natively) and extracts token usage
+//! + cost from the standard `usage` object via the shared pricing table.
+
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
@@ -8,6 +14,8 @@ use serde_json::Value;
 use std::time::Duration;
 use tracing::{debug, error};
 
+/// Provider adapter for OpenAI (`x-provider: openai`). Base URL
+/// `https://api.openai.com`; passes the Bearer token through unchanged.
 pub struct OpenAIProvider {
     base_url: String,
 }
@@ -104,13 +112,16 @@ impl MetricsExtractor for OpenAIMetricsExtractor {
             metrics.model = model.to_string();
         }
 
-        if let (Some(total_tokens), Some(model)) =
-            (metrics.total_tokens, response_body.get("model"))
-        {
-            metrics.cost = Some(calculate_cost(model.as_str().unwrap_or(""), total_tokens));
+        // Cost via the single-sourced, dual-rate pricing table (input and output
+        // priced separately). 0.0 (unknown model) is left as None.
+        if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
+            let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
+            if cost > 0.0 {
+                metrics.cost = Some(cost);
+            }
             debug!(
-                "Calculated cost: {:?} for model {} and {} tokens",
-                metrics.cost, metrics.model, total_tokens
+                "Calculated cost: {:?} for model {}",
+                metrics.cost, metrics.model
             );
         }
 
@@ -157,14 +168,5 @@ impl MetricsExtractor for OpenAIMetricsExtractor {
         }
         debug!("No usage data found in OpenAI streaming chunk");
         None
-    }
-}
-
-// Helper function to calculate cost based on model and tokens
-fn calculate_cost(model: &str, total_tokens: u32) -> f64 {
-    match model {
-        m if m.contains("gpt-4") => (total_tokens as f64) * 0.00003,
-        m if m.contains("gpt-3.5") => (total_tokens as f64) * 0.000002,
-        _ => 0.0,
     }
 }

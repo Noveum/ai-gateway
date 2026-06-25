@@ -1,3 +1,10 @@
+//! Groq provider adapter.
+//!
+//! Forwards to Groq's OpenAI-compatible API (`https://api.groq.com/openai`).
+//! Groq reports timing and token usage under an `x_groq.usage` object (with a
+//! root-`usage` fallback); both non-streaming and SSE streaming are handled, and
+//! cost is priced via the shared table.
+
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
@@ -8,6 +15,8 @@ use serde_json::Value;
 use std::time::Duration;
 use tracing::{debug, error};
 
+/// Provider adapter for Groq (`x-provider: groq`). Base URL
+/// `https://api.groq.com/openai`; OpenAI-compatible wire format.
 pub struct GroqProvider {
     base_url: String,
 }
@@ -132,16 +141,14 @@ impl MetricsExtractor for GroqMetricsExtractor {
             metrics.model = model.to_string();
         }
 
-        if let (Some(total_tokens), Some(model)) =
-            (metrics.total_tokens, response_body.get("model"))
-        {
-            metrics.cost = Some(calculate_groq_cost(
-                model.as_str().unwrap_or(""),
-                total_tokens,
-            ));
+        if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
+            let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
+            if cost > 0.0 {
+                metrics.cost = Some(cost);
+            }
             debug!(
-                "Calculated Groq cost: {:?} for model {} and {} tokens",
-                metrics.cost, metrics.model, total_tokens
+                "Calculated Groq cost: {:?} for model {}",
+                metrics.cost, metrics.model
             );
         }
 
@@ -188,13 +195,12 @@ impl MetricsExtractor for GroqMetricsExtractor {
                         metrics.model = model.to_string();
                     }
 
-                    // Calculate cost if we have total tokens and model
-                    if let Some(total_tokens) = metrics.total_tokens {
-                        metrics.cost = Some(calculate_groq_cost(&metrics.model, total_tokens));
-                        debug!(
-                            "Calculated Groq cost: {:?} for model {} and {} tokens",
-                            metrics.cost, metrics.model, total_tokens
-                        );
+                    // Cost via the shared dual-rate pricing table.
+                    if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
+                        let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
+                        if cost > 0.0 {
+                            metrics.cost = Some(cost);
+                        }
                     }
 
                     debug!(
@@ -289,9 +295,12 @@ impl MetricsExtractor for GroqMetricsExtractor {
                             metrics.model = model.to_string();
                         }
 
-                        // Calculate cost if we have total tokens and model
-                        if let Some(total_tokens) = metrics.total_tokens {
-                            metrics.cost = Some(calculate_groq_cost(&metrics.model, total_tokens));
+                        // Cost via the shared dual-rate pricing table.
+                        if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
+                            let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
+                            if cost > 0.0 {
+                                metrics.cost = Some(cost);
+                            }
                         }
 
                         debug!(
@@ -333,42 +342,5 @@ impl MetricsExtractor for GroqMetricsExtractor {
 
         debug!("No usage data found in Groq streaming chunk");
         None
-    }
-}
-
-// Helper function for Groq-specific cost calculation
-fn calculate_groq_cost(model: &str, total_tokens: u32) -> f64 {
-    let tokens = total_tokens as f64;
-
-    match model {
-        // Llama 3 models
-        m if m.contains("llama-3") && m.contains("70b") => tokens * 0.0009,
-        m if m.contains("llama-3") && m.contains("8b") => tokens * 0.0001,
-        m if m.contains("llama-3.1") && m.contains("70b") => tokens * 0.0009,
-        m if m.contains("llama-3.1") && m.contains("8b") => tokens * 0.0001,
-
-        // Legacy Llama 2 models
-        m if m.contains("llama-2") && m.contains("70b") => tokens * 0.0007,
-        m if m.contains("llama-2") && m.contains("13b") => tokens * 0.0002,
-        m if m.contains("llama-2") && m.contains("7b") => tokens * 0.0001,
-
-        // Mixtral models
-        m if m.contains("mixtral-8x7b") => tokens * 0.0002,
-        m if m.contains("mixtral-8x22b") => tokens * 0.0006,
-
-        // Gemma models
-        m if m.contains("gemma") && m.contains("7b") => tokens * 0.0001,
-        m if m.contains("gemma") && m.contains("27b") => tokens * 0.0004,
-
-        // Generic fallbacks by model family
-        m if m.contains("mixtral") => tokens * 0.0002,
-        m if m.contains("llama") => tokens * 0.0001,
-        m if m.contains("gemma") => tokens * 0.0001,
-
-        // Default case - apply minimal cost to avoid zero cost which might mislead
-        _ => {
-            debug!("Unknown Groq model for cost calculation: {}", model);
-            tokens * 0.0001
-        }
     }
 }

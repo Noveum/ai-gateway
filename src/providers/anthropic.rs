@@ -1,3 +1,12 @@
+//! Anthropic provider adapter.
+//!
+//! Maps OpenAI-style `/v1/chat/completions` requests to Anthropic's
+//! `/v1/messages` endpoint, converts the `Authorization: Bearer` header to
+//! Anthropic's `x-api-key` + `anthropic-version`, and transforms the Messages
+//! response (and streaming events) back into OpenAI shape. Token usage is read
+//! from Anthropic's `usage.input_tokens`/`output_tokens` and priced via the
+//! shared table.
+
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
@@ -17,6 +26,9 @@ thread_local! {
     static ANTHROPIC_INPUT_TOKENS: RefCell<Option<u32>> = const { RefCell::new(None) };
 }
 
+/// Provider adapter for Anthropic (`x-provider: anthropic`). Base URL
+/// `https://api.anthropic.com`; rewrites the path to `/v1/messages` and the auth
+/// header to `x-api-key`.
 pub struct AnthropicProvider {
     base_url: String,
 }
@@ -288,9 +300,12 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
         if let Some(model) = response_body.get("model").and_then(|v| v.as_str()) {
             metrics.model = model.to_string();
 
-            // Calculate cost if we have token information
-            if let Some(total_tokens) = metrics.total_tokens {
-                metrics.cost = Some(calculate_anthropic_cost(&metrics.model, total_tokens));
+            // Cost via the shared dual-rate pricing table.
+            if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
+                let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
+                if cost > 0.0 {
+                    metrics.cost = Some(cost);
+                }
             }
         }
 
@@ -379,25 +394,19 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
                     let input_tokens = ANTHROPIC_INPUT_TOKENS.with(|tokens| *tokens.borrow());
                     metrics.input_tokens = input_tokens;
 
-                    // Calculate total tokens
-                    if let Some(input) = input_tokens {
-                        metrics.total_tokens = Some(input + output);
-                        metrics.cost =
-                            Some(calculate_anthropic_cost(&metrics.model, input + output));
-                        debug!(
-                            "Final metrics - input: {}, output: {}, total: {}",
-                            input,
-                            output,
-                            input + output
-                        );
-                    } else {
-                        metrics.total_tokens = Some(output);
-                        metrics.cost = Some(calculate_anthropic_cost(&metrics.model, output));
-                        debug!(
-                            "Final metrics missing input tokens, using only output: {}",
-                            output
-                        );
+                    // Calculate total tokens + cost (dual-rate via shared table).
+                    let input = input_tokens.unwrap_or(0);
+                    metrics.total_tokens = Some(input + output);
+                    let cost = crate::policy::pricing::estimate_cost(&metrics.model, input, output);
+                    if cost > 0.0 {
+                        metrics.cost = Some(cost);
                     }
+                    debug!(
+                        "Final streaming metrics - input: {}, output: {}, total: {}",
+                        input,
+                        output,
+                        input + output
+                    );
 
                     return Some(metrics);
                 }
@@ -405,37 +414,6 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
         }
 
         None
-    }
-}
-
-// Helper function for Anthropic-specific cost calculation
-fn calculate_anthropic_cost(model: &str, total_tokens: u32) -> f64 {
-    let tokens = total_tokens as f64;
-
-    match model {
-        // Claude 3.5 models
-        m if m.contains("claude-3.5-sonnet") => tokens * 0.000003, // $3.00 per million tokens
-
-        // Claude 3 models
-        m if m.contains("claude-3-opus") => tokens * 0.000015, // $15.00 per million tokens
-        m if m.contains("claude-3-sonnet") => tokens * 0.000003, // $3.00 per million tokens
-        m if m.contains("claude-3-haiku") => tokens * 0.000000125, // $0.25 per million input, $1.25 per million output, using average
-
-        // Claude 2 models
-        m if m.contains("claude-2") => tokens * 0.000008, // $8.00 per million tokens
-
-        // Claude Instant models
-        m if m.contains("claude-instant") => tokens * 0.000001, // $1.00 per million tokens
-
-        // Generic fallbacks by model family
-        m if m.contains("claude-3") => tokens * 0.000003, // Use Sonnet pricing as default for Claude 3
-        m if m.contains("claude") => tokens * 0.000002, // Use a conservative estimate for unknown Claude models
-
-        // Default case
-        _ => {
-            debug!("Unknown Anthropic model for cost calculation: {}", model);
-            tokens * 0.000002 // Conservative default
-        }
     }
 }
 
@@ -525,7 +503,7 @@ fn transform_anthropic_to_openai_format(anthropic_response: Value) -> Value {
         "system_fingerprint": format!("anthropic-{}", anthropic_response.get("model").and_then(|m| m.as_str()).unwrap_or("claude"))
     });
 
-    // Handle the seed value - convert to string if present to avoid Elasticsearch long integer overflow
+    // Handle the seed value - convert to string if present to avoid integer overflow in downstream stores
     if let Some(seed) = anthropic_response.get("seed") {
         if let Some(choices) = transformed
             .get_mut("choices")
@@ -533,7 +511,7 @@ fn transform_anthropic_to_openai_format(anthropic_response: Value) -> Value {
         {
             for choice in choices {
                 if seed.is_number() {
-                    // Convert the numeric seed to a string to avoid Elasticsearch integer range issues
+                    // Convert the numeric seed to a string to avoid integer range issues in downstream stores
                     choice["seed"] = json!(seed.to_string());
                 } else {
                     // If it's already a string or other type, just preserve it
