@@ -3,22 +3,32 @@
 Research + migration plan for running the gateway as a globally‑distributed
 Cloudflare service. Current as of **June 2026**.
 
-## TL;DR
+## TL;DR — chosen direction
 
-Yes — there are **two viable paths**, with very different effort/payoff:
+**Primary: native Cloudflare Workers (Rust → WASM).** Containers add container
+cold‑start + higher cost and are not true per‑PoP, so they are **not** the fast
+path; we target the native Worker (V8 isolates, ~0 cold start, every PoP). We
+**keep the existing native binary + Docker image fully working** for self‑hosting
+(no Cloudflare Containers dependency), sharing **one Nova Guard engine** across
+both builds so they never diverge.
 
-| | **A. Cloudflare Containers** | **B. Cloudflare Workers (Rust → WASM)** |
+| | **Native Worker (WASM)** — primary edge | **Native binary / Docker** — self‑host (kept) |
 |---|---|---|
-| Code changes | **~none** (run the existing Docker image) | **substantial rewrite** of the runtime + I/O layers |
-| Distribution | Global (330+ cities), instance placed in optimal location | **True per‑PoP edge** in 330+ cities (V8 isolates) |
-| Cold start | Container spin‑up (100s of ms – seconds) | **~0** (isolate) |
-| Cost model | Workers Paid ($5/mo) + per‑10ms active CPU + memory/disk | Per‑request + per‑CPU‑ms (cheapest) |
-| Limits | ~container limits (memory/vCPU/disk) | 128 MB mem (hard), 5 min CPU (hard), 30s CPU default, WASM bundle‑size limit |
-| Best for | "Ship globally now, zero rewrite" | "Maximally distributed, lowest latency/cost, long‑term" |
+| Runtime | V8 isolate, `wasm32-unknown-unknown` via `workers-rs` | Tokio + Axum + reqwest (today's binary) |
+| Distribution | **True per‑PoP edge**, 330+ cities, ~0 cold start | Wherever the operator runs it |
+| Outbound HTTP | `worker::Fetch` | `reqwest` |
+| Crypto (Bedrock SigV4) | **Web Crypto** (`crypto.subtle` HMAC‑SHA256) | `aws-sigv4` |
+| Token caps | heuristic / wasm‑safe tokenizer | `tiktoken-rs` |
+| Built from | new `worker/` crate | existing `noveum-ai-gateway` crate (published, unchanged) |
 
-**Recommendation: a phased approach** — go live on **Containers** immediately
-(fast, no rewrite), then incrementally build a **Workers‑native** version for the
-hot path (the OpenAI‑compatible providers), which is where the true edge win is.
+**Shared core:** the Nova Guard engine (regex/PII/secrets/banned/model‑allowlist/
+json‑schema), pricing/cost, and provider base‑URL/path mapping live in one place
+and compile to **both** native and wasm32, so the edge Worker and the self‑hosted
+binary enforce identically.
+
+> Cloudflare **Containers** remain a documented fallback (run the same Docker
+> image) for anyone who wants the full native feature set without the WASM build —
+> but they are not the primary deployment.
 
 > Why not "just compile it to a Worker"? Cloudflare Workers run on V8 isolates and
 > execute Rust as **WebAssembly (`wasm32-unknown-unknown`)**. That environment has
@@ -27,6 +37,30 @@ hot path (the OpenAI‑compatible providers), which is where the true edge win i
 > those. So a Worker port is a real engineering project, not a recompile.
 
 ---
+
+## Implementation status
+
+**Phase 1 — DONE (single package, three targets).** The `noveum-ai-gateway` crate
+now compiles to `wasm32-unknown-unknown` as a Cloudflare Worker *and* to the
+native server, from one codebase:
+- Cargo deps split by target (`cfg(not(target_arch = "wasm32"))` = native server;
+  `cfg(target_arch = "wasm32")` = `worker`); the native binary is gated by a
+  `native` feature so the wasm build (`--no-default-features`) excludes it.
+- Native-only modules (`proxy`, `handlers`, `config`, `providers`, `telemetry`,
+  `error`, axum router) are `cfg`-gated; the **Nova Guard engine + pricing +
+  `routing`** are shared and compile to both.
+- `src/worker_rt.rs` is the `#[event(fetch)]` entry: `/health`, Nova Guard input
+  enforcement via the shared engine, and proxy of the OpenAI-compatible providers
+  via `worker::Fetch`.
+- **Verified locally in `workerd` (`wrangler dev`):** real OpenAI + Groq proxy and
+  the SSN block behave identically to the native server. Native: 166 unit + 10
+  integration tests green; clippy clean on **both** targets; `worker-build`
+  produces a deployable bundle.
+
+See **[CLOUDFLARE_WORKER.md](CLOUDFLARE_WORKER.md)** for build/test/deploy steps.
+
+**Remaining:** output-phase + SSE streaming on the edge; Anthropic + Bedrock
+(Web-Crypto SigV4); edge telemetry sink + Workers-KV policies; `wasm-opt`.
 
 ## How Cloudflare runs code (the constraint that drives everything)
 

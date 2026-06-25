@@ -14,15 +14,21 @@
 //! An `x_noveum_guard` extension object is attached so tooling can identify
 //! guard-synthesised responses; provider SDKs ignore unknown fields.
 
+// `BlockResponseMode` (the mode enum) is shared. The provider-shaped block
+// response builder is axum-based and native-only; the Cloudflare Worker builds
+// the equivalent JSON in `worker_rt` and wraps it in `worker::Response`.
+#[cfg(not(target_arch = "wasm32"))]
+use super::decision::PolicyDecision;
+#[cfg(not(target_arch = "wasm32"))]
 use axum::{
     body::Body,
     http::{header, StatusCode},
     response::Response,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use serde_json::{json, Value};
+#[cfg(not(target_arch = "wasm32"))]
 use uuid::Uuid;
-
-use super::decision::PolicyDecision;
 
 /// How a block should be surfaced to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +48,7 @@ impl BlockResponseMode {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn guard_extension(decision: &PolicyDecision) -> Value {
     json!({
         "blocked": true,
@@ -57,6 +64,7 @@ fn guard_extension(decision: &PolicyDecision) -> Value {
 /// `provider` is the `x-provider` value (e.g. `"openai"`, `"anthropic"`,
 /// `"google"`); unknown providers fall back to the OpenAI shape, which most
 /// OpenAI-compatible SDKs accept.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn block_response(
     provider: &str,
     model: &str,
@@ -97,6 +105,7 @@ pub fn block_response(
         .expect("synthetic response with sanitized header is always valid")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn reason_text(decision: &PolicyDecision) -> String {
     format!(
         "Request blocked by Nova Guard policy '{}': {}",
@@ -104,6 +113,7 @@ fn reason_text(decision: &PolicyDecision) -> String {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn error_body(provider: &str, decision: &PolicyDecision) -> Value {
     let message = reason_text(decision);
     match provider {
@@ -124,6 +134,7 @@ fn error_body(provider: &str, decision: &PolicyDecision) -> Value {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn success_body(provider: &str, model: &str, decision: &PolicyDecision) -> Value {
     let content = reason_text(decision);
     let id_suffix = Uuid::new_v4().to_string();

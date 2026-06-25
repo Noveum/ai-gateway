@@ -1,0 +1,22 @@
+# Cloudflare Worker config for the Noveum AI Gateway (edge/WASM deployment).
+#
+# Build:   worker-build --release        (compiles the crate to wasm32 + JS shim)
+# Dev:     npx wrangler dev               (runs locally in workerd at :8787)
+# Deploy:  npx wrangler deploy            (publishes to the global edge)
+#
+# The native binary / Docker image (the published `noveum-ai-gateway` crate) is
+# unaffected by this file — it is a separate deployment shape of the same package.
+name = "noveum-ai-gateway"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-11-01"
+
+[build]
+command = "worker-build --release"
+
+# Nova Guard policies for the edge (inline JSON). Empty/absent = transparent
+# pass-through, identical to the native gateway with no policies. For production,
+# prefer a Workers KV binding (see docs/CLOUDFLARE_DEPLOYMENT.md).
+[vars]
+NOVEUM_GUARD_ENABLED = "true"
+# Example: block US SSNs in the input and reject non-allowlisted models.
+NOVEUM_GUARD_POLICIES = '{"policies":[{"name":"block-ssn","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"ssn","regex":"\\d{3}-\\d{2}-\\d{4}"}],"action":"block"}}]}'

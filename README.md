@@ -38,6 +38,10 @@
 - 📊 **Telemetry & Metrics**: Per-request token usage and cost tracking with a pluggable `MetricsExporter` trait; ships with a console exporter (set `DEBUG_METRICS=true`) for local debugging. See [docs/telemetry-plugins.md](docs/telemetry-plugins.md).
 - 🌐 **CORS Support**: Configurable cross-origin resource sharing
 - 🛠️ **SDK Compatibility**: Works with any OpenAI-compatible SDK
+- 🌍 **Deploy anywhere — one package, three shapes**: the same crate runs as a
+  native binary / **Docker** image, a **Rust library**, **or** a
+  **Cloudflare Worker** (WASM, true per‑PoP edge) sharing the same Nova Guard
+  engine. See [docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md).
 
 ## ⚡ Performance
 

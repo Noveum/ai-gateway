@@ -43,12 +43,23 @@ impl TokenLengthCapRule {
     }
 }
 
-/// Estimate token count for arbitrary text using the o200k_base encoding
-/// (cached singleton). Falls back to a chars/4 heuristic only if the encoder
-/// cannot be constructed (should not happen with the bundled vocab).
+/// Estimate token count for arbitrary text.
+///
+/// Native builds use the exact `o200k_base` BPE encoding (cached singleton).
+/// The wasm32 / Cloudflare Worker build uses a `chars / 4` heuristic instead —
+/// `tiktoken-rs` bundles a multi-megabyte vocab and pulls `fancy-regex`, which
+/// would bloat the Worker bundle and risk the size/startup limits. The heuristic
+/// is conservative for a guardrail (it can only under-count pathological inputs).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn estimate_tokens(text: &str) -> u32 {
     let bpe = tiktoken_rs::o200k_base_singleton();
     bpe.encode_with_special_tokens(text).len() as u32
+}
+
+/// wasm32 token estimate: `ceil(chars / 4)` (≈ average English token length).
+#[cfg(target_arch = "wasm32")]
+pub fn estimate_tokens(text: &str) -> u32 {
+    (text.chars().count() as f32 / 4.0).ceil() as u32
 }
 
 impl PolicyRule for TokenLengthCapRule {

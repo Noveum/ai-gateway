@@ -144,45 +144,9 @@ fn header_str<B>(req: &Request<B>, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Flatten the user-supplied input text from a chat/completions-style body.
-///
-/// Handles OpenAI/Anthropic `messages[].content` (string or array-of-parts),
-/// Anthropic top-level `system`, and a plain `prompt` string.
-pub fn flatten_input_text(json: &Value) -> String {
-    let mut out = String::new();
-
-    if let Some(system) = json.get("system").and_then(|s| s.as_str()) {
-        out.push_str(system);
-        out.push('\n');
-    }
-
-    if let Some(prompt) = json.get("prompt").and_then(|p| p.as_str()) {
-        out.push_str(prompt);
-        out.push('\n');
-    }
-
-    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
-        for msg in messages {
-            match msg.get("content") {
-                Some(Value::String(s)) => {
-                    out.push_str(s);
-                    out.push('\n');
-                }
-                Some(Value::Array(parts)) => {
-                    for part in parts {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            out.push_str(t);
-                            out.push('\n');
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    out
-}
+// Input flattening is shared with the Cloudflare Worker so the input scan is
+// identical on both deployment shapes.
+pub use crate::routing::flatten_input_text;
 
 /// Apply input transforms to every text segment in the body in place, including
 /// array-form (multimodal) content parts and array-form `system` blocks so that
