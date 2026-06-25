@@ -1,0 +1,41 @@
+{
+  "bundleVersion": "1.0",
+  "policies": [
+    {
+      "name": "Block US SSN in input",
+      "type": "regex_match",
+      "mode": "enforce",
+      "priority": 10,
+      "config": {
+        "phase": "input",
+        "patterns": [{ "name": "us_ssn", "regex": "\\b\\d{3}-\\d{2}-\\d{4}\\b" }],
+        "action": "block"
+      }
+    },
+    {
+      "name": "Redact PII before forwarding",
+      "type": "pii_detection",
+      "mode": "enforce",
+      "priority": 20,
+      "config": {
+        "phase": "input",
+        "entities": ["EMAIL_ADDRESS", "CREDIT_CARD_NUMBER", "PHONE_NUMBER"],
+        "action": "redact"
+      }
+    },
+    {
+      "name": "Allow only approved models",
+      "type": "model_allowlist",
+      "mode": "enforce",
+      "priority": 5,
+      "config": { "allowed": ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4-5*", "gemini-2.5-flash"] }
+    },
+    {
+      "name": "Cap prompt size",
+      "type": "token_length_cap",
+      "mode": "enforce",
+      "priority": 30,
+      "config": { "phase": "input", "maxTokens": 100000, "action": "block" }
+    }
+  ]
+}

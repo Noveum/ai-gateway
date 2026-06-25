@@ -39,6 +39,22 @@
 - 🌐 **CORS Support**: Configurable cross-origin resource sharing
 - 🛠️ **SDK Compatibility**: Works with any OpenAI-compatible SDK
 
+## ⚡ Performance
+
+Built in Rust (Axum + Tokio). The gateway adds negligible overhead on top of the
+upstream provider's own latency. Measured locally (release build, localhost,
+includes client + loopback round-trip):
+
+| Path | p50 | p99 |
+|---|---|---|
+| Health check (gateway processing only) | ~0.46 ms | ~0.87 ms |
+| Full Nova Guard path (JSON parse + regex + PII scan, request blocked, no upstream) | ~0.60 ms | ~1.08 ms |
+
+So Nova Guard policy evaluation adds roughly **~0.15 ms** at p50, and when the
+engine is disabled or has no active policies the middleware short-circuits with
+**zero** body buffering. (Numbers vary by hardware; reproduce with the steps in
+[docs/deployment.md](docs/deployment.md).)
+
 ## 🚀 Quick Start
 
 ### Installation

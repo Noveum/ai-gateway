@@ -58,7 +58,7 @@ jobs:
       - name: Coverage (Nova Guard modules), enforce threshold
         run: >
           cargo llvm-cov --lib --test policy_integration
-          --ignore-filename-regex '(src/main\.rs|src/error\.rs|src/config\.rs|src/context\.rs|src/handlers\.rs|src/proxy/|src/telemetry/(middleware|metrics|mod|provider_metrics)\.rs|src/telemetry/plugins/|src/providers/(openai|anthropic|bedrock|groq|fireworks|together|utils|mod)\.rs)'
+          --ignore-filename-regex '(src/main\.rs|src/lib\.rs|src/error\.rs|src/config\.rs|src/handlers\.rs|src/proxy/|src/telemetry/(middleware|metrics|mod|provider_metrics)\.rs|src/telemetry/plugins/|src/providers/(openai|anthropic|bedrock|groq|fireworks|together|utils|mod)\.rs)'
           --fail-under-lines 85
           --lcov --output-path lcov.info
       - name: Upload coverage artifact

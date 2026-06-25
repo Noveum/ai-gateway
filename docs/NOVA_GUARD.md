@@ -13,11 +13,13 @@ standalone (BYOK mode) with no external service.
 ## Quick start
 
 1. Write a policy bundle (`nova-guard.json`) — see [Policy bundle](#policy-bundle).
+   A ready-to-use starter lives at
+   [`nova-guard.example.json`](../nova-guard.example.json) in the repo root.
 2. Point the gateway at it:
 
    ```bash
    export NOVEUM_GUARD_ENABLED=true
-   export NOVEUM_GUARD_POLICIES_FILE=./nova-guard.json
+   export NOVEUM_GUARD_POLICIES_FILE=./nova-guard.example.json
    cargo run --release
    ```
 
