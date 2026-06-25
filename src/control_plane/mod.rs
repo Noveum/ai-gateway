@@ -13,14 +13,16 @@
 //! failure. When no control plane is configured the gateway runs standalone with
 //! local policies only.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::policy::config::PolicyBundle;
+use crate::policy::PolicyEngine;
 
 /// Configuration for the control-plane client.
 #[derive(Debug, Clone)]
@@ -269,6 +271,52 @@ impl ControlPlaneClient {
     }
 }
 
+/// Spawn the background task that distributes hosted policies to the engine.
+///
+/// Does an immediate initial fetch, then polls every `interval` using an
+/// ETag-conditional GET. On a new bundle it hot-swaps the engine's active policy
+/// set ([`PolicyEngine::swap_bundle`], lock-free via `ArcSwap`). On `304` it does
+/// nothing. On any error it logs and **retains the current bundle** (fail-static),
+/// so a control-plane outage never silently disables enforcement nor wedges the
+/// gateway. Returns the task handle (dropping it does not cancel the task).
+pub fn spawn_policy_refresh(
+    engine: Arc<PolicyEngine>,
+    client: ControlPlaneClient,
+    project_id: String,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut etag: Option<String> = None;
+        loop {
+            match client.fetch_policies(&project_id, etag.as_deref()).await {
+                Ok(PolicyFetch::Updated {
+                    bundle,
+                    etag: new_etag,
+                }) => {
+                    let n = bundle.policies.len();
+                    engine.swap_bundle(&bundle);
+                    etag = new_etag;
+                    info!(
+                        policies = n,
+                        project = %project_id,
+                        "Nova Guard: applied hosted policy bundle from control plane"
+                    );
+                }
+                Ok(PolicyFetch::NotModified) => {
+                    debug!(project = %project_id, "Nova Guard: hosted policies unchanged (304)");
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e, project = %project_id,
+                        "Nova Guard: hosted policy refresh failed; retaining current bundle"
+                    );
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +331,44 @@ mod tests {
             request_timeout: Duration::from_secs(2),
             max_retries: 2,
         })
+    }
+
+    #[tokio::test]
+    async fn policy_refresh_hot_swaps_engine() {
+        let server = MockServer::start().await;
+        let bundle = r#"{"policies":[{"name":"a","type":"model_allowlist","config":{"allowed":["gpt-4o"]}}]}"#;
+        Mock::given(method("GET"))
+            .and(path("/v1/projects/p1/policies"))
+            .and(match_header("authorization", "Bearer test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "v1")
+                    .set_body_string(bundle),
+            )
+            .mount(&server)
+            .await;
+
+        let engine = Arc::new(PolicyEngine::disabled());
+        assert_eq!(engine.active_policy_count(), 0);
+
+        let handle = spawn_policy_refresh(
+            engine.clone(),
+            client_for(&server),
+            "p1".to_string(),
+            Duration::from_secs(60),
+        );
+
+        // The task does an immediate first fetch; wait for it to land.
+        let mut applied = false;
+        for _ in 0..100 {
+            if engine.active_policy_count() == 1 {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handle.abort();
+        assert!(applied, "refresh task did not hot-swap the hosted bundle");
     }
 
     #[tokio::test]
