@@ -161,8 +161,7 @@ fn gateway_url() -> String {
 /// Run a non-streaming test for a provider.
 ///
 /// Validates that the gateway proxies the request and returns an OpenAI-compatible
-/// response with sensible token usage. (Telemetry export is validated separately
-/// via the Noveum trace exporter's unit tests, not by querying a backing store.)
+/// response with sensible token usage.
 pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
     let api_key = get_api_key(&config.api_key_env_var);
     let gateway_url = gateway_url();
@@ -291,29 +290,43 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
     let mut stream_data: Vec<Value> = Vec::new();
     let mut content = String::new();
 
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.expect("Failed to read chunk");
-        let chunk_str = std::str::from_utf8(&chunk).expect("Invalid UTF-8");
-
-        for line in chunk_str.lines() {
-            if line.trim().is_empty() || line == "data: [DONE]" {
-                continue;
-            }
-            if let Some(json_str) = line.strip_prefix("data: ") {
-                if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                    if let Some(delta) = json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("delta"))
-                        .and_then(|d| d.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        content.push_str(delta);
-                    }
-                    stream_data.push(json);
+    // Network chunks do not align to SSE event boundaries, so buffer raw bytes
+    // and only parse complete lines (a `data:` line split across two chunks would
+    // otherwise be dropped, making the test flaky).
+    let mut process_line = |line: &str| {
+        let line = line.trim();
+        if line.is_empty() || line == "data: [DONE]" {
+            return;
+        }
+        if let Some(json_str) = line.strip_prefix("data: ") {
+            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                if let Some(delta) = json
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    content.push_str(delta);
                 }
+                stream_data.push(json);
             }
         }
+    };
+
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.expect("Failed to read chunk");
+        buf.extend_from_slice(&chunk);
+        // Drain complete lines (everything up to and including each '\n').
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            process_line(&String::from_utf8_lossy(&line_bytes));
+        }
+    }
+    // Handle any final line not terminated by a newline.
+    if !buf.is_empty() {
+        process_line(&String::from_utf8_lossy(&buf));
     }
 
     assert!(!stream_data.is_empty(), "No streaming data chunks received");

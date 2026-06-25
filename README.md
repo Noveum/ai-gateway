@@ -620,7 +620,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "x-provider: openai" \
   -H "Authorization: Bearer your-openai-api-key" \
   -H "x-project-id: your-project-id" \
-  -H "x-organisation-id: your-org-id" \
+  -H "x-organization-id: your-org-id" \
   -H "x-user-id: your-user-id" \
   -d '{
     "model": "gpt-4",

@@ -40,8 +40,8 @@ telemetry only — never the proxied request.
 
 ## Adding a new exporter
 
-1. **Create the module** under `src/telemetry/exporters/` (e.g. `datadog.rs`) and
-   declare it in `src/telemetry/exporters/mod.rs`.
+1. **Create the module** under `src/telemetry/plugins/` (e.g. `datadog.rs`,
+   alongside `console.rs`) and declare it in `src/telemetry/plugins/mod.rs`.
 
 2. **Implement `MetricsExporter`.** Use one of the provided serializers, or read
    fields off `RequestMetrics` directly:
