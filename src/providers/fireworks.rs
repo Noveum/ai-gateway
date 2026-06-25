@@ -4,10 +4,9 @@ use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
 use axum::{
-    body::{Body, Bytes},
+    body::Body,
     http::{HeaderMap, Response},
 };
-use std::time::Duration;
 use tracing::{debug, error};
 
 pub struct FireworksProvider {

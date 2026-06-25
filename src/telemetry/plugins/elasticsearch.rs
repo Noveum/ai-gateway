@@ -4,7 +4,7 @@ use crate::telemetry::metrics::MetricsExporter;
 use async_trait::async_trait;
 use elasticsearch::{
     auth::Credentials,
-    http::transport::{Transport, TransportBuilder, SingleNodeConnectionPool},
+    http::transport::{TransportBuilder, SingleNodeConnectionPool},
     Elasticsearch, IndexParts,
 };
 use opentelemetry::trace::TraceError;
@@ -63,9 +63,9 @@ impl ElasticsearchPlugin {
         
         let index = self.index.clone();
         let client = self.client.clone();
-        let request_id = request_id.to_string(); // Clone for use in async block
+        let _request_id = request_id.to_string(); // Clone for use in async block
         
-        let result = Retry::spawn(retry_strategy, || async {
+        let result = Retry::start(retry_strategy, || async {
             match timeout(Duration::from_secs(10), client.index(IndexParts::Index(&index)).body(document.clone()).send()).await {
                 Ok(response_result) => {
                     match response_result {

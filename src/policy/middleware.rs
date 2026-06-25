@@ -179,7 +179,7 @@ pub fn flatten_input_text(json: &Value) -> String {
 fn apply_input_transforms(engine: &PolicyEngine, model: &str, json: &mut Value) -> bool {
     let mut changed = false;
 
-    let mut transform_segment = |s: &str| -> Option<String> {
+    let transform_segment = |s: &str| -> Option<String> {
         let r = engine.evaluate(Phase::Input, model, s, None, None, None);
         r.transformed_text
     };

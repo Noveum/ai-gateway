@@ -30,7 +30,6 @@ struct PolicyMeta {
     policy_type: PolicyType,
     mode: PolicyMode,
     fail_closed: bool,
-    priority: i32,
 }
 
 impl PolicyMeta {
@@ -41,7 +40,6 @@ impl PolicyMeta {
             policy_type: p.policy_type,
             mode: p.mode,
             fail_closed: p.fail_closed,
-            priority: p.priority,
         }
     }
 }

@@ -6,19 +6,19 @@ use async_trait::async_trait;
 use aws_event_stream_parser::{parse_message, Message};
 use axum::{
     body::{Body, Bytes},
-    http::{HeaderMap, HeaderValue, Response, StatusCode},
+    http::{HeaderMap, Response, StatusCode},
 };
 use futures_util::StreamExt;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, error, warn};
 use uuid;
 
 /// Constants for default values
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
+#[allow(dead_code)]
 const DEFAULT_FALLBACK_MODEL: &str = "mistral.mistral-7b-instruct-v0:2";
 const DEFAULT_MAX_TOKENS: u64 = 1000;
 const DEFAULT_TEMPERATURE: f64 = 0.7;
@@ -56,6 +56,7 @@ impl BedrockProvider {
         }
     }
 
+    #[allow(dead_code)]
     fn get_model_name(&self, path: &str) -> String {
         path.split('/')
             .last()
@@ -387,7 +388,7 @@ impl Provider for BedrockProvider {
         Ok(())
     }
 
-    fn transform_path(&self, path: &str) -> String {
+    fn transform_path(&self, _path: &str) -> String {
         let model = self.current_model.read();
         let is_streaming = *self.is_streaming.read();
         

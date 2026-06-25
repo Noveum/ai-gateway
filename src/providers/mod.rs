@@ -35,16 +35,16 @@ pub trait Provider: Send + Sync {
     /// Sign the final request if needed
     async fn sign_request(
         &self,
-        method: &str,
-        url: &str,
+        _method: &str,
+        _url: &str,
         headers: &HeaderMap,
-        body: &[u8],
+        _body: &[u8],
     ) -> Result<HeaderMap, AppError> {
         Ok(headers.clone())
     }
 
     /// Process any operations needed before the request is sent
-    async fn before_request(&self, headers: &HeaderMap, body: &Bytes) -> Result<(), AppError> {
+    async fn before_request(&self, _headers: &HeaderMap, _body: &Bytes) -> Result<(), AppError> {
         Ok(())
     }
 

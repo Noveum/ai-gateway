@@ -20,7 +20,7 @@ pub async fn proxy_request(
     State(config): State<Arc<AppConfig>>,
     headers: HeaderMap,
     connect_info: Option<ConnectInfo<SocketAddr>>,
-    mut request: Request<Body>,
+    request: Request<Body>,
 ) -> impl IntoResponse {
     let provider = headers
         .get("x-provider")

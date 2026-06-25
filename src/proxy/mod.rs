@@ -89,7 +89,7 @@ pub async fn send_provider_request(
     url: String,
     headers: HeaderMap,
     body: Bytes,
-    provider: &Box<dyn Provider>,
+    _provider: &Box<dyn Provider>,
     config: Arc<AppConfig>,
 ) -> Result<Response<Body>, AppError> {
     let client = &*CLIENT;
@@ -120,7 +120,7 @@ pub async fn send_provider_request(
 
 async fn process_response(
     response: reqwest::Response,
-    config: Arc<AppConfig>,
+    _config: Arc<AppConfig>,
 ) -> Result<Response<Body>, AppError> {
     let status = StatusCode::from_u16(response.status().as_u16())?;
     let mut response_builder = Response::builder().status(status);

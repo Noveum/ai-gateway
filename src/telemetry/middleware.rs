@@ -16,7 +16,6 @@ use axum::body::to_bytes;
 use hyper::Error;
 use serde_json::Value;
 use http;
-use uuid;
 
 // Constants for safeguards
 const CHANNEL_SIZE: usize = 1000; // Increased buffer for streaming response
@@ -24,7 +23,7 @@ const MAX_ACCUMULATED_TEXT: usize = 5 * 1024 * 1024; // 5MB limit
 
 pub async fn metrics_middleware(
     State(registry): State<Arc<MetricsRegistry>>,
-    mut req: Request<Body>,
+    req: Request<Body>,
     next: Next,
 ) -> Response<Body> {
     let start = Instant::now();
