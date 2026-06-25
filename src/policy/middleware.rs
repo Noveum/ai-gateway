@@ -96,11 +96,11 @@ pub async fn guard_middleware(
         }
 
         // Apply input transforms per text segment (so structured messages stay valid).
-        if result.transformed_text.is_some() {
-            if apply_input_transforms(&engine, &model, &mut body_json) {
-                if let Ok(v) = serde_json::to_vec(&body_json) {
-                    forward_bytes = v.into();
-                }
+        if result.transformed_text.is_some()
+            && apply_input_transforms(&engine, &model, &mut body_json)
+        {
+            if let Ok(v) = serde_json::to_vec(&body_json) {
+                forward_bytes = v.into();
             }
         }
     }
@@ -290,7 +290,10 @@ async fn enforce_output(
         Ok(b) => b,
         Err(_) => {
             warn!("Nova Guard: response body too large to inspect; passing through");
-            return Response::from_parts(parts, Body::from("response body exceeded inspection limit"));
+            return Response::from_parts(
+                parts,
+                Body::from("response body exceeded inspection limit"),
+            );
         }
     };
 
@@ -305,7 +308,14 @@ async fn enforce_output(
         return Response::from_parts(parts, Body::from(bytes));
     }
 
-    let result = engine.evaluate(Phase::Output, model, &output_text, Some(&body_json), None, None);
+    let result = engine.evaluate(
+        Phase::Output,
+        model,
+        &output_text,
+        Some(&body_json),
+        None,
+        None,
+    );
     log_decisions("output", provider, model, &result.decisions);
 
     if let Some(block) = &result.block {
@@ -361,7 +371,12 @@ fn rewrite_output_text(provider: &str, json: &mut Value, new_text: &str) -> bool
     }
 }
 
-fn log_decisions(phase: &str, provider: &str, model: &str, decisions: &[super::decision::PolicyDecision]) {
+fn log_decisions(
+    phase: &str,
+    provider: &str,
+    model: &str,
+    decisions: &[super::decision::PolicyDecision],
+) {
     for d in decisions {
         if d.flagged {
             debug!(

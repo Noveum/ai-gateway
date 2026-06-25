@@ -26,7 +26,7 @@ pub async fn proxy_request_to_provider(
     let body = std::mem::replace(original_request.body_mut(), Body::empty());
     let body_bytes = to_bytes(body, usize::MAX)
         .await
-        .map_err(|e| AppError::AxumError(e.into()))?;
+        .map_err(|e| AppError::AxumError(e))?;
 
     // Call before_request first to set up any provider state
     provider
@@ -100,11 +100,7 @@ pub async fn send_provider_request(
             name.as_str()
                 .parse::<reqwest::header::HeaderName>()
                 .ok()
-                .and_then(|name_str| {
-                    reqwest::header::HeaderValue::from_bytes(value.as_bytes())
-                        .ok()
-                        .map(|v| (name_str, v))
-                })
+                .zip(reqwest::header::HeaderValue::from_bytes(value.as_bytes()).ok())
         })
         .collect::<reqwest::header::HeaderMap>();
 
@@ -137,7 +133,7 @@ async fn process_response(
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| {
+        .is_some_and(|ct| {
             ct.contains("application/vnd.amazon.eventstream") || ct.contains("text/event-stream")
         })
     {
@@ -152,7 +148,7 @@ async fn process_response(
         Ok(bytes) => Ok(bytes),
         Err(e) => {
             error!("Stream error: {}", e);
-            Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+            Err(std::io::Error::other(e))
         }
     });
 

@@ -84,7 +84,10 @@ mod tests {
     fn requires_authorization() {
         let p = MistralProvider::new();
         let empty = HeaderMap::new();
-        assert!(matches!(p.process_headers(&empty), Err(AppError::MissingApiKey)));
+        assert!(matches!(
+            p.process_headers(&empty),
+            Err(AppError::MissingApiKey)
+        ));
     }
 
     #[test]
@@ -93,7 +96,13 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer mk-123".parse().unwrap());
         let out = p.process_headers(&h).unwrap();
-        assert_eq!(out.get(http::header::AUTHORIZATION).unwrap(), "Bearer mk-123");
-        assert_eq!(out.get(http::header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(
+            out.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer mk-123"
+        );
+        assert_eq!(
+            out.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
     }
 }

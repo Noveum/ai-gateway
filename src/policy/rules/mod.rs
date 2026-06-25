@@ -233,8 +233,8 @@ mod tests {
         assert!(!clean.flagged);
         assert_eq!(clean.action, PolicyAction::Allow);
 
-        let flagged = RuleOutcome::flagged(PolicyAction::Block, 2.0, "boom")
-            .with_entities(vec!["X".into()]);
+        let flagged =
+            RuleOutcome::flagged(PolicyAction::Block, 2.0, "boom").with_entities(vec!["X".into()]);
         assert!(flagged.flagged);
         assert_eq!(flagged.score, 1.0); // clamped
         assert_eq!(flagged.matched_entities, vec!["X".to_string()]);

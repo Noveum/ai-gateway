@@ -19,8 +19,8 @@ pub struct ModelAllowlistRule {
 
 impl ModelAllowlistRule {
     pub fn parse(cfg: Value) -> Result<Self, String> {
-        let cfg: ModelAllowlistConfig =
-            serde_json::from_value(cfg).map_err(|e| format!("invalid model_allowlist config: {e}"))?;
+        let cfg: ModelAllowlistConfig = serde_json::from_value(cfg)
+            .map_err(|e| format!("invalid model_allowlist config: {e}"))?;
         if cfg.allowed.is_empty() && cfg.denied.is_empty() {
             return Err("model_allowlist requires a non-empty `allowed` or `denied` list".into());
         }
@@ -97,8 +97,10 @@ mod tests {
 
     #[test]
     fn allows_listed_model() {
-        let r = ModelAllowlistRule::parse(serde_json::json!({"allowed": ["gpt-4o", "claude-haiku-4-5"]}))
-            .unwrap();
+        let r = ModelAllowlistRule::parse(
+            serde_json::json!({"allowed": ["gpt-4o", "claude-haiku-4-5"]}),
+        )
+        .unwrap();
         assert!(!r.evaluate(&ctx_for("gpt-4o")).flagged);
         assert!(!r.evaluate(&ctx_for("claude-haiku-4-5")).flagged);
     }

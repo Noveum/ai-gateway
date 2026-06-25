@@ -136,7 +136,12 @@ pub struct PolicyDecision {
 
 impl PolicyDecision {
     /// An allow decision for a policy that did not fire.
-    pub fn allow(policy_id: impl Into<String>, policy_name: impl Into<String>, policy_type: impl Into<String>, mode: PolicyMode) -> Self {
+    pub fn allow(
+        policy_id: impl Into<String>,
+        policy_name: impl Into<String>,
+        policy_type: impl Into<String>,
+        mode: PolicyMode,
+    ) -> Self {
         Self {
             policy_id: policy_id.into(),
             policy_name: policy_name.into(),
@@ -269,9 +274,18 @@ mod tests {
 
     #[test]
     fn modes_and_actions_serialize_lowercase() {
-        assert_eq!(serde_json::to_string(&PolicyMode::Enforce).unwrap(), "\"enforce\"");
+        assert_eq!(
+            serde_json::to_string(&PolicyMode::Enforce).unwrap(),
+            "\"enforce\""
+        );
         assert_eq!(serde_json::to_string(&Phase::Input).unwrap(), "\"input\"");
-        assert_eq!(serde_json::to_string(&PolicyAction::FlagOnly).unwrap(), "\"flag_only\"");
-        assert_eq!(serde_json::to_string(&Severity::Critical).unwrap(), "\"critical\"");
+        assert_eq!(
+            serde_json::to_string(&PolicyAction::FlagOnly).unwrap(),
+            "\"flag_only\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Severity::Critical).unwrap(),
+            "\"critical\""
+        );
     }
 }

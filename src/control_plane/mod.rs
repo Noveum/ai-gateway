@@ -139,7 +139,10 @@ impl ControlPlaneClient {
         model: &str,
         request_id: &str,
     ) -> Result<ReserveResponse, ControlPlaneError> {
-        let url = format!("{}/v1/projects/{}/budget/reserve", self.config.base_url, project_id);
+        let url = format!(
+            "{}/v1/projects/{}/budget/reserve",
+            self.config.base_url, project_id
+        );
         let body = ReserveRequest {
             reserved_usd,
             model,
@@ -206,7 +209,10 @@ impl ControlPlaneClient {
         project_id: &str,
         etag: Option<&str>,
     ) -> Result<PolicyFetch, ControlPlaneError> {
-        let url = format!("{}/v1/projects/{}/policies", self.config.base_url, project_id);
+        let url = format!(
+            "{}/v1/projects/{}/policies",
+            self.config.base_url, project_id
+        );
 
         let mut req = self
             .http
@@ -243,7 +249,9 @@ impl ControlPlaneClient {
                     etag: new_etag,
                 })
             }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ControlPlaneError::Unauthorized),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                Err(ControlPlaneError::Unauthorized)
+            }
             s if s.is_server_error() => Err(ControlPlaneError::Transient(format!("status {s}"))),
             s => Err(ControlPlaneError::Fatal(format!("status {s}"))),
         }

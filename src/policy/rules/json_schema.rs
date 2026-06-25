@@ -39,7 +39,7 @@ fn strip_code_fence(s: &str) -> &str {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix("```") {
         // drop an optional language tag on the first line
-        let rest = rest.splitn(2, '\n').nth(1).unwrap_or("");
+        let rest = rest.split_once('\n').map(|x| x.1).unwrap_or("");
         rest.trim_end().strip_suffix("```").unwrap_or(rest).trim()
     } else {
         t

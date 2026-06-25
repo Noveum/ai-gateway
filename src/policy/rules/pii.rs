@@ -29,22 +29,29 @@ struct EntityPattern {
 /// (favor precision) to limit false positives in a blocking guardrail.
 static ENTITIES: Lazy<Vec<EntityPattern>> = Lazy::new(|| {
     let defs: &[(&str, &str)] = &[
-        ("EMAIL_ADDRESS", r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b"),
+        (
+            "EMAIL_ADDRESS",
+            r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b",
+        ),
         // US SSN: 3-2-4 with separators; avoids all-zero groups loosely.
         ("US_SSN", r"\b\d{3}-\d{2}-\d{4}\b"),
         // Credit card: 13-16 digits, optional spaces/dashes in 4-groups.
         ("CREDIT_CARD_NUMBER", r"\b(?:\d[ -]*?){13,16}\b"),
         // North American phone numbers (loose).
-        ("PHONE_NUMBER", r"\b(?:\+?1[ .\-]?)?(?:\(?\d{3}\)?[ .\-]?)\d{3}[ .\-]?\d{4}\b"),
-        ("IP_ADDRESS", r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b"),
+        (
+            "PHONE_NUMBER",
+            r"\b(?:\+?1[ .\-]?)?(?:\(?\d{3}\)?[ .\-]?)\d{3}[ .\-]?\d{4}\b",
+        ),
+        (
+            "IP_ADDRESS",
+            r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b",
+        ),
         ("IBAN_CODE", r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
         // US passport: one letter + 8 digits (also matches some other IDs; precision-limited).
         ("US_PASSPORT", r"\b[A-Z]\d{8}\b"),
     ];
     defs.iter()
-        .filter_map(|(name, pat)| {
-            Regex::new(pat).ok().map(|re| EntityPattern { name, re })
-        })
+        .filter_map(|(name, pat)| Regex::new(pat).ok().map(|re| EntityPattern { name, re }))
         .collect()
 });
 
@@ -58,8 +65,8 @@ pub struct PiiRule {
 
 impl PiiRule {
     pub fn parse(cfg: Value) -> Result<Self, String> {
-        let cfg: PiiDetectionConfig =
-            serde_json::from_value(cfg).map_err(|e| format!("invalid pii_detection config: {e}"))?;
+        let cfg: PiiDetectionConfig = serde_json::from_value(cfg)
+            .map_err(|e| format!("invalid pii_detection config: {e}"))?;
         let entities: Vec<String> = cfg.entities.iter().map(|s| s.to_uppercase()).collect();
         // Validate that requested entities are known.
         for e in &entities {
@@ -110,7 +117,9 @@ impl PolicyRule for PiiRule {
                         .replace_all(&transformed, |caps: &regex::Captures| {
                             let matched = &caps[0];
                             match self.action {
-                                PolicyAction::Mask => self.mask_char.repeat(matched.chars().count().min(16)),
+                                PolicyAction::Mask => {
+                                    self.mask_char.repeat(matched.chars().count().min(16))
+                                }
                                 PolicyAction::Redact => "[REDACTED]".to_string(),
                                 PolicyAction::Hash => "[HASHED]".to_string(),
                                 PolicyAction::Replace => format!("[{}]", entity.name),
@@ -153,8 +162,10 @@ mod tests {
 
     #[test]
     fn detects_email() {
-        let r = PiiRule::parse(serde_json::json!({"entities": ["EMAIL_ADDRESS"], "action": "flag_only"}))
-            .unwrap();
+        let r = PiiRule::parse(
+            serde_json::json!({"entities": ["EMAIL_ADDRESS"], "action": "flag_only"}),
+        )
+        .unwrap();
         let out = r.evaluate(&ctx("contact me at john.doe@acme.io please"));
         assert!(out.flagged);
         assert!(out.matched_entities.contains(&"EMAIL_ADDRESS".to_string()));
@@ -162,7 +173,8 @@ mod tests {
 
     #[test]
     fn detects_ssn() {
-        let r = PiiRule::parse(serde_json::json!({"entities": ["US_SSN"], "action": "block"})).unwrap();
+        let r =
+            PiiRule::parse(serde_json::json!({"entities": ["US_SSN"], "action": "block"})).unwrap();
         assert!(r.evaluate(&ctx("ssn 123-45-6789")).flagged);
     }
 
@@ -184,7 +196,10 @@ mod tests {
         }))
         .unwrap();
         let out = r.evaluate(&ctx("mail x@y.com"));
-        assert_eq!(out.transformed_text.as_deref(), Some("mail [EMAIL_ADDRESS]"));
+        assert_eq!(
+            out.transformed_text.as_deref(),
+            Some("mail [EMAIL_ADDRESS]")
+        );
     }
 
     #[test]

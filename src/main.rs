@@ -75,8 +75,8 @@ async fn main() {
             .unwrap_or_else(|_| "http://localhost:9200".to_string());
         let elasticsearch_username = std::env::var("ELASTICSEARCH_USERNAME").ok();
         let elasticsearch_password = std::env::var("ELASTICSEARCH_PASSWORD").ok();
-        let elasticsearch_index =
-            std::env::var("ELASTICSEARCH_INDEX").unwrap_or_else(|_| "ai-gateway-metrics".to_string());
+        let elasticsearch_index = std::env::var("ELASTICSEARCH_INDEX")
+            .unwrap_or_else(|_| "ai-gateway-metrics".to_string());
 
         match ElasticsearchPlugin::new(
             elasticsearch_url,
@@ -118,7 +118,11 @@ async fn main() {
 
     // Build the router with the full middleware stack.
     info!("Registering request handlers and API routes");
-    let state = AppState::new(config.clone(), metrics_registry.clone(), policy_engine.clone());
+    let state = AppState::new(
+        config.clone(),
+        metrics_registry.clone(),
+        policy_engine.clone(),
+    );
     let app = build_router(state);
 
     // Start server with optimized TCP settings
@@ -151,7 +155,10 @@ async fn main() {
         "{}",
         format!("    🔗 Listening at http://{}:{}", config.host, config.port).bright_cyan()
     );
-    println!("{}", "    🔄 Press Ctrl+C to shutdown gracefully".bright_yellow());
+    println!(
+        "{}",
+        "    🔄 Press Ctrl+C to shutdown gracefully".bright_yellow()
+    );
     println!();
 
     debug!("Starting server with graceful shutdown");
@@ -190,7 +197,7 @@ async fn print_banner() {
              AI Gateway v1.0.0
     ========================================
     "#
-            .bright_cyan()
+        .bright_cyan()
     );
 
     println!("{}", "🚀 Starting Noveum AI Gateway...".bright_green());
@@ -198,7 +205,10 @@ async fn print_banner() {
         "{}",
         "📡 Your unified interface to multiple AI providers".bright_yellow()
     );
-    println!("{}\n", "========================================".bright_cyan());
+    println!(
+        "{}\n",
+        "========================================".bright_cyan()
+    );
 }
 
 async fn shutdown_signal() {

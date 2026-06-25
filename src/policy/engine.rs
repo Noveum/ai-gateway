@@ -17,7 +17,8 @@ use arc_swap::ArcSwap;
 use tracing::{info, warn};
 
 use super::config::{
-    CostCapConfig, CostEnforcementMode, CostWindow, Policy, PolicyBundle, PolicyType, RateLimitConfig,
+    CostCapConfig, CostEnforcementMode, CostWindow, Policy, PolicyBundle, PolicyType,
+    RateLimitConfig,
 };
 use super::decision::{Phase, PolicyAction, PolicyDecision, PolicyMode, Severity};
 use super::rules::{compile_rule, EvalContext, LiveState, PolicyRule, RuleOutcome};
@@ -186,20 +187,26 @@ impl PolicyEngine {
 
         for p in policies {
             match p.policy_type {
-                PolicyType::CostCap => match serde_json::from_value::<CostCapConfig>(p.config.clone()) {
-                    Ok(config) => cost_caps.push(CostCapPolicy {
-                        meta: PolicyMeta::from_policy(p),
-                        config,
-                    }),
-                    Err(e) => warn!(policy = %p.id(), error = %e, "invalid cost_cap config; skipping"),
-                },
+                PolicyType::CostCap => {
+                    match serde_json::from_value::<CostCapConfig>(p.config.clone()) {
+                        Ok(config) => cost_caps.push(CostCapPolicy {
+                            meta: PolicyMeta::from_policy(p),
+                            config,
+                        }),
+                        Err(e) => {
+                            warn!(policy = %p.id(), error = %e, "invalid cost_cap config; skipping")
+                        }
+                    }
+                }
                 PolicyType::RateLimit => {
                     match serde_json::from_value::<RateLimitConfig>(p.config.clone()) {
                         Ok(config) => rate_limits.push(RateLimitPolicy {
                             meta: PolicyMeta::from_policy(p),
                             config,
                         }),
-                        Err(e) => warn!(policy = %p.id(), error = %e, "invalid rate_limit config; skipping"),
+                        Err(e) => {
+                            warn!(policy = %p.id(), error = %e, "invalid rate_limit config; skipping")
+                        }
                     }
                 }
                 _ => {
@@ -387,7 +394,8 @@ impl PolicyEngine {
                     .map(|soft| spent >= soft)
                     .unwrap_or(false);
                 if over_hard {
-                    let mut d = PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
+                    let mut d =
+                        PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
                     d.flagged = true;
                     d.score = 1.0;
                     d.severity = Severity::Critical;
@@ -398,7 +406,8 @@ impl PolicyEngine {
                     );
                     d
                 } else if over_soft {
-                    let mut d = PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
+                    let mut d =
+                        PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
                     d.flagged = true;
                     d.score = 0.6;
                     d.severity = Severity::High;
@@ -421,19 +430,31 @@ impl PolicyEngine {
         }
     }
 
-    fn eval_rate_limit(&self, rl: &RateLimitPolicy, live_state: Option<&LiveState>) -> PolicyDecision {
+    fn eval_rate_limit(
+        &self,
+        rl: &RateLimitPolicy,
+        live_state: Option<&LiveState>,
+    ) -> PolicyDecision {
         match live_state {
             Some(state) => {
                 for w in &rl.config.windows {
                     if let Some(max) = w.max_requests {
                         if let Some(&count) = state.requests_by_window.get(&w.period) {
                             if count >= max {
-                                let mut d = PolicyDecision::allow(&rl.meta.id, &rl.meta.name, "rate_limit", rl.meta.mode);
+                                let mut d = PolicyDecision::allow(
+                                    &rl.meta.id,
+                                    &rl.meta.name,
+                                    "rate_limit",
+                                    rl.meta.mode,
+                                );
                                 d.flagged = true;
                                 d.score = 1.0;
                                 d.severity = Severity::High;
                                 d.action = w.action;
-                                d.reason = format!("requests {count} reached limit {max} per {}", w.period);
+                                d.reason = format!(
+                                    "requests {count} reached limit {max} per {}",
+                                    w.period
+                                );
                                 return d;
                             }
                         }
@@ -441,12 +462,18 @@ impl PolicyEngine {
                     if let Some(max) = w.max_tokens {
                         if let Some(&count) = state.tokens_by_window.get(&w.period) {
                             if count >= max {
-                                let mut d = PolicyDecision::allow(&rl.meta.id, &rl.meta.name, "rate_limit", rl.meta.mode);
+                                let mut d = PolicyDecision::allow(
+                                    &rl.meta.id,
+                                    &rl.meta.name,
+                                    "rate_limit",
+                                    rl.meta.mode,
+                                );
                                 d.flagged = true;
                                 d.score = 1.0;
                                 d.severity = Severity::High;
                                 d.action = w.action;
-                                d.reason = format!("tokens {count} reached limit {max} per {}", w.period);
+                                d.reason =
+                                    format!("tokens {count} reached limit {max} per {}", w.period);
                                 return d;
                             }
                         }
@@ -454,7 +481,9 @@ impl PolicyEngine {
                 }
                 PolicyDecision::allow(&rl.meta.id, &rl.meta.name, "rate_limit", rl.meta.mode)
             }
-            None => self.unavailable_state_decision(&rl.meta, "rate_limit", PolicyAction::Block, false),
+            None => {
+                self.unavailable_state_decision(&rl.meta, "rate_limit", PolicyAction::Block, false)
+            }
         }
     }
 
@@ -520,7 +549,14 @@ mod tests {
             r#"{"policies":[{"name":"ssn","type":"regex_match","mode":"enforce",
             "config":{"phase":"input","patterns":[{"name":"ssn","regex":"\\d{3}-\\d{2}-\\d{4}"}],"action":"block"}}]}"#,
         );
-        let r = e.evaluate(Phase::Input, "gpt-4o", "my ssn 123-45-6789", None, None, None);
+        let r = e.evaluate(
+            Phase::Input,
+            "gpt-4o",
+            "my ssn 123-45-6789",
+            None,
+            None,
+            None,
+        );
         assert!(r.is_blocked());
         assert_eq!(r.block.unwrap().policy_type, "regex_match");
     }
@@ -548,7 +584,14 @@ mod tests {
                "config":{"phase":"input","patterns":[{"name":"mail","regex":"@"}],"action":"flag_only"}}
             ]}"#,
         );
-        let r = e.evaluate(Phase::Input, "gpt-4o", "write to a@b.com now", None, None, None);
+        let r = e.evaluate(
+            Phase::Input,
+            "gpt-4o",
+            "write to a@b.com now",
+            None,
+            None,
+            None,
+        );
         assert!(r.transformed_text.is_some());
         assert!(!r.transformed_text.as_ref().unwrap().contains("a@b.com"));
     }
@@ -613,7 +656,10 @@ mod tests {
             "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
         );
         let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, None);
-        assert!(!r.is_blocked(), "advisory cost_cap fails open without state");
+        assert!(
+            !r.is_blocked(),
+            "advisory cost_cap fails open without state"
+        );
     }
 
     #[test]

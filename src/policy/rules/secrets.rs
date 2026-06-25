@@ -22,7 +22,10 @@ struct Detector {
 
 static DETECTORS: Lazy<Vec<Detector>> = Lazy::new(|| {
     let defs: &[(&str, &str)] = &[
-        ("aws_access_key", r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b"),
+        (
+            "aws_access_key",
+            r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b",
+        ),
         ("github_pat", r"\bghp_[A-Za-z0-9]{36}\b"),
         ("github_oauth", r"\bgho_[A-Za-z0-9]{36}\b"),
         ("gitlab_pat", r"\bglpat-[A-Za-z0-9\-_]{20}\b"),
@@ -31,9 +34,18 @@ static DETECTORS: Lazy<Vec<Detector>> = Lazy::new(|| {
         ("openai_key", r"\bsk-[A-Za-z0-9]{20,}\b"),
         ("anthropic_key", r"\bsk-ant-[A-Za-z0-9\-_]{20,}\b"),
         ("google_api_key", r"\bAIza[0-9A-Za-z\-_]{35}\b"),
-        ("jwt", r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
-        ("private_key_pem", r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"),
-        ("basic_auth_url", r"\b[a-z][a-z0-9+.\-]*://[^/\s:@]+:[^/\s:@]+@"),
+        (
+            "jwt",
+            r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b",
+        ),
+        (
+            "private_key_pem",
+            r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
+        ),
+        (
+            "basic_auth_url",
+            r"\b[a-z][a-z0-9+.\-]*://[^/\s:@]+:[^/\s:@]+@",
+        ),
     ];
     defs.iter()
         .filter_map(|(id, pat)| Regex::new(pat).ok().map(|re| Detector { id, re }))
@@ -89,7 +101,9 @@ impl PolicyRule for SecretsRule {
             if d.re.is_match(text) {
                 found.push(d.id.to_string());
                 if self.action.is_transform() {
-                    transformed = d.re.replace_all(&transformed, "[REDACTED_SECRET]").into_owned();
+                    transformed =
+                        d.re.replace_all(&transformed, "[REDACTED_SECRET]")
+                            .into_owned();
                 }
             }
         }
@@ -126,8 +140,10 @@ mod tests {
 
     #[test]
     fn detects_aws_key() {
-        let r = SecretsRule::parse(serde_json::json!({"detectors": ["aws_access_key"], "action": "block"}))
-            .unwrap();
+        let r = SecretsRule::parse(
+            serde_json::json!({"detectors": ["aws_access_key"], "action": "block"}),
+        )
+        .unwrap();
         let out = r.evaluate(&ctx("key is AKIAIOSFODNN7EXAMPLE here"));
         assert!(out.flagged);
         assert!(out.matched_entities.contains(&"aws_access_key".to_string()));
@@ -137,7 +153,10 @@ mod tests {
     fn detects_github_pat() {
         let r = SecretsRule::parse(serde_json::json!({"action": "block"})).unwrap();
         let token = format!("ghp_{}", "a".repeat(36));
-        assert!(r.evaluate(&ctx(Box::leak(format!("token {token}").into_boxed_str()))).flagged);
+        assert!(
+            r.evaluate(&ctx(Box::leak(format!("token {token}").into_boxed_str())))
+                .flagged
+        );
     }
 
     #[test]
@@ -169,8 +188,9 @@ mod tests {
 
     #[test]
     fn jwt_detected() {
-        let r = SecretsRule::parse(serde_json::json!({"detectors": ["jwt"], "action": "flag_only"}))
-            .unwrap();
+        let r =
+            SecretsRule::parse(serde_json::json!({"detectors": ["jwt"], "action": "flag_only"}))
+                .unwrap();
         let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N";
         assert!(r.evaluate(&ctx(jwt)).flagged);
     }

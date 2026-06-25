@@ -29,7 +29,11 @@ impl TokenLengthCapRule {
         Ok(Self {
             phase: cfg.phase,
             max_tokens: cfg.max_tokens,
-            scope_to_models: cfg.scope_to_models.iter().map(|s| s.to_lowercase()).collect(),
+            scope_to_models: cfg
+                .scope_to_models
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
             action: cfg.action,
         })
     }
@@ -85,7 +89,11 @@ mod tests {
     use super::*;
     use std::borrow::Cow;
 
-    fn ctx(model: &'static str, text: &'static str, input_tokens: Option<u32>) -> EvalContext<'static> {
+    fn ctx(
+        model: &'static str,
+        text: &'static str,
+        input_tokens: Option<u32>,
+    ) -> EvalContext<'static> {
         EvalContext {
             phase: Phase::Input,
             model,
@@ -120,8 +128,9 @@ mod tests {
 
     #[test]
     fn estimates_when_no_known_tokens() {
-        let r = TokenLengthCapRule::parse(serde_json::json!({"maxTokens": 5, "action": "flag_only"}))
-            .unwrap();
+        let r =
+            TokenLengthCapRule::parse(serde_json::json!({"maxTokens": 5, "action": "flag_only"}))
+                .unwrap();
         let long = "this is definitely going to be more than five tokens of text content";
         let out = r.evaluate(&ctx("gpt-4o", long, None));
         assert!(out.flagged);
@@ -134,7 +143,10 @@ mod tests {
         )
         .unwrap();
         // out of scope -> clean despite tiny cap
-        assert!(!r.evaluate(&ctx("gpt-4o", "lots of tokens here", Some(999))).flagged);
+        assert!(
+            !r.evaluate(&ctx("gpt-4o", "lots of tokens here", Some(999)))
+                .flagged
+        );
         // in scope -> blocked
         assert!(r.evaluate(&ctx("gpt-4o-mini", "x", Some(999))).flagged);
     }

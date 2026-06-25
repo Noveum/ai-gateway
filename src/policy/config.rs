@@ -411,8 +411,7 @@ mod tests {
             ("scorer_gate", PolicyType::ScorerGate),
         ] {
             assert_eq!(ty.as_str(), json_name);
-            let parsed: PolicyType =
-                serde_json::from_str(&format!("\"{json_name}\"")).unwrap();
+            let parsed: PolicyType = serde_json::from_str(&format!("\"{json_name}\"")).unwrap();
             assert_eq!(parsed, ty);
         }
     }

@@ -64,10 +64,10 @@ pub enum AppError {
 
     #[error("HTTP error: {0}")]
     HttpError(String),
-    
+
     #[error("JSON parse error: {0}")]
     JsonParseError(String),
-    
+
     #[error("JSON serialize error: {0}")]
     JsonSerializeError(String),
 }

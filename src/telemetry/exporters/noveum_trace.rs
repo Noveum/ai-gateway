@@ -59,7 +59,10 @@ impl NoveumTraceExporter {
 
 #[async_trait]
 impl MetricsExporter for NoveumTraceExporter {
-    async fn export_metrics(&self, metrics: RequestMetrics) -> Result<(), Box<dyn std::error::Error>> {
+    async fn export_metrics(
+        &self,
+        metrics: RequestMetrics,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let payload = metrics.to_otel_log();
         let resp = self
             .client

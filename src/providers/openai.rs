@@ -1,5 +1,5 @@
-use super::Provider;
 use super::utils::log_tracking_headers;
+use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
@@ -10,6 +10,12 @@ use tracing::{debug, error};
 
 pub struct OpenAIProvider {
     base_url: String,
+}
+
+impl Default for OpenAIProvider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OpenAIProvider {
@@ -72,14 +78,25 @@ impl MetricsExtractor for OpenAIMetricsExtractor {
     fn extract_metrics(&self, response_body: &Value) -> ProviderMetrics {
         debug!("Extracting OpenAI metrics from response: {}", response_body);
         let mut metrics = ProviderMetrics::default();
-        
+
         if let Some(usage) = response_body.get("usage") {
             debug!("Found usage data: {:?}", usage);
-            metrics.input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            metrics.output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            metrics.total_tokens = usage.get("total_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            debug!("Extracted tokens - input: {:?}, output: {:?}, total: {:?}", 
-                metrics.input_tokens, metrics.output_tokens, metrics.total_tokens);
+            metrics.input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            metrics.output_tokens = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            metrics.total_tokens = usage
+                .get("total_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            debug!(
+                "Extracted tokens - input: {:?}, output: {:?}, total: {:?}",
+                metrics.input_tokens, metrics.output_tokens, metrics.total_tokens
+            );
         }
 
         if let Some(model) = response_body.get("model").and_then(|v| v.as_str()) {
@@ -87,31 +104,48 @@ impl MetricsExtractor for OpenAIMetricsExtractor {
             metrics.model = model.to_string();
         }
 
-        if let (Some(total_tokens), Some(model)) = (metrics.total_tokens, response_body.get("model")) {
+        if let (Some(total_tokens), Some(model)) =
+            (metrics.total_tokens, response_body.get("model"))
+        {
             metrics.cost = Some(calculate_cost(model.as_str().unwrap_or(""), total_tokens));
-            debug!("Calculated cost: {:?} for model {} and {} tokens", 
-                metrics.cost, metrics.model, total_tokens);
+            debug!(
+                "Calculated cost: {:?} for model {} and {} tokens",
+                metrics.cost, metrics.model, total_tokens
+            );
         }
 
         debug!("Final extracted metrics: {:?}", metrics);
         metrics
     }
-    
+
     // Override with OpenAI-specific streaming metrics extraction
-    fn try_extract_provider_specific_streaming_metrics(&self, chunk: &str) -> Option<ProviderMetrics> {
-        debug!("Attempting to extract metrics from OpenAI streaming chunk: {}", chunk);
+    fn try_extract_provider_specific_streaming_metrics(
+        &self,
+        chunk: &str,
+    ) -> Option<ProviderMetrics> {
+        debug!(
+            "Attempting to extract metrics from OpenAI streaming chunk: {}",
+            chunk
+        );
         if let Ok(json) = serde_json::from_str::<Value>(chunk) {
             // If we have usage data, extract full metrics
             if json.get("usage").is_some() {
                 debug!("Found usage in OpenAI streaming chunk, extracting metrics");
                 return Some(self.extract_metrics(&json));
             }
-            
+
             // For OpenAI streaming, extract what we can even if usage is missing
             // This will handle the common case where OpenAI omits token counts in streaming
-            let model = json.get("model").and_then(|m| m.as_str()).unwrap_or("unknown").to_string();
-            
-            if model.contains("gpt") || json.get("object").and_then(|o| o.as_str()).unwrap_or("") == "chat.completion.chunk" {
+            let model = json
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            if model.contains("gpt")
+                || json.get("object").and_then(|o| o.as_str()).unwrap_or("")
+                    == "chat.completion.chunk"
+            {
                 debug!("OpenAI streaming response detected without usage data, creating partial metrics");
                 return Some(ProviderMetrics {
                     model,

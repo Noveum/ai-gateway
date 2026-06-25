@@ -1,6 +1,7 @@
 use super::metrics::MetricsRegistry;
-use super::provider_metrics::{get_metrics_extractor, ProviderMetrics, MetricsExtractor};
+use super::provider_metrics::{get_metrics_extractor, MetricsExtractor, ProviderMetrics};
 use super::RequestMetrics;
+use axum::body::to_bytes;
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -8,14 +9,16 @@ use axum::{
     middleware::Next,
 };
 use futures_util::StreamExt;
-use std::{sync::Arc, time::{Instant, Duration}};
+use http;
+use hyper::Error;
+use serde_json::Value;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error};
-use axum::body::to_bytes;
-use hyper::Error;
-use serde_json::Value;
-use http;
 
 // Constants for safeguards
 const CHANNEL_SIZE: usize = 1000; // Increased buffer for streaming response
@@ -45,39 +48,42 @@ pub async fn metrics_middleware(
         .get("x-project-id")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
-        
+
     let org_id = req
         .headers()
         .get("x-organization-id")
-        .or_else(|| req.headers().get("x-organisation-id"))  // Try both British and American spellings
+        .or_else(|| req.headers().get("x-organisation-id")) // Try both British and American spellings
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
-        
+
     let user_id = req
         .headers()
         .get("x-user-id")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
-        
+
     let experiment_id = req
         .headers()
         .get("x-experiment-id")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
-        
+
     // Use our new utility method to extract tracking headers
     let tracking_headers = ProviderMetrics::extract_tracking_headers(req.headers());
-    
+
     // Log the tracking headers at debug level for debugging
     debug!(
         "Tracking headers: project_id={:?}, organization_id={:?}, user_id={:?}, experiment_id={:?}",
-        tracking_headers.project_id, 
-        tracking_headers.organization_id, 
-        tracking_headers.user_id, 
+        tracking_headers.project_id,
+        tracking_headers.organization_id,
+        tracking_headers.user_id,
         tracking_headers.experiment_id
     );
 
-    debug!("Received request: provider={}, path={}, method={}", provider, path, method);
+    debug!(
+        "Received request: provider={}, path={}, method={}",
+        provider, path, method
+    );
 
     // Get metrics extractor for this provider
     let metrics_extractor = get_metrics_extractor(&provider);
@@ -86,10 +92,12 @@ pub async fn metrics_middleware(
     let original_method = req.method().clone();
     let original_uri = req.uri().clone();
     let original_headers = req.headers().clone();
-    
+
     // Extract and store the original request body
     let (req_size, req_body, body) = {
-        let bytes = to_bytes(req.into_body(), usize::MAX).await.unwrap_or_default();
+        let bytes = to_bytes(req.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
         let size = bytes.len();
         let req_body = serde_json::from_slice(&bytes).ok();
         debug!("Request body size: {} bytes", size);
@@ -105,16 +113,15 @@ pub async fn metrics_middleware(
     *new_req.headers_mut() = original_headers;
 
     // Process the response with a timeout
-    let response = tokio::time::timeout(
-        Duration::from_secs(30),
-        next.run(new_req)
-    ).await.unwrap_or_else(|_| {
-        debug!("Request timed out after 30 seconds");
-        Response::builder()
-            .status(http::StatusCode::GATEWAY_TIMEOUT)
-            .body(Body::from("Request timed out after 30 seconds"))
-            .unwrap()
-    });
+    let response = tokio::time::timeout(Duration::from_secs(30), next.run(new_req))
+        .await
+        .unwrap_or_else(|_| {
+            debug!("Request timed out after 30 seconds");
+            Response::builder()
+                .status(http::StatusCode::GATEWAY_TIMEOUT)
+                .body(Body::from("Request timed out after 30 seconds"))
+                .unwrap()
+        });
 
     let is_streaming = response
         .headers()
@@ -188,21 +195,24 @@ async fn handle_regular_response(
     debug!("Regular response body size: {} bytes", resp_size);
 
     // Extract provider request ID from response headers
-    let provider_request_id = parts.headers.get("x-request-id")
-        .or_else(|| parts.headers.get("request-id"))  // Also check for Anthropic's request-id header
+    let provider_request_id = parts
+        .headers
+        .get("x-request-id")
+        .or_else(|| parts.headers.get("request-id")) // Also check for Anthropic's request-id header
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    
+
     if let Some(id) = &provider_request_id {
         debug!("Provider request ID: {}", id);
     }
 
     // Extract metrics from response body
-    let (provider_metrics, resp_body) = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        (metrics_extractor.extract_metrics(&json), Some(json))
-    } else {
-        (ProviderMetrics::default(), None)
-    };
+    let (provider_metrics, resp_body) =
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            (metrics_extractor.extract_metrics(&json), Some(json))
+        } else {
+            (ProviderMetrics::default(), None)
+        };
 
     debug!("Extracted provider metrics: {:?}", provider_metrics);
 
@@ -213,7 +223,7 @@ async fn handle_regular_response(
         model: provider_metrics.model,
         total_latency: start.elapsed(),
         provider_latency: provider_metrics.provider_latency,
-        ttfb,  // Add the TTFB measurement
+        ttfb, // Add the TTFB measurement
         request_size: req_size,
         response_size: resp_size,
         input_tokens: provider_metrics.input_tokens,
@@ -253,17 +263,22 @@ async fn handle_streaming_response(
 ) -> Response<Body> {
     // Time to first byte is essentially the time taken to get the response headers
     let ttfb = start.elapsed();
-    debug!("Time to first byte for streaming response (TTFB): {:?}", ttfb);
+    debug!(
+        "Time to first byte for streaming response (TTFB): {:?}",
+        ttfb
+    );
 
     let (parts, body) = response.into_parts();
     let (tx, rx) = mpsc::channel::<Result<Bytes, Error>>(CHANNEL_SIZE);
 
     // Extract provider request ID from response headers
-    let provider_request_id = parts.headers.get("x-request-id")
-        .or_else(|| parts.headers.get("request-id"))  // Also check for Anthropic's request-id header
+    let provider_request_id = parts
+        .headers
+        .get("x-request-id")
+        .or_else(|| parts.headers.get("request-id")) // Also check for Anthropic's request-id header
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    
+
     if let Some(id) = &provider_request_id {
         debug!("Provider request ID for streaming response: {}", id);
     }
@@ -287,19 +302,24 @@ async fn handle_streaming_response(
 
                 if let Ok(chunk_str) = String::from_utf8(bytes.to_vec()) {
                     if accumulated_text.len() + chunk_str.len() > MAX_ACCUMULATED_TEXT {
-                        error!("Accumulated text exceeded maximum size of {} bytes", MAX_ACCUMULATED_TEXT);
+                        error!(
+                            "Accumulated text exceeded maximum size of {} bytes",
+                            MAX_ACCUMULATED_TEXT
+                        );
                         break;
                     }
                     accumulated_text.push_str(&chunk_str);
-                    
+
                     // Try to parse the chunk as JSON and store it
                     if let Ok(json_chunk) = serde_json::from_str::<Value>(&chunk_str) {
                         // Only store non-empty chunks
-                        if !json_chunk.is_null() && !json_chunk.as_object().map_or(true, |o| o.is_empty()) {
+                        if !json_chunk.is_null()
+                            && !json_chunk.as_object().is_none_or(|o| o.is_empty())
+                        {
                             streamed_chunks.push(json_chunk);
                         }
                     } else {
-                        // For streaming that sends chunks broken up, try to parse 
+                        // For streaming that sends chunks broken up, try to parse
                         // different formats (like data: {...}\n\n for SSE)
                         for line in chunk_str.lines() {
                             if line.starts_with("data: ") {
@@ -308,13 +328,18 @@ async fn handle_streaming_response(
                                     debug!("Received [DONE] signal in streaming");
                                     continue;
                                 }
-                                
+
                                 if let Ok(json_data) = serde_json::from_str::<Value>(data) {
                                     streamed_chunks.push(json_data.clone());
-                                    
+
                                     // Try to extract metrics from this chunk
-                                    if let Some(chunk_metrics) = metrics_extractor.extract_streaming_metrics(data) {
-                                        debug!("Found metrics in streaming chunk: {:?}", chunk_metrics);
+                                    if let Some(chunk_metrics) =
+                                        metrics_extractor.extract_streaming_metrics(data)
+                                    {
+                                        debug!(
+                                            "Found metrics in streaming chunk: {:?}",
+                                            chunk_metrics
+                                        );
                                         accumulated_metrics = chunk_metrics;
                                         final_metrics_found = true;
                                     }
@@ -323,7 +348,7 @@ async fn handle_streaming_response(
                         }
                     }
                 }
-                
+
                 // Always forward the bytes to the client
                 if let Err(e) = tx.send(Ok(bytes)).await {
                     error!("Failed to forward streaming chunk: {}", e);
@@ -341,7 +366,7 @@ async fn handle_streaming_response(
         if !accumulated_text.is_empty() {
             resp_body = serde_json::from_str(&accumulated_text).ok();
         }
-        
+
         // Track if this is a provider that requires special streaming handling
         let is_openai_streaming = provider == "openai";
         let is_groq_streaming = provider == "groq";
@@ -351,14 +376,21 @@ async fn handle_streaming_response(
         // create a minimal metrics record with what we know
         if !final_metrics_found && needs_special_streaming_handling && !streamed_chunks.is_empty() {
             // Try to extract model from the stream chunks
-            let model = streamed_chunks.iter()
+            let model = streamed_chunks
+                .iter()
                 .find_map(|chunk| chunk.get("model").and_then(|m| m.as_str()))
-                .unwrap_or(if is_groq_streaming { "llama" } else { "unknown" })
+                .unwrap_or(if is_groq_streaming {
+                    "llama"
+                } else {
+                    "unknown"
+                })
                 .to_string();
-                
-            debug!("Creating partial metrics for {} streaming response with model: {}", 
-                   provider, model);
-            
+
+            debug!(
+                "Creating partial metrics for {} streaming response with model: {}",
+                provider, model
+            );
+
             // Rough token estimation based on accumulated text length
             // Approximation: ~4 characters per token for English text
             let estimated_output_tokens = if !accumulated_text.is_empty() {
@@ -366,10 +398,13 @@ async fn handle_streaming_response(
             } else {
                 None
             };
-            
-            debug!("Estimated output tokens from {} bytes of text: {:?}", 
-                accumulated_text.len(), estimated_output_tokens);
-            
+
+            debug!(
+                "Estimated output tokens from {} bytes of text: {:?}",
+                accumulated_text.len(),
+                estimated_output_tokens
+            );
+
             accumulated_metrics = ProviderMetrics {
                 model,
                 provider_latency: Duration::from_millis(0),
@@ -377,7 +412,7 @@ async fn handle_streaming_response(
                 // We don't have input tokens or total tokens
                 ..Default::default()
             };
-            
+
             final_metrics_found = true;
         }
 
@@ -390,7 +425,7 @@ async fn handle_streaming_response(
                 model: accumulated_metrics.model,
                 total_latency: start.elapsed(),
                 provider_latency: accumulated_metrics.provider_latency,
-                ttfb,  // Add the TTFB measurement
+                ttfb, // Add the TTFB measurement
                 request_size: req_size,
                 response_size,
                 input_tokens: accumulated_metrics.input_tokens,
@@ -405,13 +440,20 @@ async fn handle_streaming_response(
                 provider_request_id,
                 request_body: req_body,
                 response_body: resp_body,
-                streamed_data: if !streamed_chunks.is_empty() { Some(streamed_chunks) } else { None },
+                streamed_data: if !streamed_chunks.is_empty() {
+                    Some(streamed_chunks)
+                } else {
+                    None
+                },
                 is_streaming: true,
                 ..Default::default()
             };
             metrics_registry.record_metrics(metrics).await;
         } else {
-            debug!("No final metrics found in streaming response. Total text accumulated: {} bytes", accumulated_text.len());
+            debug!(
+                "No final metrics found in streaming response. Total text accumulated: {} bytes",
+                accumulated_text.len()
+            );
         }
     });
 

@@ -10,7 +10,7 @@
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
-use crate::policy::config::{RegexMatchConfig, RegexPattern, PolicyType};
+use crate::policy::config::{PolicyType, RegexMatchConfig, RegexPattern};
 use crate::policy::decision::{Phase, PolicyAction};
 
 use super::{EvalContext, PolicyRule, RuleOutcome};
@@ -71,12 +71,20 @@ fn compile_pattern(p: &RegexPattern) -> Result<Regex, String> {
             'x' => {
                 builder.ignore_whitespace(true);
             }
-            other => return Err(format!("unsupported regex flag '{other}' in pattern '{}'", p.name)),
+            other => {
+                return Err(format!(
+                    "unsupported regex flag '{other}' in pattern '{}'",
+                    p.name
+                ))
+            }
         }
     }
-    builder
-        .build()
-        .map_err(|e| format!("pattern '{}' failed to compile (possibly too large): {e}", p.name))
+    builder.build().map_err(|e| {
+        format!(
+            "pattern '{}' failed to compile (possibly too large): {e}",
+            p.name
+        )
+    })
 }
 
 impl PolicyRule for RegexMatchRule {
@@ -103,7 +111,8 @@ impl PolicyRule for RegexMatchRule {
         }
 
         let reason = format!("matched regex pattern(s): {}", matched_names.join(", "));
-        let mut outcome = RuleOutcome::flagged(self.action, 1.0, reason).with_entities(matched_names);
+        let mut outcome =
+            RuleOutcome::flagged(self.action, 1.0, reason).with_entities(matched_names);
 
         // For transform actions, rewrite the matched spans.
         if self.action.is_transform() {
@@ -244,7 +253,10 @@ mod tests {
         let input = "a".repeat(40) + "b"; // classic ReDoS trigger for backtrackers
         let start = std::time::Instant::now();
         let out = r.evaluate(&ctx(Box::leak(input.into_boxed_str())));
-        assert!(start.elapsed().as_millis() < 100, "regex must be linear-time");
+        assert!(
+            start.elapsed().as_millis() < 100,
+            "regex must be linear-time"
+        );
         assert!(!out.flagged); // 'b' at end means no full match
     }
 }

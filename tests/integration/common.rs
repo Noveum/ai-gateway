@@ -1,12 +1,15 @@
-use reqwest::{Client, header::{HeaderMap, HeaderValue}};
+use dotenv::from_filename;
+use futures_util::StreamExt;
+use reqwest::StatusCode;
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client,
+};
 use serde_json::{json, Value};
 use std::env;
 use std::time::Duration;
 use tokio::time::sleep;
-use dotenv::from_filename;
 use uuid::Uuid;
-use futures_util::StreamExt;
-use reqwest::StatusCode;
 
 /// Configuration for a provider test
 pub struct ProviderTestConfig {
@@ -27,12 +30,12 @@ impl ProviderTestConfig {
             max_tokens: 100,
         }
     }
-    
+
     pub fn with_prompt(mut self, prompt: &str) -> Self {
         self.prompt = prompt.to_string();
         self
     }
-    
+
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
@@ -43,7 +46,7 @@ impl ProviderTestConfig {
 pub fn init_test_env() {
     // For tests, we prioritize .env.test files
     let mut loaded_test_env = false;
-    
+
     // Try to load from .env.test in project root first
     if from_filename(".env.test").is_ok() {
         loaded_test_env = true;
@@ -53,7 +56,7 @@ pub fn init_test_env() {
         loaded_test_env = true;
         println!("Loaded environment from tests/.env.test");
     }
-    
+
     if !loaded_test_env {
         // Only if no test environment was loaded, try the standard .env file
         if dotenv::dotenv().is_ok() {
@@ -73,19 +76,19 @@ pub fn generate_request_id() -> String {
 pub async fn search_elasticsearch(gateway_request_id: &str) -> Result<Value, reqwest::Error> {
     // Ensure environment variables are loaded
     init_test_env();
-    
-    let es_url = env::var("ELASTICSEARCH_URL")
-        .expect("ELASTICSEARCH_URL must be set in .env.test file");
+
+    let es_url =
+        env::var("ELASTICSEARCH_URL").expect("ELASTICSEARCH_URL must be set in .env.test file");
     let es_username = env::var("ELASTICSEARCH_USERNAME")
         .expect("ELASTICSEARCH_USERNAME must be set in .env.test file");
     let es_password = env::var("ELASTICSEARCH_PASSWORD")
         .expect("ELASTICSEARCH_PASSWORD must be set in .env.test file");
-    let es_index = env::var("ELASTICSEARCH_INDEX")
-        .expect("ELASTICSEARCH_INDEX must be set in .env.test file");
-    
+    let es_index =
+        env::var("ELASTICSEARCH_INDEX").expect("ELASTICSEARCH_INDEX must be set in .env.test file");
+
     let client = Client::new();
     let search_url = format!("{}/{}/_search", es_url, es_index);
-    
+
     let query = json!({
         "query": {
             "term": {
@@ -93,49 +96,72 @@ pub async fn search_elasticsearch(gateway_request_id: &str) -> Result<Value, req
             }
         }
     });
-    
+
     println!("Searching ElasticSearch with query: {}", query);
-    
+
     let response = client
         .post(&search_url)
         .basic_auth(es_username, Some(es_password))
         .json(&query)
         .send()
         .await?;
-    
+
     response.json::<Value>().await
 }
 
 /// Set up request headers for a provider test
 pub fn setup_test_headers(provider: &str, api_key: &str, request_id: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    
+
     // Different header setup based on provider
     match provider {
         "bedrock" => {
             // For Bedrock, we need AWS credentials
-            let aws_access_key = env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID must be set");
-            let aws_secret_key = env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY must be set");
+            let aws_access_key =
+                env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID must be set");
+            let aws_secret_key =
+                env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY must be set");
             let aws_region = env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-            
-            headers.insert("x-aws-access-key-id", HeaderValue::from_str(&aws_access_key).unwrap());
-            headers.insert("x-aws-secret-access-key", HeaderValue::from_str(&aws_secret_key).unwrap());
+
+            headers.insert(
+                "x-aws-access-key-id",
+                HeaderValue::from_str(&aws_access_key).unwrap(),
+            );
+            headers.insert(
+                "x-aws-secret-access-key",
+                HeaderValue::from_str(&aws_secret_key).unwrap(),
+            );
             headers.insert("x-aws-region", HeaderValue::from_str(&aws_region).unwrap());
-        },
+        }
         _ => {
             // For other providers, use Bearer token auth
-            headers.insert("Authorization", HeaderValue::from_str(&format!("Bearer {}", api_key)).unwrap());
+            headers.insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("Bearer {}", api_key)).unwrap(),
+            );
         }
     }
-    
+
     // Common headers for all providers
-    headers.insert("Content-Type", HeaderValue::from_str("application/json").unwrap());
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str("application/json").unwrap(),
+    );
     headers.insert("x-provider", HeaderValue::from_str(provider).unwrap());
-    headers.insert("x-organisation-id", HeaderValue::from_str("TEST_ORG").unwrap());
-    headers.insert("x-project-id", HeaderValue::from_str("TEST_PROJECT").unwrap());
-    headers.insert("x-experiment-id", HeaderValue::from_str("TEST_EXPERIMENT").unwrap());
+    headers.insert(
+        "x-organisation-id",
+        HeaderValue::from_str("TEST_ORG").unwrap(),
+    );
+    headers.insert(
+        "x-project-id",
+        HeaderValue::from_str("TEST_PROJECT").unwrap(),
+    );
+    headers.insert(
+        "x-experiment-id",
+        HeaderValue::from_str("TEST_EXPERIMENT").unwrap(),
+    );
     headers.insert("x-user-id", HeaderValue::from_str("TEST_USER").unwrap());
-    
+
     headers
 }
 
@@ -158,7 +184,7 @@ pub fn create_test_request_body(config: &ProviderTestConfig, stream: bool) -> Va
 fn get_api_key(env_var_name: &str) -> String {
     // Ensure environment variables are loaded
     init_test_env();
-    
+
     // For Bedrock, we need to ensure all required AWS credentials are available
     if env_var_name == "AWS_ACCESS_KEY_ID" {
         // Make sure the other AWS credentials are set as well
@@ -169,11 +195,17 @@ fn get_api_key(env_var_name: &str) -> String {
             panic!("AWS_REGION must be set for Bedrock tests");
         }
     }
-    
+
     match env::var(env_var_name) {
         Ok(key) if !key.is_empty() => key,
-        Ok(_) => panic!("{} is set but empty. Please provide a valid value.", env_var_name),
-        Err(_) => panic!("{} must be set either in .env.test file or as an environment variable.", env_var_name),
+        Ok(_) => panic!(
+            "{} is set but empty. Please provide a valid value.",
+            env_var_name
+        ),
+        Err(_) => panic!(
+            "{} must be set either in .env.test file or as an environment variable.",
+            env_var_name
+        ),
     }
 }
 
@@ -181,25 +213,28 @@ fn get_api_key(env_var_name: &str) -> String {
 pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
     // Get the API key for the provider
     let api_key = get_api_key(&config.api_key_env_var);
-    
+
     // Get gateway URL from environment or use default
-    let gateway_url = env::var("GATEWAY_URL")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
-    
-    println!("Running non-streaming test for provider: {}", config.provider_name);
-    
+    let gateway_url =
+        env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+
+    println!(
+        "Running non-streaming test for provider: {}",
+        config.provider_name
+    );
+
     // Generate a unique request ID for tracking
     let request_id = generate_request_id();
-    
+
     // Setup headers
     let headers = setup_test_headers(&config.provider_name, &api_key, &request_id);
-    
+
     // Print request ID for debugging
     println!("Request ID: {}", request_id);
-    
+
     // Create request body
     let request_body = create_test_request_body(config, false);
-    
+
     // Send request to the gateway
     let client = Client::new();
     let response = client
@@ -209,68 +244,107 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
         .send()
         .await
         .expect("Failed to send request");
-    
+
     // Print the status code
     println!("Response status: {}", response.status());
-    
+
     // If we got a 403 Forbidden error, print the response body to debug
     if response.status() == StatusCode::FORBIDDEN {
-        let error_body = response.text().await.expect("Failed to read error response body");
+        let error_body = response
+            .text()
+            .await
+            .expect("Failed to read error response body");
         println!("Error response from gateway: {}", error_body);
         panic!("Request failed with status: 403 Forbidden - Make sure your AWS credentials have the correct permissions for AWS Bedrock");
     }
-    
+
     // Ensure the request was successful
-    assert!(response.status().is_success(), 
-            "Request failed with status: {} - Make sure the AI Gateway is running with ENABLE_ELASTICSEARCH=true", 
+    assert!(response.status().is_success(),
+            "Request failed with status: {} - Make sure the AI Gateway is running with ENABLE_ELASTICSEARCH=true",
             response.status());
-    
+
     // Extract gateway request ID from headers
     let response_headers = response.headers().clone();
-    let gateway_request_id = response_headers.get("x-request-id")
+    let gateway_request_id = response_headers
+        .get("x-request-id")
         .expect("x-request-id header not found in response")
         .to_str()
         .expect("Invalid x-request-id header value");
-    
+
     println!("Gateway request ID from headers: {}", gateway_request_id);
-    
+
     // Get the response body
-    let response_body = response.json::<Value>().await.expect("Failed to parse response as JSON");
-    
+    let response_body = response
+        .json::<Value>()
+        .await
+        .expect("Failed to parse response as JSON");
+
     // Print response for debugging
     // println!("Response: {:#?}", response_body);
-    
+
     // Validate response structure - still keep basic validation for immediate feedback
-    assert!(response_body.get("choices").is_some(), "Response missing 'choices' field");
-    assert!(response_body.get("usage").is_some(), "Response missing 'usage' field");
-    
+    assert!(
+        response_body.get("choices").is_some(),
+        "Response missing 'choices' field"
+    );
+    assert!(
+        response_body.get("usage").is_some(),
+        "Response missing 'usage' field"
+    );
+
     // Extract token counts
     let usage = response_body.get("usage").unwrap();
-    let prompt_tokens = usage.get("prompt_tokens").expect("Missing prompt_tokens").as_u64().unwrap();
-    let completion_tokens = usage.get("completion_tokens").expect("Missing completion_tokens").as_u64().unwrap();
-    let total_tokens = usage.get("total_tokens").expect("Missing total_tokens").as_u64().unwrap();
-    
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .expect("Missing prompt_tokens")
+        .as_u64()
+        .unwrap();
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .expect("Missing completion_tokens")
+        .as_u64()
+        .unwrap();
+    let total_tokens = usage
+        .get("total_tokens")
+        .expect("Missing total_tokens")
+        .as_u64()
+        .unwrap();
+
     // Validate token counts
     assert!(prompt_tokens > 0, "prompt_tokens should be greater than 0");
-    assert!(completion_tokens > 0, "completion_tokens should be greater than 0");
-    assert_eq!(prompt_tokens + completion_tokens, total_tokens, "Total tokens should equal prompt + completion tokens");
-    
+    assert!(
+        completion_tokens > 0,
+        "completion_tokens should be greater than 0"
+    );
+    assert_eq!(
+        prompt_tokens + completion_tokens,
+        total_tokens,
+        "Total tokens should equal prompt + completion tokens"
+    );
+
     // Wait for data to be indexed in ElasticSearch
     println!("Waiting for data to be indexed in ElasticSearch...");
     sleep(Duration::from_secs(3)).await;
-    
+
     // Load environment variables (to make it clear in the logs)
     dotenv::from_filename(".env.test").ok();
-    
-    // Search ElasticSearch for the request using gateway request ID
-    let es_response = search_elasticsearch(gateway_request_id).await.expect("Failed to search ElasticSearch");
 
-    
+    // Search ElasticSearch for the request using gateway request ID
+    let es_response = search_elasticsearch(gateway_request_id)
+        .await
+        .expect("Failed to search ElasticSearch");
+
     // Basic validation to fail early if something is obviously wrong
-    let hits = es_response.get("hits").and_then(|h| h.get("hits")).expect("No hits in ElasticSearch response");
+    let hits = es_response
+        .get("hits")
+        .and_then(|h| h.get("hits"))
+        .expect("No hits in ElasticSearch response");
     let hits_array = hits.as_array().expect("Hits is not an array");
-    assert!(!hits_array.is_empty(), "No matching documents found in ElasticSearch");
-    
+    assert!(
+        !hits_array.is_empty(),
+        "No matching documents found in ElasticSearch"
+    );
+
     // Use LLM to validate the test results
     let llm_validation_passed = validate_with_llm(
         &config.provider_name,
@@ -278,38 +352,45 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
         &request_id,
         &headers,
         &response_body,
-        &es_response
-    ).await;
-    
+        &es_response,
+    )
+    .await;
+
     // Assert that the LLM validation passed
     assert!(llm_validation_passed, "LLM validation failed");
-    
-    println!("Non-streaming test completed successfully for provider: {}", config.provider_name);
+
+    println!(
+        "Non-streaming test completed successfully for provider: {}",
+        config.provider_name
+    );
 }
 
 /// Run a streaming test for a provider
 pub async fn run_streaming_test(config: &ProviderTestConfig) {
     // Get the API key for the provider
     let api_key = get_api_key(&config.api_key_env_var);
-    
+
     // Get gateway URL from environment or use default
-    let gateway_url = env::var("GATEWAY_URL")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
-    
-    println!("Running streaming test for provider: {}", config.provider_name);
-    
+    let gateway_url =
+        env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+
+    println!(
+        "Running streaming test for provider: {}",
+        config.provider_name
+    );
+
     // Generate a unique request ID for tracking
     let request_id = generate_request_id();
-    
+
     // Setup headers
     let headers = setup_test_headers(&config.provider_name, &api_key, &request_id);
-    
+
     // Print request ID for debugging
     println!("Request ID: {}", request_id);
-    
+
     // Create request body with streaming enabled
     let request_body = create_test_request_body(config, true);
-    
+
     // Send request to the gateway
     let client = Client::new();
     let response = client
@@ -319,89 +400,98 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
         .send()
         .await
         .expect("Failed to send request");
-    
+
     // Print the status code
     println!("Response status: {}", response.status());
-    
+
     // If we got a 403 Forbidden error, print the response body to debug
     if response.status() == StatusCode::FORBIDDEN {
-        let error_body = response.text().await.expect("Failed to read error response body");
+        let error_body = response
+            .text()
+            .await
+            .expect("Failed to read error response body");
         println!("Error response from gateway: {}", error_body);
         panic!("Request failed with status: 403 Forbidden - Make sure your AWS credentials have the correct permissions for AWS Bedrock");
     }
-    
+
     // Ensure the request was successful
-    assert!(response.status().is_success(), 
-            "Request failed with status: {} - Make sure the AI Gateway is running with ENABLE_ELASTICSEARCH=true", 
+    assert!(response.status().is_success(),
+            "Request failed with status: {} - Make sure the AI Gateway is running with ENABLE_ELASTICSEARCH=true",
             response.status());
-    
+
     // Extract gateway request ID from headers
     let response_headers = response.headers().clone();
-    let gateway_request_id = response_headers.get("x-request-id")
+    let gateway_request_id = response_headers
+        .get("x-request-id")
         .expect("x-request-id header not found in response")
         .to_str()
         .expect("Invalid x-request-id header value");
-    
+
     println!("Gateway request ID from headers: {}", gateway_request_id);
-    
+
     // Get a reference to the response body stream
     let mut stream = response.bytes_stream();
-    
+
     // Consume the streaming response
     let mut stream_data = Vec::new();
     let mut provider_request_id = String::new();
-    
+
     // Process stream chunks
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.expect("Failed to read chunk");
         let chunk_str = std::str::from_utf8(&chunk).expect("Invalid UTF-8");
-        
+
         // Process each line in the chunk
         for line in chunk_str.lines() {
             // Skip empty lines or data: [DONE]
             if line.trim().is_empty() || line == "data: [DONE]" {
                 continue;
             }
-            
+
             // Process chunk (remove "data: " prefix and parse JSON)
             if let Some(json_str) = line.strip_prefix("data: ") {
                 if let Ok(json) = serde_json::from_str::<Value>(json_str) {
                     stream_data.push(json.clone());
-                    
+
                     // Extract provider request ID from chunk if available and not already set
                     if provider_request_id.is_empty() && json.get("id").is_some() {
-                        provider_request_id = json.get("id")
-                            .unwrap()
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        
+                        provider_request_id =
+                            json.get("id").unwrap().as_str().unwrap_or("").to_string();
+
                         println!("Provider request ID from stream: {}", provider_request_id);
                     }
                 }
             }
         }
     }
-    
+
     // Validate we received some streaming chunks
     assert!(!stream_data.is_empty(), "No streaming data chunks received");
-    
+
     sleep(Duration::from_secs(3)).await;
-    
+
     // Load environment variables (to make it clear in the logs)
     dotenv::from_filename(".env.test").ok();
-    
+
     // Search ElasticSearch for the request using gateway request ID
-    let es_response = search_elasticsearch(gateway_request_id).await.expect("Failed to search ElasticSearch");
-    
+    let es_response = search_elasticsearch(gateway_request_id)
+        .await
+        .expect("Failed to search ElasticSearch");
+
     // Basic validation to fail early if something is obviously wrong
-    let hits = es_response.get("hits").and_then(|h| h.get("hits")).expect("No hits in ElasticSearch response");
+    let hits = es_response
+        .get("hits")
+        .and_then(|h| h.get("hits"))
+        .expect("No hits in ElasticSearch response");
     let hits_array = hits.as_array().expect("Hits is not an array");
-    assert!(!hits_array.is_empty(), "No matching documents found in ElasticSearch");
-    
+    assert!(
+        !hits_array.is_empty(),
+        "No matching documents found in ElasticSearch"
+    );
+
     // Reconstruct the complete response from the streaming chunks for the LLM validation
     let last_chunk = stream_data.last().unwrap();
-    
+
     // Create the reconstructed response based on provider
     let reconstructed_response = if config.provider_name == "openai" {
         // For OpenAI, we need to handle the missing usage field in streaming responses
@@ -414,10 +504,10 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
                 "message": {
                     "role": "assistant",
                     "content": stream_data.iter()
-                        .filter_map(|chunk| chunk.get("choices").and_then(|choices| 
-                            choices.get(0).and_then(|choice| 
-                                choice.get("delta").and_then(|delta| 
-                                    delta.get("content").and_then(|content| 
+                        .filter_map(|chunk| chunk.get("choices").and_then(|choices|
+                            choices.get(0).and_then(|choice|
+                                choice.get("delta").and_then(|delta|
+                                    delta.get("content").and_then(|content|
                                         content.as_str())))))
                         .collect::<Vec<_>>()
                         .join("")
@@ -436,7 +526,7 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
             "completion_tokens": 0,
             "total_tokens": 0
         });
-        
+
         serde_json::json!({
             "id": last_chunk.get("id").unwrap_or(&serde_json::Value::Null),
             "object": "chat.completion",
@@ -446,10 +536,10 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
                 "message": {
                     "role": "assistant",
                     "content": stream_data.iter()
-                        .filter_map(|chunk| chunk.get("choices").and_then(|choices| 
-                            choices.get(0).and_then(|choice| 
-                                choice.get("delta").and_then(|delta| 
-                                    delta.get("content").and_then(|content| 
+                        .filter_map(|chunk| chunk.get("choices").and_then(|choices|
+                            choices.get(0).and_then(|choice|
+                                choice.get("delta").and_then(|delta|
+                                    delta.get("content").and_then(|content|
                                         content.as_str())))))
                         .collect::<Vec<_>>()
                         .join("")
@@ -462,7 +552,7 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
             "usage": usage
         })
     };
-    
+
     // Use LLM to validate the test results
     let llm_validation_passed = validate_with_llm(
         &config.provider_name,
@@ -470,13 +560,17 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
         &request_id,
         &headers,
         &reconstructed_response,
-        &es_response
-    ).await;
-    
+        &es_response,
+    )
+    .await;
+
     // Assert that the LLM validation passed
     assert!(llm_validation_passed, "LLM validation failed");
-    
-    println!("Streaming test completed successfully for provider: {}", config.provider_name);
+
+    println!(
+        "Streaming test completed successfully for provider: {}",
+        config.provider_name
+    );
 }
 
 /// Validate test results using an OpenAI LLM
@@ -490,12 +584,13 @@ pub async fn validate_with_llm(
 ) -> bool {
     // Get OpenAI API key from environment
     let openai_api_key = get_api_key("OPENAI_API_KEY");
-    
+
     // Format the prompt with all the necessary data
-    let gateway_request_id = request_headers.get("x-request-id")
+    let gateway_request_id = request_headers
+        .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
-    
+
     // Create a cleaned version of headers for the prompt
     let headers_json = serde_json::json!({
         "authorization": mask_api_key(request_headers.get("authorization")
@@ -520,7 +615,7 @@ pub async fn validate_with_llm(
             .and_then(|v| v.to_str().ok())
             .unwrap_or(""),
     });
-    
+
     // Build the prompt for the OpenAI model
     let prompt = format!(
         "As a LLM judge and validator your task is to make sure that all metrics are getting accurately logged for the given request ->\n\n\n\
@@ -577,7 +672,7 @@ pub async fn validate_with_llm(
         },
         "temperature": 0
     });
-    
+
     // Send request to OpenAI
     let client = Client::new();
     let openai_response = client
@@ -594,13 +689,13 @@ pub async fn validate_with_llm(
         .send()
         .await
         .expect("Failed to send request to OpenAI");
-    
+
     // Parse OpenAI response
     let openai_result = openai_response
         .json::<Value>()
         .await
         .expect("Failed to parse OpenAI response");
-    
+
     // Extract and parse the validation result
     let validation_result = openai_result
         .get("choices")
@@ -610,29 +705,35 @@ pub async fn validate_with_llm(
         .and_then(|content| content.as_str())
         .and_then(|content_str| serde_json::from_str::<Value>(content_str).ok())
         .expect("Failed to parse validation result from OpenAI");
-    
+
     // Print the full validation result for debugging
     println!("LLM validation result: {:#?}", validation_result);
-    
+
     // Check if the test passed according to the LLM
     let test_passed = validation_result
         .get("test_result")
         .and_then(|result| result.as_str())
         .map(|result| result == "pass")
         .unwrap_or(false);
-    
+
     if !test_passed {
         let failed_fields = validation_result
             .get("failed_fields")
             .and_then(|fields| fields.as_array())
-            .map(|fields| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", "))
+            .map(|fields| {
+                fields
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_else(|| "unknown fields".to_string());
-        
+
         println!("❌ LLM validation failed. Failed fields: {}", failed_fields);
     } else {
         println!("✅ LLM validation passed!");
     }
-    
+
     test_passed
 }
 
@@ -641,24 +742,24 @@ fn mask_api_key(api_key: &str) -> String {
     if api_key.is_empty() {
         return String::from("");
     }
-    
+
     // If it contains "Bearer ", keep that prefix
     if let Some(stripped) = api_key.strip_prefix("Bearer ") {
         if stripped.len() <= 8 {
             return format!("Bearer {}", stripped);
         }
-        
+
         let visible_start = &stripped[..4];
         let visible_end = &stripped[stripped.len() - 4..];
         return format!("Bearer {}...{}", visible_start, visible_end);
     }
-    
+
     // Otherwise just mask the key directly
     if api_key.len() <= 8 {
         return api_key.to_string();
     }
-    
+
     let visible_start = &api_key[..4];
     let visible_end = &api_key[api_key.len() - 4..];
     format!("{}...{}", visible_start, visible_end)
-} 
+}

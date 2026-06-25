@@ -33,14 +33,14 @@ pub async fn proxy_request(
 
     let path = request.uri().path();
     let method = request.method().as_str();
-    
+
     // Extract potentially useful headers for logging
     let organization = headers
         .get("x-organisation-id")
-        .or_else(|| headers.get("x-organization-id"))  // Try both British and American spelling
+        .or_else(|| headers.get("x-organization-id")) // Try both British and American spelling
         .and_then(|h| h.to_str().ok())
         .unwrap_or("none");
-        
+
     let project = headers
         .get("x-project-id")
         .and_then(|h| h.to_str().ok())
@@ -65,13 +65,7 @@ pub async fn proxy_request(
 
     debug!(
         "Request details: provider={}, client={}, path={}, method={}, org={}, project={}, user={}",
-        provider,
-        client_addr,
-        path,
-        method,
-        organization,
-        project,
-        user
+        provider, client_addr, path, method, organization, project, user
     );
 
     // Clone values needed for logging inside the async block
@@ -94,35 +88,39 @@ pub async fn proxy_request(
         let start_time = std::time::Instant::now();
         let result = proxy_request_to_provider(config, provider, request).await;
         let elapsed = start_time.elapsed();
-        
+
         match result {
             Ok(response) => {
                 let status = response.status().as_u16();
-                
+
                 // Extract x-request-id header from response for tracking
-                let request_id = response.headers()
+                let request_id = response
+                    .headers()
                     .get("x-request-id")
                     .and_then(|h| h.to_str().ok())
                     .unwrap_or("none");
-                
+
                 // Also try to get provider-specific request ID
                 let provider_request_id = match provider_clone.as_str() {
-                    "openai" => response.headers()
+                    "openai" => response
+                        .headers()
                         .get("x-request-id")
                         .or_else(|| response.headers().get("openai-request-id"))
                         .and_then(|h| h.to_str().ok()),
-                    "anthropic" => response.headers()
+                    "anthropic" => response
+                        .headers()
                         .get("anthropic-request-id")
                         .and_then(|h| h.to_str().ok()),
-                    "groq" => response.headers()
+                    "groq" => response
+                        .headers()
                         .get("groq-request-id")
                         .and_then(|h| h.to_str().ok()),
                     _ => None,
                 };
-                
+
                 // Use provider request ID if available, otherwise use our internal ID
                 let tracking_id = provider_request_id.unwrap_or(request_id);
-                
+
                 info!(
                     provider = %provider_clone,
                     path = %path_clone,
@@ -133,11 +131,11 @@ pub async fn proxy_request(
                     "Request completed successfully"
                 );
                 response
-            },
+            }
             Err(e) => {
                 // For errors, generate a unique ID to help with debugging
-                let error_id = format!("err-{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
-                
+                let error_id = format!("err-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
                 error!(
                     provider = %provider_clone,
                     path = %path_clone,

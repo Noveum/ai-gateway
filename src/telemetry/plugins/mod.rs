@@ -9,8 +9,8 @@ pub trait TelemetryPlugin: Send + Sync {
 }
 
 // Example plugin stubs (to be implemented later)
-pub mod elasticsearch;
 pub mod console;
+pub mod elasticsearch;
 
 pub use console::ConsolePlugin;
 
@@ -24,4 +24,4 @@ impl TelemetryPlugin for ConsolePlugin {
     fn name(&self) -> &str {
         "console"
     }
-} 
+}

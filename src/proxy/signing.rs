@@ -40,12 +40,12 @@ pub async fn sign_aws_request(
         vec![("Content-Type", "application/json")].into_iter(),
         SignableBody::Bytes(body),
     )
-    .map_err(|e| AppError::AwsSigningError(e))?;
+    .map_err(AppError::AwsSigningError)?;
 
     // Sign the request
     let (signing_instructions, _signature) =
         aws_sigv4::http_request::sign(signable_request, &signing_params)
-            .map_err(|e| AppError::AwsSigningError(e))?
+            .map_err(AppError::AwsSigningError)?
             .into_parts();
 
     // Create a temporary request to apply signing instructions

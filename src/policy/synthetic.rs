@@ -157,7 +157,8 @@ mod tests {
     use http_body_util::BodyExt;
 
     fn decision() -> PolicyDecision {
-        let mut d = PolicyDecision::allow("pol_1", "Monthly budget", "cost_cap", PolicyMode::Enforce);
+        let mut d =
+            PolicyDecision::allow("pol_1", "Monthly budget", "cost_cap", PolicyMode::Enforce);
         d.flagged = true;
         d.severity = Severity::Critical;
         d.reason = "spend cap reached".to_string();
@@ -171,16 +172,33 @@ mod tests {
 
     #[test]
     fn mode_from_env() {
-        assert_eq!(BlockResponseMode::from_env_str("provider_error"), BlockResponseMode::ProviderError);
-        assert_eq!(BlockResponseMode::from_env_str("error"), BlockResponseMode::ProviderError);
-        assert_eq!(BlockResponseMode::from_env_str("anything"), BlockResponseMode::SyntheticSuccess);
+        assert_eq!(
+            BlockResponseMode::from_env_str("provider_error"),
+            BlockResponseMode::ProviderError
+        );
+        assert_eq!(
+            BlockResponseMode::from_env_str("error"),
+            BlockResponseMode::ProviderError
+        );
+        assert_eq!(
+            BlockResponseMode::from_env_str("anything"),
+            BlockResponseMode::SyntheticSuccess
+        );
     }
 
     #[tokio::test]
     async fn openai_success_shape_is_200_with_choices() {
-        let resp = block_response("openai", "gpt-4o", &decision(), BlockResponseMode::SyntheticSuccess);
+        let resp = block_response(
+            "openai",
+            "gpt-4o",
+            &decision(),
+            BlockResponseMode::SyntheticSuccess,
+        );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get("x-noveum-guard-blocked").unwrap(), "true");
+        assert_eq!(
+            resp.headers().get("x-noveum-guard-blocked").unwrap(),
+            "true"
+        );
         let b = body_json(resp).await;
         assert_eq!(b["object"], "chat.completion");
         assert_eq!(b["model"], "gpt-4o");
@@ -193,7 +211,12 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_success_shape() {
-        let resp = block_response("anthropic", "claude-opus-4-8", &decision(), BlockResponseMode::SyntheticSuccess);
+        let resp = block_response(
+            "anthropic",
+            "claude-opus-4-8",
+            &decision(),
+            BlockResponseMode::SyntheticSuccess,
+        );
         let b = body_json(resp).await;
         assert_eq!(b["type"], "message");
         assert_eq!(b["content"][0]["type"], "text");
@@ -201,14 +224,24 @@ mod tests {
 
     #[tokio::test]
     async fn google_success_shape() {
-        let resp = block_response("google", "gemini-2.5-pro", &decision(), BlockResponseMode::SyntheticSuccess);
+        let resp = block_response(
+            "google",
+            "gemini-2.5-pro",
+            &decision(),
+            BlockResponseMode::SyntheticSuccess,
+        );
         let b = body_json(resp).await;
         assert!(b["candidates"][0]["content"]["parts"][0]["text"].is_string());
     }
 
     #[tokio::test]
     async fn provider_error_is_403() {
-        let resp = block_response("openai", "gpt-4o", &decision(), BlockResponseMode::ProviderError);
+        let resp = block_response(
+            "openai",
+            "gpt-4o",
+            &decision(),
+            BlockResponseMode::ProviderError,
+        );
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let b = body_json(resp).await;
         assert_eq!(b["error"]["code"], "noveum_guard_blocked");
@@ -216,14 +249,24 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_error_envelope() {
-        let resp = block_response("anthropic", "claude-opus-4-8", &decision(), BlockResponseMode::ProviderError);
+        let resp = block_response(
+            "anthropic",
+            "claude-opus-4-8",
+            &decision(),
+            BlockResponseMode::ProviderError,
+        );
         let b = body_json(resp).await;
         assert_eq!(b["error"]["type"], "permission_error");
     }
 
     #[tokio::test]
     async fn unknown_provider_falls_back_to_openai_shape() {
-        let resp = block_response("some-new-provider", "x", &decision(), BlockResponseMode::SyntheticSuccess);
+        let resp = block_response(
+            "some-new-provider",
+            "x",
+            &decision(),
+            BlockResponseMode::SyntheticSuccess,
+        );
         let b = body_json(resp).await;
         assert_eq!(b["object"], "chat.completion");
     }

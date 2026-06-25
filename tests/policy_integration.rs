@@ -111,7 +111,10 @@ async fn blocks_input_with_synthetic_success() {
         json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "my ssn is 123-45-6789"}]}),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.headers().get("x-noveum-guard-blocked").unwrap(), "true");
+    assert_eq!(
+        resp.headers().get("x-noveum-guard-blocked").unwrap(),
+        "true"
+    );
     let (status, body) = response_json(resp).await;
     assert_eq!(status, StatusCode::OK); // synthetic_success default
     assert_eq!(body["object"], "chat.completion");
@@ -158,7 +161,10 @@ async fn masks_pii_in_forwarded_request() {
     let (status, body) = response_json(resp).await;
     assert_eq!(status, StatusCode::OK);
     let forwarded = body["messages"][0]["content"].as_str().unwrap();
-    assert!(!forwarded.contains("jane@acme.io"), "email should be redacted: {forwarded}");
+    assert!(
+        !forwarded.contains("jane@acme.io"),
+        "email should be redacted: {forwarded}"
+    );
     assert!(forwarded.contains("[REDACTED]"));
 }
 
@@ -174,7 +180,10 @@ async fn model_allowlist_blocks_disallowed_model() {
         json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}),
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.headers().get("x-noveum-guard-blocked").unwrap(), "true");
+    assert_eq!(
+        resp.headers().get("x-noveum-guard-blocked").unwrap(),
+        "true"
+    );
 }
 
 #[tokio::test]
@@ -185,9 +194,15 @@ async fn output_phase_blocks_leaked_secret() {
     );
     let app = router(engine);
     // input is clean; the canned handler returns a response containing an AWS key
-    let req = post_json("/v1/canned", json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "ok"}]}));
+    let req = post_json(
+        "/v1/canned",
+        json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "ok"}]}),
+    );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.headers().get("x-noveum-guard-blocked").unwrap(), "true");
+    assert_eq!(
+        resp.headers().get("x-noveum-guard-blocked").unwrap(),
+        "true"
+    );
 }
 
 #[tokio::test]
@@ -197,7 +212,10 @@ async fn output_phase_redacts_secret() {
         "config":{"phase":"output","detectors":["aws_access_key"],"action":"redact"}}]}"#,
     );
     let app = router(engine);
-    let req = post_json("/v1/canned", json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "ok"}]}));
+    let req = post_json(
+        "/v1/canned",
+        json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "ok"}]}),
+    );
     let resp = app.oneshot(req).await.unwrap();
     let (status, body) = response_json(resp).await;
     assert_eq!(status, StatusCode::OK);
@@ -222,7 +240,10 @@ async fn shadow_mode_passes_through_but_does_not_block() {
     assert!(resp.headers().get("x-noveum-guard-blocked").is_none());
     let (status, body) = response_json(resp).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body["messages"][0]["content"].as_str().unwrap().contains("123-45-6789"));
+    assert!(body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("123-45-6789"));
 }
 
 #[tokio::test]

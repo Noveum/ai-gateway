@@ -13,6 +13,12 @@ pub struct AppConfig {
     pub buffer_size: usize,
 }
 
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppConfig {
     pub fn new() -> Self {
         info!("Loading environment configuration");

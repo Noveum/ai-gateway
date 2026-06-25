@@ -54,14 +54,22 @@ pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
     ("command-r7b-12-2024", 0.0375, 0.15),
     // Together AI — together.ai/pricing
     ("meta-llama/llama-3.3-70b-instruct-turbo", 1.04, 1.04),
-    ("meta-llama/llama-4-maverick-17b-128e-instruct-fp8", 0.27, 0.85),
+    (
+        "meta-llama/llama-4-maverick-17b-128e-instruct-fp8",
+        0.27,
+        0.85,
+    ),
     ("meta-llama/llama-4-scout-17b-16e-instruct", 0.18, 0.59),
     ("deepseek-ai/deepseek-v3", 1.25, 1.25),
     // Fireworks AI — fireworks.ai/pricing
     ("accounts/fireworks/models/deepseek-v4-pro", 1.74, 3.48),
     ("accounts/fireworks/models/deepseek-v4-flash", 0.14, 0.28),
     ("accounts/fireworks/models/kimi-k2p6", 0.95, 4.00),
-    ("accounts/fireworks/models/llama-v3p3-70b-instruct", 0.90, 0.90),
+    (
+        "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        0.90,
+        0.90,
+    ),
     // AWS Bedrock — aws.amazon.com/bedrock/pricing (US on-demand)
     ("anthropic.claude-opus-4-5-20251101-v1:0", 5.00, 25.00),
     ("anthropic.claude-sonnet-4-5-20250929-v1:0", 3.00, 15.00),
@@ -113,7 +121,7 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
     for &(id, i, o) in MODEL_PRICING {
         if m.starts_with(id) || id.starts_with(&m) {
             let common = id.len().min(m.len());
-            if best.map_or(true, |(blen, _, _)| common > blen) {
+            if best.is_none_or(|(blen, _, _)| common > blen) {
                 best = Some((common, i, o));
             }
         }

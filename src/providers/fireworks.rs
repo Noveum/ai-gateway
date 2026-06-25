@@ -1,5 +1,5 @@
-use super::Provider;
 use super::utils::log_tracking_headers;
+use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
@@ -11,6 +11,12 @@ use tracing::{debug, error};
 
 pub struct FireworksProvider {
     base_url: String,
+}
+
+impl Default for FireworksProvider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FireworksProvider {
@@ -97,10 +103,10 @@ impl Provider for FireworksProvider {
             path.to_string()
         }
     }
-    
+
     async fn process_response(&self, response: Response<Body>) -> Result<Response<Body>, AppError> {
         let (mut parts, body) = response.into_parts();
-        
+
         // Extract the Fireworks request ID from the response headers if present
         if let Some(id) = parts.headers.get("x-request-id").cloned() {
             debug!("Found Fireworks x-request-id header: {:?}", id);
@@ -109,7 +115,7 @@ impl Provider for FireworksProvider {
         } else {
             debug!("No x-request-id found in Fireworks response headers");
         }
-        
+
         Ok(Response::from_parts(parts, body))
     }
 }
@@ -119,17 +125,31 @@ pub struct FireworksMetricsExtractor;
 
 impl MetricsExtractor for FireworksMetricsExtractor {
     fn extract_metrics(&self, response_body: &serde_json::Value) -> ProviderMetrics {
-        debug!("Extracting Fireworks metrics from response: {}", response_body);
+        debug!(
+            "Extracting Fireworks metrics from response: {}",
+            response_body
+        );
         let mut metrics = ProviderMetrics::default();
-        
+
         // Extract token information from usage field (OpenAI compatible format)
         if let Some(usage) = response_body.get("usage") {
             debug!("Found usage data: {:?}", usage);
-            metrics.input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            metrics.output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            metrics.total_tokens = usage.get("total_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
-            debug!("Extracted tokens - input: {:?}, output: {:?}, total: {:?}", 
-                metrics.input_tokens, metrics.output_tokens, metrics.total_tokens);
+            metrics.input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            metrics.output_tokens = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            metrics.total_tokens = usage
+                .get("total_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            debug!(
+                "Extracted tokens - input: {:?}, output: {:?}, total: {:?}",
+                metrics.input_tokens, metrics.output_tokens, metrics.total_tokens
+            );
         }
 
         // Extract model information
@@ -137,13 +157,13 @@ impl MetricsExtractor for FireworksMetricsExtractor {
             debug!("Found model: {}", model);
             metrics.model = model.to_string();
         }
-        
+
         // Extract request ID
         if let Some(id) = response_body.get("id").and_then(|v| v.as_str()) {
             debug!("Found request ID: {}", id);
             metrics.request_id = Some(id.to_string());
         }
-        
+
         metrics
     }
 }
