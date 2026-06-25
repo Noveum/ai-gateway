@@ -1,0 +1,63 @@
+# Nova Guard CI — hermetic build/lint/test/coverage for the gateway.
+#
+# To enable: copy this file to .github/workflows/nova-guard.yml and commit it.
+# (It is shipped here under docs/ci/ because adding workflow files requires a
+# token with the `workflow` OAuth scope; a maintainer with that scope can move
+# it into place in one step.)
+#
+# Unlike the live-provider integration tests (which need API keys + a running
+# gateway), everything here runs hermetically — no secrets required — so it can
+# gate every PR.
+
+name: Nova Guard CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build + lint + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --lib --bins -- -D warnings
+      - name: Build
+        run: cargo build --verbose
+      - name: Unit + policy integration tests (no external services)
+        run: cargo test --lib --test policy_integration --verbose
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage (lib + policy integration), enforce threshold
+        run: >
+          cargo llvm-cov --lib --test policy_integration
+          --fail-under-lines 75
+          --lcov --output-path lcov.info
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
