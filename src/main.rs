@@ -19,10 +19,7 @@ use noveum_ai_gateway::{
     config::{AppConfig, TelemetryConfig},
     control_plane::{spawn_policy_refresh, ControlPlaneClient, ControlPlaneConfig},
     policy::PolicyEngine,
-    telemetry::{
-        exporters::NoveumTraceExporter, plugins::elasticsearch::ElasticsearchPlugin, ConsolePlugin,
-        MetricsRegistry,
-    },
+    telemetry::{exporters::NoveumTraceExporter, ConsolePlugin, MetricsRegistry},
     AppState,
 };
 
@@ -68,31 +65,6 @@ async fn main() {
         metrics_registry
             .register_exporter(Box::new(ConsolePlugin::new()))
             .await;
-    }
-
-    if telemetry_config.elasticsearch_enabled {
-        debug!("Registering Elasticsearch exporter");
-        let elasticsearch_url = std::env::var("ELASTICSEARCH_URL")
-            .unwrap_or_else(|_| "http://localhost:9200".to_string());
-        let elasticsearch_username = std::env::var("ELASTICSEARCH_USERNAME").ok();
-        let elasticsearch_password = std::env::var("ELASTICSEARCH_PASSWORD").ok();
-        let elasticsearch_index = std::env::var("ELASTICSEARCH_INDEX")
-            .unwrap_or_else(|_| "ai-gateway-metrics".to_string());
-
-        match ElasticsearchPlugin::new(
-            elasticsearch_url,
-            elasticsearch_username,
-            elasticsearch_password,
-            elasticsearch_index,
-        ) {
-            Ok(plugin) => {
-                metrics_registry.register_exporter(Box::new(plugin)).await;
-                info!("Elasticsearch exporter registered successfully");
-            }
-            Err(e) => {
-                error!("Failed to initialize Elasticsearch exporter: {}", e);
-            }
-        }
     }
 
     // Noveum trace exporter — ships gateway traffic to the Noveum platform's

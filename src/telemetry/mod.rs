@@ -186,19 +186,19 @@ impl RequestMetrics {
                 response_value["streamed_data"] = json!(streamed_chunks);
             }
 
-            Some(self.sanitize_for_elasticsearch(response_value))
+            Some(self.sanitize_json_for_export(response_value))
         } else {
             // For non-streaming responses, just include the response body
             self.response_body
                 .clone()
-                .map(|body| self.sanitize_for_elasticsearch(body))
+                .map(|body| self.sanitize_json_for_export(body))
         };
 
-        // Sanitize request body for Elasticsearch
+        // Sanitize request body for export.
         let request_data = self
             .request_body
             .clone()
-            .map(|body| self.sanitize_for_elasticsearch(body));
+            .map(|body| self.sanitize_json_for_export(body));
 
         let attributes = LogAttributes {
             id: self.id.clone().unwrap_or_else(|| {
@@ -334,7 +334,7 @@ impl RequestMetrics {
         if let Some(req) = &self.request_body {
             attrs.insert(
                 "llm.request".into(),
-                self.sanitize_for_elasticsearch(req.clone()),
+                self.sanitize_json_for_export(req.clone()),
             );
         }
         if self.is_streaming && self.streamed_data.is_some() {
@@ -342,11 +342,11 @@ impl RequestMetrics {
             if let Some(chunks) = &self.streamed_data {
                 resp["streamed_data"] = json!(chunks);
             }
-            attrs.insert("llm.response".into(), self.sanitize_for_elasticsearch(resp));
+            attrs.insert("llm.response".into(), self.sanitize_json_for_export(resp));
         } else if let Some(resp) = &self.response_body {
             attrs.insert(
                 "llm.response".into(),
-                self.sanitize_for_elasticsearch(resp.clone()),
+                self.sanitize_json_for_export(resp.clone()),
             );
         }
 
@@ -398,9 +398,11 @@ impl RequestMetrics {
         })
     }
 
-    /// Sanitize complex JSON structures for Elasticsearch
-    /// This converts message content objects to strings to prevent mapping errors
-    fn sanitize_for_elasticsearch(&self, mut value: Value) -> Value {
+    /// Sanitize complex JSON structures for export.
+    /// Flattens nested message `content` objects to strings and normalizes error
+    /// objects / large seed numbers so downstream stores (trace ingest, console)
+    /// receive predictable shapes.
+    fn sanitize_json_for_export(&self, mut value: Value) -> Value {
         // Handle the case where we have a message array with complex content
         if let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for message in messages {
@@ -414,13 +416,13 @@ impl RequestMetrics {
             }
         }
 
-        // Handle error objects - convert to string to prevent Elasticsearch mapping errors
+        // Handle error objects - convert to string to prevent type-mapping errors in downstream stores
         if let Some(error) = value.get_mut("error") {
             if error.is_object() || error.is_array() {
                 let error_str = error.to_string();
                 *error = json!(error_str);
                 debug!(
-                    "Converting error object to string for Elasticsearch compatibility: {}",
+                    "Converting error object to string for downstream-store compatibility: {}",
                     error_str
                 );
             }
@@ -457,7 +459,7 @@ impl RequestMetrics {
                             }
                         }
 
-                        // Convert 'seed' to string to avoid Elasticsearch long integer overflow
+                        // Convert 'seed' to string to avoid integer overflow in downstream stores
                         if let Some(seed) = choice.get_mut("seed") {
                             if seed.is_number() {
                                 let seed_str = seed.to_string();
@@ -480,7 +482,7 @@ impl RequestMetrics {
         // Handle root-level choices array
         if let Some(choices) = value.get_mut("choices").and_then(|c| c.as_array_mut()) {
             for choice in choices {
-                // Convert 'seed' to string to avoid Elasticsearch long integer overflow
+                // Convert 'seed' to string to avoid integer overflow in downstream stores
                 if let Some(seed) = choice.get_mut("seed") {
                     if seed.is_number() {
                         let seed_str = seed.to_string();

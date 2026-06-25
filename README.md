@@ -11,7 +11,7 @@
 
 [Quick Start](#quick-start) • 
 [Documentation](docs/) • 
-[Monitoring](docs/elasticsearch-integration.md) • 
+[Pricing](docs/PRICING.md) • 
 [Docker](docs/deployment.md) • 
 [Contributing](docs/CONTRIBUTING.md)
 
@@ -41,7 +41,7 @@
 - 🛡️ **Nova Guard policy enforcement**: In-process guardrails — cost caps, rate limits, model allow/deny, regex, banned substrings, PII & secrets detection, JSON-schema validation, token caps — that block, redact, or flag requests and responses. Runs standalone (BYOK) or wired to the Noveum control plane for hosted policies and atomic budget reservation. See [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md).
 - 🛡️ **Production Ready**: Battle-tested in high-load environments
 - 🔍 **Health Checking**: Built-in monitoring
-- 📊 **Telemetry & Metrics**: Supports [Elasticsearch integration](docs/elasticsearch-integration.md) and [Noveum trace ingest](docs/NOVA_GUARD.md) with periodic status logs for operational insights
+- 📊 **Telemetry & Metrics**: Per-request token usage and cost tracking, exported as span-based traces to the [Noveum platform](docs/NOVA_GUARD.md) (set `ENABLE_NOVEUM_TRACES=true`), plus an optional console exporter for local debugging
 - 🌐 **CORS Support**: Configurable cross-origin resource sharing
 - 🛠️ **SDK Compatibility**: Works with any OpenAI-compatible SDK
 
@@ -429,21 +429,24 @@ docker run -p 3000:3000 \
   noveum/noveum-ai-gateway:latest
 ```
 
-### Using Pre-built Docker Image with Elasticsearch
+### Using Pre-built Docker Image with Noveum trace export
+
+Export per-request token/cost traces to the Noveum platform by setting the
+Noveum env vars (see [Nova Guard docs](docs/NOVA_GUARD.md)):
 
 ```bash
 docker pull noveum/noveum-ai-gateway:latest  --platform linux/amd64
 docker run --platform linux/amd64 -p 3000:3000 \
   -e RUST_LOG=info \
-  -e ENABLE_ELASTICSEARCH=true \
-  -e ELASTICSEARCH_URL=http://localhost:9200 \
-  -e ELASTICSEARCH_USERNAME=elastic \
-  -e ELASTICSEARCH_PASSWORD=your_secure_password \
-  -e ELASTICSEARCH_INDEX=ai-gateway-metrics \
+  -e ENABLE_NOVEUM_TRACES=true \
+  -e NOVEUM_ENDPOINT=https://api.noveum.ai/api \
+  -e NOVEUM_API_KEY=nv_your_api_key \
+  -e NOVEUM_PROJECT=your-project-id \
   noveum/noveum-ai-gateway:latest
 ```
 
-> **Note**: When running with Elasticsearch, make sure your Elasticsearch instance is accessible from the Docker container. If running Elasticsearch locally, you may need to use `host.docker.internal` instead of `localhost` in the URL.
+> **Note**: Per-request project attribution can also be set with the
+> `x-project-id` request header, which overrides `NOVEUM_PROJECT`.
 
 ### Docker Compose
 
@@ -488,9 +491,9 @@ Then run either option with:
 docker-compose up -d
 ```
 
-#### Option 3: Use Prebuilt Image with Elasticsearch
+#### Option 3: Use Prebuilt Image with Noveum trace export
 
-Create a `docker-compose.yml` file with Elasticsearch integration:
+Create a `docker-compose.yml` that ships token/cost traces to the Noveum platform:
 
 ```yaml
 version: '3.8'
@@ -502,40 +505,11 @@ services:
       - "3000:3000"
     environment:
       - RUST_LOG=info
-      - ENABLE_ELASTICSEARCH=true
-      - ELASTICSEARCH_URL=http://elasticsearch:9200
-      - ELASTICSEARCH_USERNAME=elastic
-      - ELASTICSEARCH_PASSWORD=your_secure_password
-      - ELASTICSEARCH_INDEX=ai-gateway-metrics
+      - ENABLE_NOVEUM_TRACES=true
+      - NOVEUM_ENDPOINT=https://api.noveum.ai/api
+      - NOVEUM_API_KEY=nv_your_api_key
+      - NOVEUM_PROJECT=your-project-id
     restart: unless-stopped
-    depends_on:
-      - elasticsearch
-
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=true
-      - "ELASTIC_PASSWORD=your_secure_password"
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    ports:
-      - "9200:9200"
-    volumes:
-      - es_data:/usr/share/elasticsearch/data
-
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.12.0
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-      - ELASTICSEARCH_USERNAME=elastic
-      - ELASTICSEARCH_PASSWORD=your_secure_password
-    ports:
-      - "5601:5601"
-    depends_on:
-      - elasticsearch
-
-volumes:
-  es_data:
 ```
 
 Then run with:
@@ -632,7 +606,7 @@ These headers will be included in the telemetry logs, allowing you to:
 - Analyze performance by user
 - Segment analytics by experiment
 
-For more details, see the [Elasticsearch Integration Guide](docs/elasticsearch-integration.md) and [Telemetry Plugins Guide](docs/telemetry-plugins.md).
+For more details, see the [Telemetry Exporters Guide](docs/telemetry-plugins.md).
 
 ## Testing
 
@@ -649,9 +623,11 @@ Noveum Gateway includes comprehensive integration tests for all supported provid
    nano .env.test
    ```
 
-2. Start the gateway with ElasticSearch enabled:
+2. Start the gateway:
    ```bash
-   ENABLE_ELASTICSEARCH=true cargo run
+   cargo run
+   # optionally export traces to Noveum:
+   # ENABLE_NOVEUM_TRACES=true NOVEUM_ENDPOINT=https://api.noveum.ai/api NOVEUM_API_KEY=nv_... cargo run
    ```
 
 3. Run the integration tests:
@@ -675,12 +651,6 @@ Your `.env.test` file should include the following variables:
 ```bash
 # Gateway URL (default: http://localhost:3000)
 GATEWAY_URL=http://localhost:3000
-
-# ElasticSearch Configuration (required for tests)
-ELASTICSEARCH_URL=http://localhost:9200
-ELASTICSEARCH_USERNAME=elastic
-ELASTICSEARCH_PASSWORD=your_elasticsearch_password
-ELASTICSEARCH_INDEX=ai-gateway-metrics
 
 # Provider API Keys - Add keys for the providers you want to test
 OPENAI_API_KEY=your_openai_api_key

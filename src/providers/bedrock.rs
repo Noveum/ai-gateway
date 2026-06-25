@@ -1,3 +1,11 @@
+//! AWS Bedrock provider adapter.
+//!
+//! Translates OpenAI-style chat requests into Bedrock's Converse API
+//! (`/model/{id}/converse[-stream]`), signs them with AWS SigV4 (credentials and
+//! region taken from request headers), and transforms Converse responses and
+//! event-stream chunks back into OpenAI shape. Token usage is read from Bedrock's
+//! `usage.inputTokens`/`outputTokens` (with an OpenAI-shape fallback).
+
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
@@ -18,8 +26,6 @@ use uuid;
 /// Constants for default values
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
-#[allow(dead_code)]
-const DEFAULT_FALLBACK_MODEL: &str = "mistral.mistral-7b-instruct-v0:2";
 const DEFAULT_MAX_TOKENS: u64 = 1000;
 const DEFAULT_TEMPERATURE: f64 = 0.7;
 const DEFAULT_TOP_P: f64 = 1.0;
@@ -68,14 +74,6 @@ impl BedrockProvider {
             system_fingerprint: Arc::new(RwLock::new(fingerprint)),
             first_chunk: Arc::new(RwLock::new(true)),
         }
-    }
-
-    #[allow(dead_code)]
-    fn get_model_name(&self, path: &str) -> String {
-        path.split('/')
-            .next_back()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_string())
     }
 
     fn transform_request_body(&self, body: Value) -> Result<Value, AppError> {
@@ -715,15 +713,15 @@ impl MetricsExtractor for BedrockMetricsExtractor {
             metrics.request_id = Some(request_id.to_string());
         }
 
-        // Calculate cost if we have token information and a model
-        if let (Some(total_tokens), Some(model)) =
-            (metrics.total_tokens, response_body.get("model"))
-        {
-            let model_name = model.as_str().unwrap_or("");
-            metrics.cost = Some(calculate_bedrock_cost(model_name, total_tokens));
+        // Cost via the shared dual-rate pricing table.
+        if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
+            let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
+            if cost > 0.0 {
+                metrics.cost = Some(cost);
+            }
             debug!(
-                "Calculated Bedrock cost: {:?} for model {} and {} tokens",
-                metrics.cost, metrics.model, total_tokens
+                "Calculated Bedrock cost: {:?} for model {}",
+                metrics.cost, metrics.model
             );
         }
 
@@ -774,15 +772,5 @@ impl MetricsExtractor for BedrockMetricsExtractor {
         }
 
         None
-    }
-}
-
-// Helper function for Bedrock-specific cost calculation
-fn calculate_bedrock_cost(model: &str, total_tokens: u32) -> f64 {
-    match model {
-        m if m.contains("claude") => (total_tokens as f64) * 0.00001102,
-        m if m.contains("titan") => (total_tokens as f64) * 0.00001,
-        m if m.contains("llama2") => (total_tokens as f64) * 0.00001,
-        _ => 0.0,
     }
 }
