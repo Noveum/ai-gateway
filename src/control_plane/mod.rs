@@ -285,6 +285,9 @@ pub fn spawn_policy_refresh(
     project_id: String,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    // Never poll with a zero interval (a misconfigured caller would otherwise
+    // hot-loop the control plane). Floor at 5s.
+    let interval = interval.max(Duration::from_secs(5));
     tokio::spawn(async move {
         let mut etag: Option<String> = None;
         loop {
@@ -348,7 +351,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let engine = Arc::new(PolicyEngine::disabled());
+        // Start from an ENABLED but empty engine — the realistic runtime state —
+        // so the test exercises enforcement being active after the swap, not just
+        // the policy count (a disabled engine would still bypass middleware).
+        let engine = Arc::new(PolicyEngine::from_bundle(
+            &PolicyBundle::default(),
+            crate::policy::engine::EngineOptions::default(),
+        ));
+        assert!(engine.is_enabled());
         assert_eq!(engine.active_policy_count(), 0);
 
         let handle = spawn_policy_refresh(
@@ -369,6 +379,7 @@ mod tests {
         }
         handle.abort();
         assert!(applied, "refresh task did not hot-swap the hosted bundle");
+        assert!(engine.is_enabled(), "engine must remain enabled after swap");
     }
 
     #[tokio::test]

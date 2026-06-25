@@ -1,3 +1,9 @@
+//! Together AI provider adapter.
+//!
+//! Forwards to Together's OpenAI-compatible API (`https://api.together.xyz`) and
+//! reuses the OpenAI metrics extractor (standard `usage` object), pricing via the
+//! shared table.
+
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
@@ -11,6 +17,8 @@ use serde_json::Value;
 use tracing::{debug, error};
 use uuid::Uuid;
 
+/// Provider adapter for Together AI (`x-provider: together`). Base URL
+/// `https://api.together.xyz`; OpenAI-compatible wire format.
 pub struct TogetherProvider {
     base_url: String,
 }

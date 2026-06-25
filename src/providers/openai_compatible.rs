@@ -69,9 +69,23 @@ impl Provider for OpenAICompatibleProvider {
         );
 
         if let Some(auth) = original_headers
-            .get("authorization")
+            .get(http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
         {
+            // Validate the Bearer token shape locally so malformed credentials
+            // fail fast as InvalidHeader rather than being forwarded upstream
+            // (where they'd surface as an opaque 401 to the caller).
+            if !auth.starts_with("Bearer ") {
+                error!(
+                    "Invalid authorization format for {} request - must start with 'Bearer '",
+                    self.name
+                );
+                return Err(AppError::InvalidHeader);
+            }
+            if auth.len() <= 7 {
+                error!("Empty Bearer token for {} request", self.name);
+                return Err(AppError::InvalidHeader);
+            }
             headers.insert(
                 http::header::AUTHORIZATION,
                 http::header::HeaderValue::from_str(auth).map_err(|_| {
@@ -162,6 +176,25 @@ mod tests {
         assert!(matches!(
             p.process_headers(&HeaderMap::new()),
             Err(AppError::MissingApiKey)
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_bearer() {
+        let p = OpenAICompatibleProvider::new("deepseek", "https://api.deepseek.com", false);
+        // Wrong scheme.
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Token abc".parse().unwrap());
+        assert!(matches!(
+            p.process_headers(&h),
+            Err(AppError::InvalidHeader)
+        ));
+        // Empty token after "Bearer ".
+        let mut h2 = HeaderMap::new();
+        h2.insert("authorization", "Bearer ".parse().unwrap());
+        assert!(matches!(
+            p.process_headers(&h2),
+            Err(AppError::InvalidHeader)
         ));
     }
 

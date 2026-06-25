@@ -1,3 +1,6 @@
+//! The gateway's unified error type ([`AppError`]) and its mapping to HTTP
+//! responses via [`axum::response::IntoResponse`].
+
 use aws_sigv4::http_request::SigningError;
 use axum::{
     http::StatusCode,

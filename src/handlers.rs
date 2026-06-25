@@ -1,3 +1,7 @@
+//! Axum HTTP handlers: the health check and the catch-all proxy entry point that
+//! resolves the target provider from the `x-provider` header and forwards the
+//! request through [`crate::proxy`].
+
 use crate::{config::AppConfig, proxy::proxy_request_to_provider};
 use axum::{
     body::Body,

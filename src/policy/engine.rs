@@ -308,13 +308,19 @@ impl PolicyEngine {
         // `Phase::Both` is a *policy* attribute, not an evaluation axis. The
         // middleware must call this with `Input` or `Output` only; evaluating
         // with `Both` would run input- and output-only policies together and
-        // double-apply `Both` transforms.
-        debug_assert!(
-            phase != Phase::Both,
-            "evaluate() must be called with Phase::Input or Phase::Output, not Both"
-        );
+        // double-apply `Both` transforms. Guard at runtime (not just debug) so an
+        // out-of-tree caller can't silently evaluate under an invalid axis.
+        let result = EvaluationResult::default();
+        if phase == Phase::Both {
+            debug_assert!(
+                false,
+                "evaluate() must be called with Phase::Input or Phase::Output, not Both"
+            );
+            warn!("Nova Guard: evaluate() called with Phase::Both; returning no-op result");
+            return result;
+        }
         let state = self.state.load();
-        let mut result = EvaluationResult::default();
+        let mut result = result;
         if !state.enabled {
             return result;
         }
@@ -395,6 +401,14 @@ impl PolicyEngine {
     /// segments (chat message contents) so the forwarded body stays valid and
     /// blocking is never re-litigated per segment.
     pub fn apply_text_transforms(&self, phase: Phase, model: &str, text: &str) -> Option<String> {
+        // `Phase::Both` is a policy attribute, not an evaluation axis (see
+        // `evaluate`). Guard at runtime so a release build can't transform under
+        // an invalid axis.
+        if phase == Phase::Both {
+            debug_assert!(false, "apply_text_transforms requires Input or Output");
+            warn!("Nova Guard: apply_text_transforms called with Phase::Both; skipping");
+            return None;
+        }
         let state = self.state.load();
         if !state.enabled {
             return None;
@@ -797,8 +811,12 @@ mod tests {
                "config":{"phase":"input","entities":["EMAIL_ADDRESS"],"action":"redact"}}
             ]}"#,
         );
-        let out = e.apply_text_transforms(Phase::Input, "gpt-4o", "mail a@b.com");
-        assert_eq!(out.as_deref(), Some("mail [REDACTED]"));
+        // Input contains an SSN (which the block policy WOULD match) plus an
+        // email. apply_text_transforms must ignore the block and only redact the
+        // email — proving blocking is not re-litigated here. The SSN is left as-is
+        // because the block rule is not a transform.
+        let out = e.apply_text_transforms(Phase::Input, "gpt-4o", "ssn 123-45-6789 mail a@b.com");
+        assert_eq!(out.as_deref(), Some("ssn 123-45-6789 mail [REDACTED]"));
         // text with no email -> no transform
         assert!(e
             .apply_text_transforms(Phase::Input, "gpt-4o", "nothing here")

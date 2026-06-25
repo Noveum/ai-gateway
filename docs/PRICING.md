@@ -25,7 +25,10 @@ extractor, so cost is single-sourced.
 
 ## Provider coverage
 
-The gateway proxies and prices these providers (via `x-provider`):
+The gateway proxies these providers (via `x-provider`). All are priced from the
+table below **except OpenRouter**, which is a meta-router — it is priced only when
+the upstream model id it returns also appears in the table, and otherwise reports
+cost `0` (see [caveats](#caveats)).
 
 | Provider | `x-provider` | Endpoint / mode |
 |---|---|---|
@@ -40,7 +43,7 @@ The gateway proxies and prices these providers (via `x-provider`):
 | Google Gemini | `google` / `gemini` | OpenAI-compatibility endpoint (`/v1beta/openai`) |
 | DeepSeek | `deepseek` | OpenAI-compatible |
 | xAI (Grok) | `xai` / `grok` | OpenAI-compatible |
-| OpenRouter | `openrouter` | OpenAI-compatible |
+| OpenRouter | `openrouter` | OpenAI-compatible (routed; priced only if upstream model is in the table) |
 | Perplexity | `perplexity` | OpenAI-compatible |
 
 ## Pricing table (USD per 1M tokens)
