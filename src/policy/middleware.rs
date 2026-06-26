@@ -31,11 +31,21 @@ use super::synthetic::block_response;
 /// Max request/response body we will buffer for inspection (8 MiB).
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// State threaded into [`guard_middleware`]: the engine plus an optional provider
+/// of platform live cost/rate state (for `cost_cap`/`rate_limit`). `live` is
+/// `None` when platform-managed Nova Guard isn't configured.
+#[derive(Clone)]
+pub struct GuardState {
+    pub engine: Arc<PolicyEngine>,
+    pub live: Option<Arc<crate::policy::remote::RemoteLiveState>>,
+}
+
 pub async fn guard_middleware(
-    State(engine): State<Arc<PolicyEngine>>,
+    State(gs): State<GuardState>,
     req: Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
+    let engine = gs.engine.clone();
     // Fast path: nothing to enforce.
     if !engine.is_enabled() || engine.active_policy_count() == 0 {
         return next.run(req).await;
@@ -71,6 +81,13 @@ pub async fn guard_middleware(
         .unwrap_or("")
         .to_string();
 
+    // Live cost/rate counters from the platform (for cost_cap/rate_limit). `None`
+    // when platform-managed Nova Guard isn't configured → those policies fail open.
+    let live_state = match &gs.live {
+        Some(remote) => remote.get().await,
+        None => None,
+    };
+
     let mut forward_bytes = bytes.clone();
     let mut body_mutated = false;
 
@@ -83,7 +100,7 @@ pub async fn guard_middleware(
             &input_text,
             Some(&body_json),
             None,
-            None, // standalone: no live cost/rate state (control-plane path supplies it)
+            live_state.as_ref(),
         );
 
         log_decisions("input", &provider, &model, &result.decisions);
@@ -117,7 +134,7 @@ pub async fn guard_middleware(
     let response = next.run(forwarded).await;
 
     // --- OUTPUT PHASE ---
-    enforce_output(&engine, &provider, &model, response).await
+    enforce_output(&engine, &provider, &model, response, live_state.as_ref()).await
 }
 
 /// Should this request be inspected? POST, JSON, on the `/v1/` proxy path.
@@ -155,6 +172,7 @@ async fn enforce_output(
     provider: &str,
     model: &str,
     response: Response,
+    live_state: Option<&crate::policy::rules::LiveState>,
 ) -> Response {
     // Skip streaming responses (documented v1 limitation).
     let is_stream = response
@@ -229,7 +247,7 @@ async fn enforce_output(
         &output_text,
         Some(&body_json),
         None,
-        None,
+        live_state,
     );
     log_decisions("output", provider, model, &result.decisions);
 

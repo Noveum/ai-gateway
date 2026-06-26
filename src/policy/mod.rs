@@ -22,6 +22,9 @@
 pub mod config;
 pub mod decision;
 pub mod engine;
+// Translation layer for Noveum platform NovaGuard policies + live state. Pure +
+// shared; the native HTTP fetch is in `crate::policy::remote`.
+pub mod platform;
 pub mod pricing;
 pub mod rules;
 pub mod synthetic;
@@ -30,6 +33,11 @@ pub mod synthetic;
 // Worker builds the engine from an in-memory bundle (env var / KV) instead.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod source;
+
+// Native HTTP bridge to the Noveum platform NovaGuard API (reqwest) — fetches
+// policies + live cost/rate state.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod remote;
 
 // The Tower/Axum guard middleware is native-only; the Cloudflare Worker wires the
 // engine into `worker_rt` instead.

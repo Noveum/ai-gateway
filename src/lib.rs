@@ -75,6 +75,9 @@ pub struct AppState {
     /// The Nova Guard policy engine. Always present; when guardrails are disabled
     /// or no policies are loaded it evaluates to a no-op that allows every request.
     pub policy: Arc<PolicyEngine>,
+    /// Optional provider of platform live cost/rate state (for `cost_cap`/
+    /// `rate_limit`). `None` when platform-managed Nova Guard isn't configured.
+    pub live: Option<Arc<crate::policy::remote::RemoteLiveState>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -83,11 +86,13 @@ impl AppState {
         config: Arc<AppConfig>,
         metrics: Arc<MetricsRegistry>,
         policy: Arc<PolicyEngine>,
+        live: Option<Arc<crate::policy::remote::RemoteLiveState>>,
     ) -> Self {
         Self {
             config,
             metrics,
             policy,
+            live,
         }
     }
 }
@@ -118,7 +123,10 @@ pub fn build_router(state: AppState) -> Router {
         // Nova Guard policy enforcement runs closest to the handler so it sees the
         // final request and can short-circuit before the upstream provider call.
         .layer(from_fn_with_state(
-            state.policy.clone(),
+            policy::middleware::GuardState {
+                engine: state.policy.clone(),
+                live: state.live.clone(),
+            },
             policy::middleware::guard_middleware,
         ))
         // Telemetry capture wraps the policy layer so blocked requests are still

@@ -66,19 +66,45 @@ async fn main() {
             .await;
     }
 
-    // Nova Guard policy engine. Loads policies from the local source
-    // (`NOVEUM_GUARD_POLICIES_FILE` or inline `NOVEUM_GUARD_POLICIES`). On any
-    // load failure it degrades to a transparent pass-through so the gateway never
-    // fails to boot.
+    // Nova Guard policy engine. If platform-managed Nova Guard is configured
+    // (`NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID`), policies are fetched from the
+    // Noveum platform and live cost/rate state is queried per request; otherwise
+    // policies load from the local source (`NOVEUM_GUARD_POLICIES_FILE` / inline
+    // `NOVEUM_GUARD_POLICIES`). Any load failure degrades to a transparent
+    // pass-through so the gateway never fails to boot.
     info!("Initializing Nova Guard policy engine");
-    let policy_engine = Arc::new(PolicyEngine::from_env().await);
+    use noveum_ai_gateway::policy::engine::EngineOptions;
+    use noveum_ai_gateway::policy::remote::{RemoteConfig, RemoteLiveState};
+    let remote_cfg = RemoteConfig::from_env();
+    let (policy_engine, live) = match remote_cfg {
+        Some(cfg) => {
+            info!(
+                project = %cfg.project_id, api = %cfg.base_url,
+                "Nova Guard: fetching policies from the Noveum platform"
+            );
+            let engine = match noveum_ai_gateway::policy::remote::fetch_bundle(&cfg).await {
+                Ok(bundle) => PolicyEngine::from_bundle(&bundle, EngineOptions::from_env()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Nova Guard: platform policy fetch failed; falling back to local bundle");
+                    PolicyEngine::from_env().await
+                }
+            };
+            (Arc::new(engine), Some(Arc::new(RemoteLiveState::new(cfg))))
+        }
+        None => (Arc::new(PolicyEngine::from_env().await), None),
+    };
     info!(
-        "Nova Guard: {} active policies ({})",
+        "Nova Guard: {} active policies ({}{})",
         policy_engine.active_policy_count(),
         if policy_engine.is_enabled() {
             "enabled"
         } else {
             "disabled (pass-through)"
+        },
+        if live.is_some() {
+            ", platform live-state"
+        } else {
+            ""
         }
     );
 
@@ -88,6 +114,7 @@ async fn main() {
         config.clone(),
         metrics_registry.clone(),
         policy_engine.clone(),
+        live,
     );
     let app = build_router(state);
 

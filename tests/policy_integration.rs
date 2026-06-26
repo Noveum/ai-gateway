@@ -52,11 +52,15 @@ async fn canned_secret_handler() -> Response {
 }
 
 fn router(engine: PolicyEngine) -> Router {
-    let engine = Arc::new(engine);
+    // No platform live-state in tests (`live: None`) → cost_cap/rate_limit fail open.
+    let guard_state = noveum_ai_gateway::policy::middleware::GuardState {
+        engine: Arc::new(engine),
+        live: None,
+    };
     Router::new()
         .route("/v1/chat/completions", post(echo_handler))
         .route("/v1/canned", post(canned_secret_handler))
-        .layer(from_fn_with_state(engine, guard_middleware))
+        .layer(from_fn_with_state(guard_state, guard_middleware))
 }
 
 fn engine_from(json_bundle: &str) -> PolicyEngine {

@@ -122,6 +122,31 @@ pub struct EngineOptions {
     pub fail_open_default: bool,
 }
 
+impl EngineOptions {
+    /// Build options from the standard env vars (`NOVEUM_GUARD_ENABLED`,
+    /// `NOVEUM_GUARD_BLOCK_RESPONSE_MODE`). Shared by the local and the
+    /// platform-fetched policy paths so they enforce identically.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("NOVEUM_GUARD_ENABLED")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "false" | "0" | "no" | "off" | "disabled" | ""
+                )
+            })
+            .unwrap_or(true);
+        let block_mode = std::env::var("NOVEUM_GUARD_BLOCK_RESPONSE_MODE")
+            .map(|v| BlockResponseMode::from_env_str(&v))
+            .unwrap_or(BlockResponseMode::SyntheticSuccess);
+        Self {
+            enabled,
+            block_mode,
+            fail_open_default: true,
+        }
+    }
+}
+
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
