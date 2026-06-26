@@ -68,9 +68,17 @@ native. The request/response transforms (`apply_input_transforms`,
 are one shared codebase used by both targets — verified live against OpenAI,
 Groq, Gemini, and Anthropic on `noveum-ai-gateway.<account>.workers.dev`.
 
-**Remaining:** **Bedrock** (the one provider still needing AWS SigV4 via Web
-Crypto, `crypto.subtle`); edge telemetry sink + Workers-KV policies; re-enable
-`wasm-opt`.
+**Phase 3 — DONE (verified live).** **Bedrock** now runs on the edge: OpenAI →
+Bedrock Converse request, **AWS SigV4** signing implemented in pure Rust
+(`sha2`+`hmac` in `src/sigv4.rs`; simpler + more reliable than async Web Crypto,
+and unit-tested in native CI against RFC 4231), Converse→OpenAI response
+conversion, and **temporary-credential support** (`x-aws-session-token`) that the
+native path lacks. Verified live against `amazon.nova-micro-v1:0` with temporary
+STS credentials, including Nova Guard input block + redaction.
+
+**All 13 providers now run on the edge. Remaining:** edge telemetry sink +
+Workers-KV policies; re-enable `wasm-opt`; (optional) add session-token support
+to the native Bedrock path for full parity.
 
 ## How Cloudflare runs code (the constraint that drives everything)
 

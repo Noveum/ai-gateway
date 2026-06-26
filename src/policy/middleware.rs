@@ -205,7 +205,17 @@ async fn enforce_output(
         return Response::from_parts(parts, Body::from(bytes));
     };
 
-    let output_text = flatten_output_text(provider, &body_json);
+    // Native providers (notably Anthropic) convert the upstream body to OpenAI
+    // chat-completion shape BEFORE this middleware runs. Pick the flatten/transform
+    // shape from the ACTUAL body, not the `x-provider` name, so output enforcement
+    // never silently misses `choices[].message.content`.
+    let output_provider = if body_json.get("choices").is_some() {
+        "openai"
+    } else {
+        provider
+    };
+
+    let output_text = flatten_output_text(output_provider, &body_json);
     if output_text.is_empty() {
         return Response::from_parts(parts, Body::from(bytes));
     }
@@ -233,7 +243,7 @@ async fn enforce_output(
     // can't leak. Re-runs the transform per segment via the shared helper.
     if result.transformed_text.is_some() {
         let mut out_json = body_json;
-        if apply_output_transforms(engine, model, provider, &mut out_json) {
+        if apply_output_transforms(engine, model, output_provider, &mut out_json) {
             if let Ok(v) = serde_json::to_vec(&out_json) {
                 let mut parts = parts;
                 parts.headers.remove(header::CONTENT_LENGTH);

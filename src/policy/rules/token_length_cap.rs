@@ -142,8 +142,14 @@ mod tests {
 
     #[test]
     fn estimate_tokens_is_reasonable() {
-        let n = estimate_tokens("Hello, world! This is a test sentence.");
+        let text = "Hello, world! This is a test sentence.";
+        let n = estimate_tokens(text);
+        // Native: exact BPE count (well under 30 for this short sentence).
+        #[cfg(not(target_arch = "wasm32"))]
         assert!(n > 0 && n < 30, "got {n}");
+        // wasm32: a safe UPPER bound == UTF-8 byte length (never undercounts).
+        #[cfg(target_arch = "wasm32")]
+        assert_eq!(n, text.len() as u32, "wasm estimate must equal byte length");
     }
 
     #[test]

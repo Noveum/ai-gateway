@@ -78,6 +78,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.15.1", features = ["serde", "v4"] }
 regex = "1.12"                 # linear-time, ReDoS-safe matching (RegexSet, size limits)
 aho-corasick = "1.1"           # fast multi-pattern banned-substring matching
+sha2 = "0.10"                  # pure-Rust SHA-256 for AWS SigV4 (edge Bedrock); wasm-safe
+hmac = "0.12"                  # pure-Rust HMAC-SHA256 for the SigV4 signing-key chain
 jsonschema = { version = "0.46", default-features = false }  # JSON Schema validation (no http/file $ref resolvers — wasm-safe)
 arc-swap = "1.7"               # lock-free read-mostly policy cache
 

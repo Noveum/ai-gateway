@@ -99,6 +99,21 @@ and are not inspected; only `application/json` bodies run through Nova Guard.
 - **Anthropic**: path → `/v1/messages`, `Authorization: Bearer` → `x-api-key` +
   `anthropic-version`, and the response converted back to OpenAI Chat Completions
   shape — same as the native server.
+- **Bedrock**: OpenAI → Bedrock **Converse** request, **AWS SigV4**-signed in pure
+  Rust (`sha2`+`hmac`; see `src/sigv4.rs`) with credentials from `x-aws-*` headers,
+  and the Converse response converted back to OpenAI shape. Unlike native, the
+  edge also accepts **temporary credentials** via `x-aws-session-token`. Pass
+  `x-aws-access-key-id`, `x-aws-secret-access-key`, `x-aws-region` (+ optional
+  `x-aws-session-token`) instead of `Authorization`:
+
+  ```bash
+  curl $GW/v1/chat/completions -H "x-provider: bedrock" \
+    -H "x-aws-access-key-id: $AWS_ACCESS_KEY_ID" \
+    -H "x-aws-secret-access-key: $AWS_SECRET_ACCESS_KEY" \
+    -H "x-aws-session-token: $AWS_SESSION_TOKEN" \
+    -H "x-aws-region: us-east-1" -H "Content-Type: application/json" \
+    -d '{"model":"amazon.nova-micro-v1:0","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
+  ```
 - **SSE streaming**: passed through unbuffered (input redaction still applies;
   output-phase enforcement is skipped on streams — the documented v1 limitation,
   identical to native).
@@ -120,9 +135,10 @@ The same Nova Guard policy schema, decisions, and redactions run here as on the
 native server (the engine + request/response shaping are one shared codebase).
 Note the redact replacement key is **`redactWith`** (see `wrangler.toml`).
 
-**Next (see [CLOUDFLARE_DEPLOYMENT.md](CLOUDFLARE_DEPLOYMENT.md)):**
-- **Bedrock** — the one remaining provider; needs **AWS SigV4 via Web Crypto**
-  (`crypto.subtle`) since native crypto crates don't run on wasm.
+**All 13 providers now run on the edge** (OpenAI-compatible set + Anthropic +
+Bedrock). **Next (see [CLOUDFLARE_DEPLOYMENT.md](CLOUDFLARE_DEPLOYMENT.md)):**
 - Edge telemetry sink (Workers Analytics Engine / Queues) and Workers-KV policies.
 - Re-enable `wasm-opt` to shrink the bundle (currently ~3.3 MB unoptimized;
   gzips to ~1 MB, well under the 10 MB paid-plan limit).
+- Optionally add `x-aws-session-token` support to the **native** Bedrock path too
+  (the edge already supports temporary credentials).

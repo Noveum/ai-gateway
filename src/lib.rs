@@ -24,6 +24,7 @@
 // shape.
 pub mod policy;
 pub mod routing;
+pub mod sigv4;
 
 // Native runtime (Tokio + Axum server): the binary, Docker image, and library
 // server. Not compiled for the wasm32 (Cloudflare Worker) target.

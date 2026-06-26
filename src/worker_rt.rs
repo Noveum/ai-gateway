@@ -10,10 +10,12 @@
 //! Parity with the native server: same provider routing, same `x-provider`
 //! contract, header pass‑through, query pass‑through, same Nova Guard
 //! input/output decisions + redaction, the same block response modes
-//! (`NOVEUM_GUARD_BLOCK_RESPONSE_MODE`), and the same Anthropic→OpenAI response
-//! conversion. Streaming responses pass through without output‑phase enforcement
-//! (the documented v1 limitation, identical to native). Non‑JSON `/v1/*` bodies
-//! are forwarded byte‑for‑byte. Bedrock (AWS SigV4 via Web Crypto) lands later.
+//! (`NOVEUM_GUARD_BLOCK_RESPONSE_MODE`), and the same Anthropic→OpenAI and
+//! Bedrock-Converse→OpenAI response conversions. Bedrock is signed with AWS
+//! SigV4 (see [`crate::sigv4`]) and additionally supports temporary credentials
+//! (`x-aws-session-token`). Streaming responses pass through without output‑phase
+//! enforcement (the documented v1 limitation, identical to native). Non‑JSON
+//! `/v1/*` bodies are forwarded byte‑for‑byte.
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -23,9 +25,68 @@ use crate::policy::decision::{Phase, PolicyDecision};
 use crate::policy::synthetic::{block_body, block_status, policy_header_token, BlockResponseMode};
 use crate::policy::PolicyEngine;
 use crate::routing::{
-    apply_input_transforms, apply_output_transforms, flatten_input_text, flatten_output_text,
-    resolve_provider, transform_anthropic_to_openai_format, upstream_url,
+    apply_input_transforms, apply_output_transforms, bedrock_converse_to_openai,
+    flatten_input_text, flatten_output_text, openai_to_bedrock_converse, resolve_provider,
+    transform_anthropic_to_openai_format, upstream_url,
 };
+use crate::sigv4;
+
+/// Default Bedrock model + region (mirrors the native `BedrockProvider`).
+const BEDROCK_DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
+const BEDROCK_DEFAULT_REGION: &str = "us-east-1";
+
+/// AWS credentials for a Bedrock request, taken from `x-aws-*` headers.
+struct BedrockCreds {
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+    region: String,
+}
+
+/// Extract Bedrock credentials from request headers (supports temporary creds
+/// via `x-aws-session-token`, which the native path does not).
+fn bedrock_credentials(req: &Request) -> Option<BedrockCreds> {
+    let h = req.headers();
+    let access_key = h.get("x-aws-access-key-id").ok().flatten()?;
+    let secret_key = h.get("x-aws-secret-access-key").ok().flatten()?;
+    let session_token = h.get("x-aws-session-token").ok().flatten();
+    let region = h
+        .get("x-aws-region")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| BEDROCK_DEFAULT_REGION.to_string());
+    Some(BedrockCreds {
+        access_key,
+        secret_key,
+        session_token,
+        region,
+    })
+}
+
+/// Current UTC time as SigV4 `(amz_date = YYYYMMDDTHHMMSSZ, datestamp = YYYYMMDD)`.
+fn amz_timestamps() -> (String, String) {
+    let d = js_sys::Date::new_0();
+    let year = d.get_utc_full_year();
+    let month = d.get_utc_month() + 1; // JS months are 0-based
+    let day = d.get_utc_date();
+    let hour = d.get_utc_hours();
+    let min = d.get_utc_minutes();
+    let sec = d.get_utc_seconds();
+    let datestamp = format!("{year:04}{month:02}{day:02}");
+    let amz_date = format!("{datestamp}T{hour:02}{min:02}{sec:02}Z");
+    (amz_date, datestamp)
+}
+
+/// The bytes to forward upstream: redacted JSON re-serialized, else the original
+/// request bytes verbatim.
+fn forward_body_bytes(redacted: bool, body_json: &Option<Value>, original: &[u8]) -> Vec<u8> {
+    if redacted {
+        if let Some(j) = body_json {
+            return serde_json::to_vec(j).unwrap_or_else(|_| original.to_vec());
+        }
+    }
+    original.to_vec()
+}
 
 /// Max response size we will buffer for output-phase inspection. Larger
 /// responses pass through uninspected (matches native; avoids OOM on the
@@ -204,8 +265,9 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .flatten()
         .unwrap_or_else(|| "openai".to_string());
     let is_anthropic = provider.eq_ignore_ascii_case("anthropic");
+    let is_bedrock = provider.eq_ignore_ascii_case("bedrock");
     let route = resolve_provider(&provider);
-    if route.is_none() && !is_anthropic {
+    if route.is_none() && !is_anthropic && !is_bedrock {
         return Response::error(
             format!("Unsupported or not-yet-ported provider on edge: {provider}"),
             400,
@@ -235,9 +297,9 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Read the raw request body once.
     let body_bytes = req.bytes().await.unwrap_or_default();
 
-    // Parse JSON only when we actually need to inspect it (guard on). A
-    // transparent proxy forwards the original bytes byte-for-byte.
-    let mut body_json: Option<Value> = if guard_active && is_json_req {
+    // Parse JSON when we need to inspect (guard on) or transform it (Bedrock
+    // converts OpenAI→Converse). A transparent proxy forwards bytes byte-for-byte.
+    let mut body_json: Option<Value> = if (guard_active || is_bedrock) && is_json_req {
         serde_json::from_slice(&body_bytes).ok()
     } else {
         None
@@ -264,37 +326,86 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
     }
 
-    // --- Build the outbound request (forward client headers + provider auth) ---
-    let out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
-    let url = if is_anthropic {
+    // --- Build the outbound request (provider-specific routing/auth/body) ---
+    let url: String;
+    let out_headers: Headers;
+    let forward_bytes: Vec<u8>;
+
+    if is_bedrock {
+        // AWS Bedrock Converse, signed with SigV4 (temporary creds supported).
+        let Some(creds) = bedrock_credentials(&req) else {
+            return Response::error(
+                "Bedrock requires x-aws-access-key-id and x-aws-secret-access-key headers",
+                400,
+            );
+        };
+        let Some(body) = body_json.as_ref() else {
+            return Response::error("Bedrock requires a JSON chat-completions body", 400);
+        };
+        let effective_model = if model.is_empty() {
+            BEDROCK_DEFAULT_MODEL
+        } else {
+            model.as_str()
+        };
+        forward_bytes = serde_json::to_vec(&openai_to_bedrock_converse(body)).unwrap_or_default();
+
+        let host = format!("bedrock-runtime.{}.amazonaws.com", creds.region);
+        // Wire path keeps the literal `:` (AWS re-encodes it); ARN `/` → %2F so
+        // the id stays one segment. The SigV4 canonical URI must additionally
+        // encode `:` → %3A to match AWS's canonicalization (what `aws-sigv4` does
+        // internally on the native path).
+        let wire_uri = format!("/model/{}/converse", effective_model.replace('/', "%2F"));
+        let canonical_uri = wire_uri.replace(':', "%3A");
+        url = format!("https://{host}{wire_uri}");
+
+        let (amz_date, datestamp) = amz_timestamps();
+        let signed = sigv4::sign(
+            "POST",
+            &host,
+            &canonical_uri,
+            "",
+            &forward_bytes,
+            &creds.access_key,
+            &creds.secret_key,
+            creds.session_token.as_deref(),
+            &creds.region,
+            "bedrock",
+            &amz_date,
+            &datestamp,
+        );
+        out_headers = Headers::new();
+        out_headers.set("content-type", "application/json")?;
+        out_headers.set("x-amz-date", &signed.amz_date)?;
+        out_headers.set("authorization", &signed.authorization)?;
+        if let Some(token) = &signed.security_token {
+            out_headers.set("x-amz-security-token", token)?;
+        }
+    } else if is_anthropic {
         // Anthropic uses x-api-key + anthropic-version, not Bearer auth.
+        out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
         out_headers.delete("authorization")?;
         out_headers.set("anthropic-version", "2023-06-01")?;
         if let Ok(Some(auth)) = req.headers().get("authorization") {
             out_headers.set("x-api-key", auth.trim_start_matches("Bearer ").trim())?;
         }
-        "https://api.anthropic.com/v1/messages".to_string()
+        url = "https://api.anthropic.com/v1/messages".to_string();
+        forward_bytes = forward_body_bytes(redacted, &body_json, &body_bytes);
     } else {
         let route = route.expect("checked above");
+        out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
         let base = upstream_url(&route, &path);
-        match &query {
+        url = match &query {
             Some(q) => format!("{base}?{q}"),
             None => base,
-        }
-    };
+        };
+        forward_bytes = forward_body_bytes(redacted, &body_json, &body_bytes);
+    }
 
-    // Forward the redacted JSON (re-serialized) or the original bytes verbatim.
     let mut init = RequestInit::new();
     init.with_method(Method::Post).with_headers(out_headers);
-    if redacted {
-        if let Some(j) = &body_json {
-            init.with_body(Some(serde_json::to_string(j).unwrap_or_default().into()));
-        }
-    } else {
-        let arr = js_sys::Uint8Array::new_with_length(body_bytes.len() as u32);
-        arr.copy_from(&body_bytes);
-        init.with_body(Some(arr.into()));
-    }
+    let arr = js_sys::Uint8Array::new_with_length(forward_bytes.len() as u32);
+    arr.copy_from(&forward_bytes);
+    init.with_body(Some(arr.into()));
     let out_req = Request::new_with_init(&url, &init)?;
     let mut resp = Fetch::Request(out_req).send().await?;
 
@@ -313,9 +424,9 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return passthrough(resp);
     }
 
-    // Non-streaming: only buffer when we must transform (Anthropic) or run the
-    // output phase; otherwise stream the upstream response straight back.
-    if !is_anthropic && !guard_active {
+    // Non-streaming: only buffer when we must transform (Anthropic/Bedrock) or
+    // run the output phase; otherwise stream the upstream response straight back.
+    if !is_anthropic && !is_bedrock && !guard_active {
         return passthrough(resp);
     }
 
@@ -359,11 +470,20 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
     };
 
-    // Anthropic → OpenAI shape for parity (only successful responses carry the
-    // Messages body; errors pass through as-is).
-    if is_anthropic && (200..300).contains(&status) {
+    // Convert provider-native responses to OpenAI shape for parity (only on 2xx;
+    // error envelopes pass through unchanged).
+    if (200..300).contains(&status) {
         let created = (Date::now().as_millis() / 1000) as i64;
-        out_json = transform_anthropic_to_openai_format(out_json, created);
+        if is_bedrock {
+            let model_name = if model.is_empty() {
+                BEDROCK_DEFAULT_MODEL
+            } else {
+                model.as_str()
+            };
+            out_json = bedrock_converse_to_openai(&out_json, model_name, created);
+        } else if is_anthropic {
+            out_json = transform_anthropic_to_openai_format(out_json, created);
+        }
     }
 
     // Output phase — every edge response is OpenAI-shaped at this point.

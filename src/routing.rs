@@ -380,6 +380,90 @@ pub fn transform_anthropic_to_openai_format(anthropic_response: Value, created_t
     transformed
 }
 
+/// Convert an OpenAI chat-completions body into the AWS Bedrock **Converse** API
+/// request shape. Mirrors the native `BedrockProvider::transform_request_body`
+/// (defaults: maxTokens 1000, temperature 0.7, topP 1.0).
+pub fn openai_to_bedrock_converse(body: &Value) -> Value {
+    // Already Converse-shaped → pass through.
+    if body.get("inferenceConfig").is_some() {
+        return body.clone();
+    }
+
+    let messages = body.get("messages").and_then(|m| m.as_array());
+    let transformed: Vec<Value> = messages
+        .map(|arr| {
+            arr.iter()
+                .map(|msg| {
+                    let content = msg
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    json!({
+                        "role": msg.get("role").and_then(|r| r.as_str()).unwrap_or("user"),
+                        "content": [{ "text": content }],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "messages": transformed,
+        "inferenceConfig": {
+            "maxTokens": body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(1000),
+            "temperature": body.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7),
+            "topP": body.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0),
+        }
+    })
+}
+
+/// Convert an AWS Bedrock **Converse** API response into OpenAI Chat Completions
+/// shape. Mirrors the native `BedrockProvider::transform_bedrock_to_openai_format`.
+/// `created_ts` is passed in (chrono is unavailable on wasm32).
+pub fn bedrock_converse_to_openai(resp: &Value, model: &str, created_ts: i64) -> Value {
+    let content = resp
+        .get("output")
+        .and_then(|o| o.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|f| f.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+
+    let usage = resp.get("usage");
+    let tok = |k: &str| {
+        usage
+            .and_then(|u| u.get(k))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+
+    let finish_reason = match resp.get("stopReason").and_then(|s| s.as_str()) {
+        Some("end_turn") => "stop",
+        Some("max_tokens") => "length",
+        Some("stop_sequence") => "stop",
+        _ => "stop",
+    };
+
+    json!({
+        "id": format!("chatcmpl-bedrock-{created_ts}"),
+        "object": "chat.completion",
+        "created": created_ts,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": content },
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": tok("inputTokens"),
+            "completion_tokens": tok("outputTokens"),
+            "total_tokens": tok("totalTokens"),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +647,42 @@ mod tests {
         let content = body["messages"][0]["content"].as_str().unwrap();
         assert!(content.contains("[MASKED]"), "got: {content}");
         assert!(!content.contains("secret"));
+    }
+
+    #[test]
+    fn openai_to_bedrock_converse_shapes_messages_and_config() {
+        let body = json!({
+            "model": "amazon.titan-text-premier-v1:0",
+            "max_tokens": 256,
+            "temperature": 0.2,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let out = openai_to_bedrock_converse(&body);
+        assert_eq!(out["messages"][0]["role"], "user");
+        assert_eq!(out["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(out["inferenceConfig"]["maxTokens"], 256);
+        assert_eq!(out["inferenceConfig"]["temperature"], 0.2);
+        assert_eq!(out["inferenceConfig"]["topP"], 1.0); // default
+                                                         // Already-Converse bodies pass through unchanged.
+        let passthrough = json!({"messages": [], "inferenceConfig": {"maxTokens": 1}});
+        assert_eq!(openai_to_bedrock_converse(&passthrough), passthrough);
+    }
+
+    #[test]
+    fn bedrock_converse_to_openai_maps_content_usage_and_finish() {
+        let resp = json!({
+            "output": {"message": {"content": [{"text": "hi there"}]}},
+            "stopReason": "max_tokens",
+            "usage": {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}
+        });
+        let out =
+            bedrock_converse_to_openai(&resp, "amazon.titan-text-premier-v1:0", 1_700_000_000);
+        assert_eq!(out["object"], "chat.completion");
+        assert_eq!(out["created"], 1_700_000_000);
+        assert_eq!(out["choices"][0]["message"]["content"], "hi there");
+        assert_eq!(out["choices"][0]["finish_reason"], "length");
+        assert_eq!(out["usage"]["prompt_tokens"], 7);
+        assert_eq!(out["usage"]["completion_tokens"], 3);
+        assert_eq!(out["usage"]["total_tokens"], 10);
     }
 }
