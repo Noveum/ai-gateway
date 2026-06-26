@@ -10,6 +10,7 @@
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
+use crate::routing::transform_anthropic_to_openai_format;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
@@ -18,7 +19,7 @@ use axum::{
     http::{HeaderValue, Response},
 };
 use chrono;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::cell::RefCell;
 use tracing::{debug, error};
 
@@ -207,8 +208,22 @@ impl Provider for AnthropicProvider {
             // Extract the ID from the JSON response for later use
             let json_id = json.get("id").and_then(|v| v.as_str()).map(String::from);
 
-            // Transform Anthropic API response to OpenAI format
-            let transformed_response = transform_anthropic_to_openai_format(json);
+            // Only convert SUCCESSFUL Messages responses to OpenAI shape. For
+            // 4xx/5xx, preserve the upstream Anthropic error envelope + status
+            // (matches the edge Worker) instead of emitting an empty
+            // "chat.completion" payload.
+            if !parts.status.is_success() {
+                debug!(
+                    "Anthropic returned {}; passing the error body through unchanged",
+                    parts.status
+                );
+                return Ok(Response::from_parts(parts, Body::from(bytes)));
+            }
+
+            // Transform Anthropic API response to OpenAI format (shared with the
+            // edge Worker; timestamp passed in since chrono is wasm-unavailable).
+            let transformed_response =
+                transform_anthropic_to_openai_format(json, chrono::Utc::now().timestamp());
             debug!("Transformed Anthropic response to OpenAI format");
 
             // Ensure x-request-id header is set in the response
@@ -418,115 +433,10 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
 }
 
 // Convert Anthropic API response format to OpenAI format
-fn transform_anthropic_to_openai_format(anthropic_response: Value) -> Value {
-    // Extract content from Anthropic's array-based content structure
-    let content =
-        if let Some(content_array) = anthropic_response.get("content").and_then(|c| c.as_array()) {
-            // Extract text content from content array (typically contains objects with "type" and "text")
-            let mut text = String::new();
-            for item in content_array {
-                if let Some(item_text) = item.get("text").and_then(|t| t.as_str()) {
-                    text.push_str(item_text);
-                }
-            }
-            text
-        } else {
-            // Fallback if content structure is different
-            anthropic_response
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-
-    // Map Anthropic usage fields to OpenAI format
-    let usage = {
-        let mut usage_map = json!({
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        });
-
-        if let Some(anthropic_usage) = anthropic_response.get("usage") {
-            // Map input_tokens to prompt_tokens
-            if let Some(input_tokens) = anthropic_usage.get("input_tokens").and_then(|t| t.as_u64())
-            {
-                usage_map["prompt_tokens"] = json!(input_tokens);
-            }
-
-            // Map output_tokens to completion_tokens
-            if let Some(output_tokens) = anthropic_usage
-                .get("output_tokens")
-                .and_then(|t| t.as_u64())
-            {
-                usage_map["completion_tokens"] = json!(output_tokens);
-            }
-
-            // Calculate total tokens
-            let prompt_tokens = usage_map["prompt_tokens"].as_u64().unwrap_or(0);
-            let completion_tokens = usage_map["completion_tokens"].as_u64().unwrap_or(0);
-            usage_map["total_tokens"] = json!(prompt_tokens + completion_tokens);
-        }
-
-        usage_map
-    };
-
-    // Map stop_reason to finish_reason (Anthropic uses "end_turn", "max_tokens", etc.)
-    let finish_reason = match anthropic_response
-        .get("stop_reason")
-        .and_then(|r| r.as_str())
-    {
-        Some("end_turn") => "stop",
-        Some("max_tokens") => "length",
-        Some("stop_sequence") => "stop",
-        Some(reason) => reason,
-        None => "stop", // Default
-    };
-
-    // Create OpenAI-compatible format
-    let mut transformed = json!({
-        "id": anthropic_response.get("id").unwrap_or(&Value::Null),
-        "object": "chat.completion",
-        "created": chrono::Utc::now().timestamp(),
-        "model": anthropic_response.get("model").unwrap_or(&Value::Null),
-        "type": anthropic_response.get("type").unwrap_or(&json!("message")),
-        "role": anthropic_response.get("role").unwrap_or(&json!("assistant")),
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": anthropic_response.get("role").unwrap_or(&json!("assistant")),
-                "content": content
-            },
-            "finish_reason": finish_reason
-        }],
-        "usage": usage,
-        "system_fingerprint": format!("anthropic-{}", anthropic_response.get("model").and_then(|m| m.as_str()).unwrap_or("claude"))
-    });
-
-    // Handle the seed value - convert to string if present to avoid integer overflow in downstream stores
-    if let Some(seed) = anthropic_response.get("seed") {
-        if let Some(choices) = transformed
-            .get_mut("choices")
-            .and_then(|c| c.as_array_mut())
-        {
-            for choice in choices {
-                if seed.is_number() {
-                    // Convert the numeric seed to a string to avoid integer range issues in downstream stores
-                    choice["seed"] = json!(seed.to_string());
-                } else {
-                    // If it's already a string or other type, just preserve it
-                    choice["seed"] = seed.clone();
-                }
-            }
-        }
-    }
-
-    transformed
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn hdr(auth: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -600,8 +510,9 @@ mod tests {
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 5, "output_tokens": 2}
         });
-        let out = transform_anthropic_to_openai_format(anthropic);
+        let out = transform_anthropic_to_openai_format(anthropic, 1_700_000_000);
         assert_eq!(out["object"], "chat.completion");
+        assert_eq!(out["created"], 1_700_000_000);
         assert_eq!(out["choices"][0]["message"]["content"], "Hello world");
         assert_eq!(out["choices"][0]["finish_reason"], "stop");
         assert_eq!(out["usage"]["prompt_tokens"], 5);

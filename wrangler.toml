@@ -1,0 +1,32 @@
+# Cloudflare Worker config for the Noveum AI Gateway (edge/WASM deployment).
+#
+# Build:   worker-build --release        (compiles the crate to wasm32 + JS shim)
+# Dev:     npx wrangler dev               (runs locally in workerd at :8787)
+# Deploy:  npx wrangler deploy            (publishes to the global edge)
+#
+# The native binary / Docker image (the published `noveum-ai-gateway` crate) is
+# unaffected by this file — it is a separate deployment shape of the same package.
+name = "noveum-ai-gateway"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-11-01"
+
+[build]
+command = "worker-build --release"
+
+# Nova Guard configuration. The checked-in default is a TRANSPARENT proxy:
+# no policies are loaded, so `wrangler dev`/`wrangler deploy` will not mutate or
+# reject any traffic. Opt in by setting `NOVEUM_GUARD_POLICIES` (inline JSON, the
+# same schema as the native `nova-guard.json`) — uncomment the example below or,
+# for production, use a `wrangler secret` / Workers KV (see
+# docs/CLOUDFLARE_DEPLOYMENT.md). Optional: `NOVEUM_GUARD_BLOCK_RESPONSE_MODE`
+# (`guard_error` | `provider_error`).
+#
+# Example policy set exercising all three enforcement paths (do NOT enable
+# blindly on a shared deployment — it will block SSNs and redact phones/emails):
+#   NOVEUM_GUARD_POLICIES = '{"policies":[
+#     {"name":"block-ssn-input","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"ssn","regex":"\\d{3}-\\d{2}-\\d{4}"}],"action":"block"}},
+#     {"name":"redact-input-phone","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"phone","regex":"\\d{3}-\\d{3}-\\d{4}"}],"action":"redact","redactWith":"[PHONE]"}},
+#     {"name":"redact-output-email","type":"regex_match","mode":"enforce","config":{"phase":"output","patterns":[{"name":"email","regex":"[\\w.+-]+@[\\w-]+\\.[\\w.-]+"}],"action":"redact","redactWith":"[EMAIL]"}}
+#   ]}'
+[vars]
+# (no NOVEUM_GUARD_POLICIES → transparent proxy; set it to enable Nova Guard)

@@ -26,6 +26,12 @@ exclude = [
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+# Cloudflare Worker (worker-build/wasm-pack) build settings. wasm-opt is disabled
+# here because it requires a binaryen install on PATH; enable it in CI once
+# binaryen is available to shrink the bundle further.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -34,41 +40,73 @@ panic = "abort"
 strip = true
 debug = false
 
+# One package, three deployment shapes:
+#   * native binary / Docker  → `cargo build` (default, x86_64/arm64)
+#   * Rust library            → `noveum-ai-gateway` as a dependency (rlib)
+#   * Cloudflare Worker (edge)→ `cargo build --target wasm32-unknown-unknown` (cdylib)
+# The Nova Guard engine + pricing + policy types in `[dependencies]` compile to
+# BOTH targets; runtime-specific deps are split by target below.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The native server binary. `required-features = ["native"]` (on by default) keeps
+# it OUT of the wasm32 / Cloudflare Worker build, which is compiled with
+# `--no-default-features` (the Worker entry point is the cdylib lib, not a bin).
+[[bin]]
+name = "noveum-ai-gateway"
+path = "src/main.rs"
+required-features = ["native"]
+
+[features]
+default = ["native"]
+# Marker feature gating the native binary; native runtime deps are selected by
+# target (`cfg(not(target_arch = "wasm32"))`), not by this feature.
+native = []
+
+# --- Shared core: compiles on native AND wasm32 (Nova Guard, pricing, types) ---
 [dependencies]
+http = "1.0"
+bytes = { version = "1.5.0", features = ["serde"] }
+futures = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
+once_cell = "1.18"
+thiserror = "2.0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = { version = "0.1", features = ["attributes"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.15.1", features = ["serde", "v4"] }
+regex = "1.12"                 # linear-time, ReDoS-safe matching (RegexSet, size limits)
+aho-corasick = "1.1"           # fast multi-pattern banned-substring matching
+sha2 = "0.10"                  # pure-Rust SHA-256 for AWS SigV4 (edge Bedrock); wasm-safe
+hmac = "0.12"                  # pure-Rust HMAC-SHA256 for the SigV4 signing-key chain
+jsonschema = { version = "0.46", default-features = false }  # JSON Schema validation (no http/file $ref resolvers — wasm-safe)
+arc-swap = "1.7"               # lock-free read-mostly policy cache
+
+# --- Native only: the Tokio/Axum server (Docker, binary, library server) ---
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 axum = { version = "0.7", features = ["http2", "tokio"] }
 tokio = { version = "1.0", features = ["full", "parking_lot", "rt-multi-thread"] }
 tokio-stream = "0.1"
 hyper = { version = "0.14", features = ["client", "runtime"] }
 tower-http = { version = "0.6.2", features = ["cors", "compression-full"] }
-tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 reqwest = { version = "0.12.9", features = ["stream", "json", "rustls-tls", "http2", "gzip", "brotli"], default-features = false }
-http = "1.0"
-bytes = { version = "1.5.0", features = ["serde"] }
 dotenv = "0.15"
-futures-util = { version = "0.3", features = ["io"] }
-futures = "0.3"
-once_cell = "1.18"
 async-trait = "0.1"
-thiserror = "2.0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 num_cpus = "1.15"
 aws-sigv4 = "1.2.5"
 aws-credential-types = "1.2.1"
-chrono = { version = "0.4", features = ["serde"] }
 aws_event_stream_parser = "0.1.2"
 parking_lot = "0.12"
-uuid = { version = "1.15.1", features = ["serde", "v4"] }
 colored = "2.1.0"
-
-# --- Nova Guard policy-enforcement layer ---
-regex = "1.12"                 # linear-time, ReDoS-safe matching (RegexSet, size limits)
-aho-corasick = "1.1"           # fast multi-pattern banned-substring matching
-jsonschema = "0.46"            # JSON Schema validation for structured-output policies
-tiktoken-rs = "0.12"           # token counting for cost estimation / token-cap policies
-arc-swap = "1.7"               # lock-free read-mostly policy cache
+tiktoken-rs = "0.12"           # token counting (native); wasm uses a char heuristic
 async-stream = "0.3"           # SSE tee for post-call streaming policy evaluation
+
+# --- Cloudflare Worker only: WASM runtime + edge fetch ---
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = { version = "0.8", features = ["http"] }
+uuid = { version = "1.15.1", features = ["js"] }   # v4 randomness on wasm
 
 [dev-dependencies]
 noveum-ai-gateway = { path = "." }

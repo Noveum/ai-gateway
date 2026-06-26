@@ -15,9 +15,12 @@ WORKDIR /usr/src/app
 # Copy only necessary files first
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy main.rs to build dependencies
+# Create dummy sources to pre-build dependencies. The crate now exposes BOTH a
+# library target (the Cloudflare Worker / Rust-library shape — see [lib] in
+# Cargo.toml) and the binary, so cargo needs src/lib.rs to exist here too.
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs && \
     cargo build --release --target x86_64-unknown-linux-gnu && \
     rm -rf src
 

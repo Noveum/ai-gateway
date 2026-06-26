@@ -144,160 +144,11 @@ fn header_str<B>(req: &Request<B>, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Flatten the user-supplied input text from a chat/completions-style body.
-///
-/// Handles OpenAI/Anthropic `messages[].content` (string or array-of-parts),
-/// Anthropic top-level `system`, and a plain `prompt` string.
-pub fn flatten_input_text(json: &Value) -> String {
-    let mut out = String::new();
-
-    if let Some(system) = json.get("system").and_then(|s| s.as_str()) {
-        out.push_str(system);
-        out.push('\n');
-    }
-
-    if let Some(prompt) = json.get("prompt").and_then(|p| p.as_str()) {
-        out.push_str(prompt);
-        out.push('\n');
-    }
-
-    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
-        for msg in messages {
-            match msg.get("content") {
-                Some(Value::String(s)) => {
-                    out.push_str(s);
-                    out.push('\n');
-                }
-                Some(Value::Array(parts)) => {
-                    for part in parts {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            out.push_str(t);
-                            out.push('\n');
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    out
-}
-
-/// Apply input transforms to every text segment in the body in place, including
-/// array-form (multimodal) content parts and array-form `system` blocks so that
-/// PII/secret redaction is never silently skipped for structured content.
-///
-/// Returns true if anything was mutated. Uses the engine's transform-only path
-/// (the aggregate block decision was already made over the flattened text), so
-/// blocking is not re-litigated per segment and cost/rate/token policies do not
-/// re-run here.
-fn apply_input_transforms(engine: &PolicyEngine, model: &str, json: &mut Value) -> bool {
-    let mut changed = false;
-    let transform = |s: &str| engine.apply_text_transforms(Phase::Input, model, s);
-
-    // Mutate one JSON string field in place if a transform changed it.
-    fn rewrite_string(
-        v: &mut Value,
-        transform: &dyn Fn(&str) -> Option<String>,
-        changed: &mut bool,
-    ) {
-        if let Value::String(s) = v {
-            if let Some(t) = transform(s) {
-                if &t != s {
-                    *v = Value::String(t);
-                    *changed = true;
-                }
-            }
-        }
-    }
-
-    // Mutate either a string field or every `.text` in an array-of-parts.
-    fn rewrite_content(
-        v: &mut Value,
-        transform: &dyn Fn(&str) -> Option<String>,
-        changed: &mut bool,
-    ) {
-        match v {
-            Value::String(_) => rewrite_string(v, transform, changed),
-            Value::Array(parts) => {
-                for part in parts.iter_mut() {
-                    if let Some(text) = part.get_mut("text") {
-                        rewrite_string(text, transform, changed);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(prompt) = json.get_mut("prompt") {
-        rewrite_string(prompt, &transform, &mut changed);
-    }
-    if let Some(system) = json.get_mut("system") {
-        // Anthropic `system` may be a string or an array of text blocks.
-        rewrite_content(system, &transform, &mut changed);
-    }
-    if let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for msg in messages.iter_mut() {
-            if let Some(content) = msg.get_mut("content") {
-                rewrite_content(content, &transform, &mut changed);
-            }
-        }
-    }
-
-    changed
-}
-
-/// Extract the assistant text from a provider response body.
-pub fn flatten_output_text(provider: &str, json: &Value) -> String {
-    match provider {
-        "anthropic" => json
-            .get("content")
-            .and_then(|c| c.as_array())
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default(),
-        "google" | "gemini" => json
-            .get("candidates")
-            .and_then(|c| c.as_array())
-            .map(|cands| {
-                cands
-                    .iter()
-                    .filter_map(|c| c.get("content").and_then(|ct| ct.get("parts")))
-                    .filter_map(|p| p.as_array())
-                    .flat_map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default(),
-        // OpenAI / compatible
-        _ => json
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .map(|choices| {
-                choices
-                    .iter()
-                    .filter_map(|c| {
-                        c.get("message")
-                            .and_then(|m| m.get("content"))
-                            .and_then(|c| c.as_str())
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default(),
-    }
-}
+// Request/response shaping is shared with the Cloudflare Worker so input/output
+// scanning + transforms are byte-identical on both deployment shapes.
+pub use crate::routing::{
+    apply_input_transforms, apply_output_transforms, flatten_input_text, flatten_output_text,
+};
 
 async fn enforce_output(
     engine: &PolicyEngine,
@@ -354,7 +205,20 @@ async fn enforce_output(
         return Response::from_parts(parts, Body::from(bytes));
     };
 
-    let output_text = flatten_output_text(provider, &body_json);
+    // Native providers (notably Anthropic) convert the upstream body to OpenAI
+    // chat-completion shape BEFORE this middleware runs. Pick the flatten/transform
+    // shape from the ACTUAL body, not the `x-provider` name, so output enforcement
+    // never silently misses `choices[].message.content`.
+    // `x-provider` is case-insensitive; normalize so e.g. "Gemini" still matches
+    // the `candidates` shape instead of silently failing open.
+    let provider_key = provider.to_ascii_lowercase();
+    let output_provider = if body_json.get("choices").is_some() {
+        "openai"
+    } else {
+        provider_key.as_str()
+    };
+
+    let output_text = flatten_output_text(output_provider, &body_json);
     if output_text.is_empty() {
         return Response::from_parts(parts, Body::from(bytes));
     }
@@ -377,10 +241,12 @@ async fn enforce_output(
         return block_response(provider, model, block, engine.block_mode());
     }
 
-    // Output transform: rewrite the assistant text in place for the common shapes.
-    if let Some(transformed) = &result.transformed_text {
+    // Output transform: redact EVERY assistant text segment in place (all
+    // choices / content blocks), not just the first, so multi-choice responses
+    // can't leak. Re-runs the transform per segment via the shared helper.
+    if result.transformed_text.is_some() {
         let mut out_json = body_json;
-        if rewrite_output_text(provider, &mut out_json, transformed) {
+        if apply_output_transforms(engine, model, output_provider, &mut out_json) {
             if let Ok(v) = serde_json::to_vec(&out_json) {
                 let mut parts = parts;
                 parts.headers.remove(header::CONTENT_LENGTH);
@@ -390,36 +256,6 @@ async fn enforce_output(
     }
 
     Response::from_parts(parts, Body::from(bytes))
-}
-
-/// Rewrite the first assistant text field with the transformed text. Best-effort
-/// for the common OpenAI/Anthropic shapes.
-fn rewrite_output_text(provider: &str, json: &mut Value, new_text: &str) -> bool {
-    match provider {
-        "anthropic" => {
-            if let Some(parts) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
-                if let Some(first_text) = parts
-                    .iter_mut()
-                    .find(|p| p.get("text").map(|t| t.is_string()).unwrap_or(false))
-                {
-                    first_text["text"] = Value::String(new_text.to_string());
-                    return true;
-                }
-            }
-            false
-        }
-        _ => {
-            if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
-                if let Some(first) = choices.first_mut() {
-                    if let Some(msg) = first.get_mut("message") {
-                        msg["content"] = Value::String(new_text.to_string());
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-    }
 }
 
 fn log_decisions(
@@ -501,19 +337,23 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_openai_output_text() {
+    fn apply_output_transforms_redacts_all_openai_choices() {
+        // Output-phase email redaction over a multi-choice response: every choice
+        // must be rewritten (regression guard — the old helper did only the first).
+        let bundle = crate::policy::config::PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"red","type":"pii_detection","mode":"enforce","config":{"phase":"output","entities":["EMAIL_ADDRESS"],"action":"redact"}}]}"#,
+        )
+        .unwrap();
+        let e = PolicyEngine::from_bundle(&bundle, crate::policy::engine::EngineOptions::default());
         let mut j = serde_json::json!({
-            "choices": [{"message": {"role": "assistant", "content": "secret stuff"}}]
+            "choices": [
+                {"message": {"role": "assistant", "content": "ping a@b.com"}},
+                {"message": {"role": "assistant", "content": "or c@d.io"}}
+            ]
         });
-        assert!(rewrite_output_text("openai", &mut j, "[REDACTED]"));
-        assert_eq!(j["choices"][0]["message"]["content"], "[REDACTED]");
-    }
-
-    #[test]
-    fn rewrite_anthropic_output_text() {
-        let mut j = serde_json::json!({"content": [{"type": "text", "text": "secret"}]});
-        assert!(rewrite_output_text("anthropic", &mut j, "[X]"));
-        assert_eq!(j["content"][0]["text"], "[X]");
+        assert!(apply_output_transforms(&e, "gpt-4o", "openai", &mut j));
+        assert_eq!(j["choices"][0]["message"]["content"], "ping [REDACTED]");
+        assert_eq!(j["choices"][1]["message"]["content"], "or [REDACTED]");
     }
 
     fn redact_email_engine() -> PolicyEngine {

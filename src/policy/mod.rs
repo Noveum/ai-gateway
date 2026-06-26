@@ -22,11 +22,19 @@
 pub mod config;
 pub mod decision;
 pub mod engine;
-pub mod middleware;
 pub mod pricing;
 pub mod rules;
-pub mod source;
 pub mod synthetic;
+
+// Local bundle loading reads the filesystem (`tokio::fs`) — native only. The
+// Worker builds the engine from an in-memory bundle (env var / KV) instead.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod source;
+
+// The Tower/Axum guard middleware is native-only; the Cloudflare Worker wires the
+// engine into `worker_rt` instead.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod middleware;
 
 pub use config::{Policy, PolicyBundle, PolicyType};
 pub use decision::{Phase, PolicyAction, PolicyDecision, PolicyMode, Severity};

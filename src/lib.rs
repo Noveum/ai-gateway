@@ -19,22 +19,44 @@
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::redundant_closure)]
 
-pub mod config;
-pub mod error;
-pub mod handlers;
+// Shared core: compiles to BOTH the native server and the wasm32 Cloudflare
+// Worker, so guardrails + request routing behave identically on every deployment
+// shape.
 pub mod policy;
+pub mod routing;
+pub mod sigv4;
+
+// Native runtime (Tokio + Axum server): the binary, Docker image, and library
+// server. Not compiled for the wasm32 (Cloudflare Worker) target.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod config;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod error;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod handlers;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod providers;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod telemetry;
 
+// Cloudflare Worker runtime (WASM): the `#[event(fetch)]` entry point + edge
+// proxy. Only compiled for wasm32.
+#[cfg(target_arch = "wasm32")]
+pub mod worker_rt;
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use axum::{
     middleware::from_fn_with_state,
     routing::{any, get},
     Router,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::{
     config::AppConfig,
     policy::PolicyEngine,
@@ -45,6 +67,7 @@ use crate::{
 ///
 /// `AppState` is intentionally cheap to clone (everything behind an `Arc`) so it
 /// can be attached to multiple Tower layers and handlers.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
@@ -54,6 +77,7 @@ pub struct AppState {
     pub policy: Arc<PolicyEngine>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl AppState {
     pub fn new(
         config: Arc<AppConfig>,
@@ -80,6 +104,7 @@ impl AppState {
 /// The policy middleware is always wired but becomes a transparent pass-through
 /// when the engine has no active policies, so enabling/disabling guardrails is a
 /// runtime concern, not a routing concern.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn build_router(state: AppState) -> Router {
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)

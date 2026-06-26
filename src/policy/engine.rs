@@ -11,6 +11,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -167,6 +168,10 @@ impl PolicyEngine {
     ///
     /// Any load/parse error degrades to an empty (pass-through) engine with a
     /// warning; the gateway never fails to boot because of policy config.
+    ///
+    /// Native only (reads env + filesystem). The Cloudflare Worker builds the
+    /// engine from an in-memory bundle via [`PolicyEngine::from_bundle`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn from_env() -> Self {
         // Treat a broad set of falsey values as "disabled" (case-insensitive,
         // trimmed) so a kill-switch like `NOVEUM_GUARD_ENABLED=Off` actually
@@ -385,9 +390,15 @@ impl PolicyEngine {
                 input_tokens,
                 live_state,
             };
+            // `std::time::Instant` is unsupported on wasm32 (Cloudflare Worker)
+            // and panics; per-policy latency is telemetry only, so skip it there.
+            #[cfg(not(target_arch = "wasm32"))]
             let start = Instant::now();
             let outcome = cp.rule.evaluate(&ctx);
+            #[cfg(not(target_arch = "wasm32"))]
             let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            #[cfg(target_arch = "wasm32")]
+            let latency_ms = 0.0_f64;
             let decision = Self::decision_from_outcome(&cp.meta, outcome, latency_ms);
 
             // Apply transform if enforced.

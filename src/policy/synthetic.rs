@@ -14,15 +14,20 @@
 //! An `x_noveum_guard` extension object is attached so tooling can identify
 //! guard-synthesised responses; provider SDKs ignore unknown fields.
 
+// `BlockResponseMode` + the provider-shaped block *body* builders + status are
+// SHARED, so the native server and the Cloudflare Worker emit byte-identical
+// block responses. Only the axum `Response` wrapper is native-only; the Worker
+// wraps the same body/status in a `worker::Response`.
+use super::decision::PolicyDecision;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+#[cfg(not(target_arch = "wasm32"))]
 use axum::{
     body::Body,
     http::{header, StatusCode},
     response::Response,
 };
-use serde_json::{json, Value};
-use uuid::Uuid;
-
-use super::decision::PolicyDecision;
 
 /// How a block should be surfaced to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +47,44 @@ impl BlockResponseMode {
     }
 }
 
+/// Sanitize a policy id to a safe ASCII header token (so building a response
+/// header can never fail). Shared by native + Worker.
+pub fn policy_header_token(policy_id: &str) -> String {
+    policy_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '\u{7f}' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect()
+}
+
+/// HTTP status for a block in the given mode (shared by native + Worker).
+pub fn block_status(mode: BlockResponseMode) -> u16 {
+    match mode {
+        BlockResponseMode::ProviderError => 403,
+        BlockResponseMode::SyntheticSuccess => 200,
+    }
+}
+
+/// Build the provider-shaped block response *body* for the given mode. Shared by
+/// native (`block_response`) and the Cloudflare Worker (`worker_rt`).
+pub fn block_body(
+    provider: &str,
+    model: &str,
+    decision: &PolicyDecision,
+    mode: BlockResponseMode,
+) -> Value {
+    match mode {
+        BlockResponseMode::ProviderError => error_body(provider, decision),
+        BlockResponseMode::SyntheticSuccess => success_body(provider, model, decision),
+    }
+}
+
 fn guard_extension(decision: &PolicyDecision) -> Value {
     json!({
         "blocked": true,
@@ -57,36 +100,17 @@ fn guard_extension(decision: &PolicyDecision) -> Value {
 /// `provider` is the `x-provider` value (e.g. `"openai"`, `"anthropic"`,
 /// `"google"`); unknown providers fall back to the OpenAI shape, which most
 /// OpenAI-compatible SDKs accept.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn block_response(
     provider: &str,
     model: &str,
     decision: &PolicyDecision,
     mode: BlockResponseMode,
 ) -> Response {
-    let body = match mode {
-        BlockResponseMode::ProviderError => error_body(provider, decision),
-        BlockResponseMode::SyntheticSuccess => success_body(provider, model, decision),
-    };
-    let status = match mode {
-        BlockResponseMode::ProviderError => StatusCode::FORBIDDEN,
-        BlockResponseMode::SyntheticSuccess => StatusCode::OK,
-    };
-
-    // Policy ids come from user/control-plane config and may contain characters
-    // that are invalid in an HTTP header value; sanitize to a safe ASCII token so
-    // building the response can never panic.
-    let policy_header: String = decision
-        .policy_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_graphic() && c != '\u{7f}' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(128)
-        .collect();
+    let body = block_body(provider, model, decision, mode);
+    let status =
+        StatusCode::from_u16(block_status(mode)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let policy_header = policy_header_token(&decision.policy_id);
 
     Response::builder()
         .status(status)
