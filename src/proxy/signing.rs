@@ -6,20 +6,29 @@ use axum::http::HeaderMap;
 use std::time::SystemTime;
 use tracing::debug;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn sign_aws_request(
     method: &str,
     url: &str,
     body: &[u8],
     access_key: &str,
     secret_key: &str,
+    session_token: Option<String>,
     region: &str,
     service: &str,
 ) -> Result<HeaderMap, AppError> {
     debug!("Signing request with method: {}, url: {}", method, url);
 
-    // Create credentials
-    let identity =
-        Credentials::new(access_key, secret_key, None, None, "signing-credentials").into();
+    // Create credentials. `session_token` is `Some` for temporary (STS)
+    // credentials, in which case aws-sigv4 also signs `x-amz-security-token`.
+    let identity = Credentials::new(
+        access_key,
+        secret_key,
+        session_token,
+        None,
+        "signing-credentials",
+    )
+    .into();
 
     // Create signing parameters
     let signing_settings = SigningSettings::default();

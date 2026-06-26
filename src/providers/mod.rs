@@ -58,6 +58,12 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Get the AWS session token for temporary (STS) credentials, if present.
+    /// Returns `None` for long-lived credentials.
+    fn get_session_token(&self, _headers: &HeaderMap) -> Option<String> {
+        None
+    }
+
     /// Get the signing host for the provider
     fn get_signing_host(&self) -> String {
         self.base_url()

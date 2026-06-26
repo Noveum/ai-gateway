@@ -497,6 +497,13 @@ impl Provider for BedrockProvider {
         Some((access_key.to_string(), secret_key.to_string(), region))
     }
 
+    fn get_session_token(&self, headers: &HeaderMap) -> Option<String> {
+        headers
+            .get("x-aws-session-token")
+            .and_then(|h| h.to_str().ok())
+            .map(String::from)
+    }
+
     fn get_signing_host(&self) -> String {
         let region = self.region.read().clone();
         format!("bedrock-runtime.{}.amazonaws.com", region)
@@ -779,6 +786,17 @@ impl MetricsExtractor for BedrockMetricsExtractor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_token_read_from_header_for_temporary_creds() {
+        let p = BedrockProvider::new();
+        // No header → None (long-lived credentials).
+        assert_eq!(p.get_session_token(&HeaderMap::new()), None);
+        // Present → returned (temporary STS credentials).
+        let mut h = HeaderMap::new();
+        h.insert("x-aws-session-token", "tok-abc123".parse().unwrap());
+        assert_eq!(p.get_session_token(&h).as_deref(), Some("tok-abc123"));
+    }
 
     #[test]
     fn transform_path_url_encodes_slash_in_arn_model() {

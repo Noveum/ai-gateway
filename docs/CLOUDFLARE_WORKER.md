@@ -16,9 +16,12 @@ share the Nova Guard engine + provider routing, so behavior is identical.
 rustup target add wasm32-unknown-unknown
 cargo install worker-build           # Rust→WASM bundler for Workers
 npm i -g wrangler                    # or use `npx wrangler`
-# (optional, for smaller bundles) install binaryen so `wasm-opt` is on PATH,
-# then set `wasm-opt = true` in [package.metadata.wasm-pack.profile.release].
+brew install binaryen                # provides `wasm-opt` (the build runs `-Oz`)
 ```
+
+> The build invokes `wasm-opt -Oz` (configured in `Cargo.toml` under
+> `[package.metadata.wasm-pack.profile.release]`). If `wasm-opt` isn't on PATH the
+> build fails — install `binaryen`, or set `wasm-opt = false` to skip optimization.
 
 ## Build the Worker bundle
 
@@ -136,9 +139,9 @@ native server (the engine + request/response shaping are one shared codebase).
 Note the redact replacement key is **`redactWith`** (see `wrangler.toml`).
 
 **All 13 providers now run on the edge** (OpenAI-compatible set + Anthropic +
-Bedrock). **Next (see [CLOUDFLARE_DEPLOYMENT.md](CLOUDFLARE_DEPLOYMENT.md)):**
+Bedrock). Bedrock temporary credentials (`x-aws-session-token`) are supported on
+**both** the edge and the native server. The bundle is built with `wasm-opt -Oz`
+(~3.0 MB, ~1.06 MB gzipped — well under the 10 MB paid-plan limit).
+
+**Next (see [CLOUDFLARE_DEPLOYMENT.md](CLOUDFLARE_DEPLOYMENT.md)):**
 - Edge telemetry sink (Workers Analytics Engine / Queues) and Workers-KV policies.
-- Re-enable `wasm-opt` to shrink the bundle (currently ~3.3 MB unoptimized;
-  gzips to ~1 MB, well under the 10 MB paid-plan limit).
-- Optionally add `x-aws-session-token` support to the **native** Bedrock path too
-  (the edge already supports temporary credentials).

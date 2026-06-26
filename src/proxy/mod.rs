@@ -53,12 +53,14 @@ pub async fn proxy_request_to_provider(
     // Handle AWS signing if required
     let final_headers = if provider.requires_signing() {
         if let Some((access_key, secret_key, region)) = provider.get_signing_credentials(&headers) {
+            let session_token = provider.get_session_token(&headers);
             signing::sign_aws_request(
                 original_request.method().as_str(),
                 &url,
                 &prepared_body,
                 &access_key,
                 &secret_key,
+                session_token,
                 &region,
                 "bedrock",
             )

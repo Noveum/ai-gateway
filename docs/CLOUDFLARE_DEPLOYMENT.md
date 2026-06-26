@@ -76,9 +76,12 @@ conversion, and **temporary-credential support** (`x-aws-session-token`) that th
 native path lacks. Verified live against `amazon.nova-micro-v1:0` with temporary
 STS credentials, including Nova Guard input block + redaction.
 
-**All 13 providers now run on the edge. Remaining:** edge telemetry sink +
-Workers-KV policies; re-enable `wasm-opt`; (optional) add session-token support
-to the native Bedrock path for full parity.
+**All 13 providers now run on the edge.** Bedrock temporary credentials
+(`x-aws-session-token`) are supported on **both** the edge and the native server,
+and the Worker bundle is built with `wasm-opt -Oz` (~3.0 MB / ~1.06 MB gzipped).
+
+**Remaining:** edge telemetry sink (Workers Analytics Engine / Queues) +
+Workers-KV-backed Nova Guard policies.
 
 ## How Cloudflare runs code (the constraint that drives everything)
 

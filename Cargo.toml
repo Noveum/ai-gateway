@@ -26,11 +26,12 @@ exclude = [
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-# Cloudflare Worker (worker-build/wasm-pack) build settings. wasm-opt is disabled
-# here because it requires a binaryen install on PATH; enable it in CI once
-# binaryen is available to shrink the bundle further.
+# Cloudflare Worker (worker-build/wasm-pack) build settings. wasm-opt shrinks the
+# bundle; it requires `binaryen` (wasm-opt) on PATH. `-Oz` optimizes for size;
+# `--all-features` lets wasm-opt accept the modern wasm features wasm-bindgen
+# emits (bulk-memory, sign-ext, …), which all run on workerd.
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+wasm-opt = ['-Oz', '--all-features']
 
 [profile.release]
 opt-level = 3
