@@ -209,10 +209,13 @@ async fn enforce_output(
     // chat-completion shape BEFORE this middleware runs. Pick the flatten/transform
     // shape from the ACTUAL body, not the `x-provider` name, so output enforcement
     // never silently misses `choices[].message.content`.
+    // `x-provider` is case-insensitive; normalize so e.g. "Gemini" still matches
+    // the `candidates` shape instead of silently failing open.
+    let provider_key = provider.to_ascii_lowercase();
     let output_provider = if body_json.get("choices").is_some() {
         "openai"
     } else {
-        provider
+        provider_key.as_str()
     };
 
     let output_text = flatten_output_text(output_provider, &body_json);

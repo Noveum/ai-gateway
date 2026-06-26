@@ -389,46 +389,77 @@ pub fn openai_to_bedrock_converse(body: &Value) -> Value {
         return body.clone();
     }
 
-    let messages = body.get("messages").and_then(|m| m.as_array());
-    let transformed: Vec<Value> = messages
-        .map(|arr| {
-            arr.iter()
-                .map(|msg| {
-                    let content = msg
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or_default();
-                    json!({
-                        "role": msg.get("role").and_then(|r| r.as_str()).unwrap_or("user"),
-                        "content": [{ "text": content }],
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    json!({
-        "messages": transformed,
-        "inferenceConfig": {
-            "maxTokens": body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(1000),
-            "temperature": body.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7),
-            "topP": body.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0),
+    // Extract a message's text from string OR array-of-parts content.
+    fn content_text(msg: &Value) -> String {
+        match msg.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
         }
-    })
+    }
+
+    // Converse keeps `system` separate and only allows user/assistant roles in
+    // `messages`; route `system` entries to the top-level `system` field so they
+    // are not dropped or rejected.
+    let mut messages = Vec::new();
+    let mut system = Vec::new();
+    if let Some(arr) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in arr {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let text = content_text(msg);
+            if role == "system" {
+                system.push(json!({ "text": text }));
+            } else {
+                messages.push(json!({ "role": role, "content": [{ "text": text }] }));
+            }
+        }
+    }
+
+    let mut inference = json!({
+        "maxTokens": body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(1000),
+        "temperature": body.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.7),
+        "topP": body.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0),
+    });
+    // OpenAI `stop` (string or array) → Converse `inferenceConfig.stopSequences`.
+    match body.get("stop") {
+        Some(Value::String(s)) => inference["stopSequences"] = json!([s]),
+        Some(Value::Array(a)) => {
+            let seqs: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
+            if !seqs.is_empty() {
+                inference["stopSequences"] = json!(seqs);
+            }
+        }
+        _ => {}
+    }
+
+    let mut out = json!({ "messages": messages, "inferenceConfig": inference });
+    if !system.is_empty() {
+        out["system"] = Value::Array(system);
+    }
+    out
 }
 
 /// Convert an AWS Bedrock **Converse** API response into OpenAI Chat Completions
 /// shape. Mirrors the native `BedrockProvider::transform_bedrock_to_openai_format`.
 /// `created_ts` is passed in (chrono is unavailable on wasm32).
 pub fn bedrock_converse_to_openai(resp: &Value, model: &str, created_ts: i64) -> Value {
+    // Concatenate ALL text blocks (Converse may return several), not just the
+    // first, so multi-block responses are not silently truncated.
     let content = resp
         .get("output")
         .and_then(|o| o.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-        .and_then(|f| f.get("text"))
-        .and_then(|t| t.as_str())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
         .unwrap_or_default();
 
     let usage = resp.get("usage");
@@ -441,8 +472,10 @@ pub fn bedrock_converse_to_openai(resp: &Value, model: &str, created_ts: i64) ->
 
     let finish_reason = match resp.get("stopReason").and_then(|s| s.as_str()) {
         Some("end_turn") => "stop",
-        Some("max_tokens") => "length",
+        Some("max_tokens") | Some("model_context_window_exceeded") => "length",
         Some("stop_sequence") => "stop",
+        // Surface safety stops distinctly instead of as a normal "stop".
+        Some("content_filtered") | Some("guardrail_intervened") => "content_filter",
         _ => "stop",
     };
 
@@ -684,5 +717,47 @@ mod tests {
         assert_eq!(out["usage"]["prompt_tokens"], 7);
         assert_eq!(out["usage"]["completion_tokens"], 3);
         assert_eq!(out["usage"]["total_tokens"], 10);
+    }
+
+    #[test]
+    fn openai_to_bedrock_converse_handles_system_array_content_and_stop() {
+        let body = json!({
+            "model": "amazon.nova-micro-v1:0",
+            "stop": ["END", "STOP"],
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "part-1"},
+                    {"type": "image_url", "image_url": {"url": "x"}},
+                    {"type": "text", "text": " part-2"}
+                ]}
+            ]
+        });
+        let out = openai_to_bedrock_converse(&body);
+        // system routed to the top-level field, NOT into messages.
+        assert_eq!(out["system"][0]["text"], "be terse");
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(out["messages"][0]["role"], "user");
+        // array (multimodal) content text is preserved, not dropped to empty.
+        assert_eq!(out["messages"][0]["content"][0]["text"], "part-1 part-2");
+        // stop → stopSequences.
+        assert_eq!(
+            out["inferenceConfig"]["stopSequences"],
+            json!(["END", "STOP"])
+        );
+    }
+
+    #[test]
+    fn bedrock_converse_aggregates_blocks_and_maps_safety_stops() {
+        let resp = json!({
+            "output": {"message": {"content": [{"text": "a"}, {"text": "b"}, {"text": "c"}]}},
+            "stopReason": "guardrail_intervened",
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
+        });
+        let out = bedrock_converse_to_openai(&resp, "m", 1);
+        // ALL content blocks concatenated (regression: only the first was kept).
+        assert_eq!(out["choices"][0]["message"]["content"], "abc");
+        // safety stop surfaced distinctly.
+        assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
     }
 }
