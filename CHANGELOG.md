@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-26
+### Added
+- **One package, three deployment shapes.** The same `noveum-ai-gateway` crate
+  now builds as the native binary / Docker image, a Rust library, **and a
+  Cloudflare Worker** (`wasm32`, true per‑PoP edge). The Nova Guard engine,
+  pricing, and request/response shaping are shared so all shapes behave
+  identically. See [docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md) and
+  [docs/CLOUDFLARE_DEPLOYMENT.md](docs/CLOUDFLARE_DEPLOYMENT.md).
+- **All 13 providers on the edge Worker:** the OpenAI‑compatible set (OpenAI,
+  Groq, Together, Fireworks, Mistral, Cohere, Gemini, DeepSeek, xAI, OpenRouter,
+  Perplexity) plus **Anthropic** (`/v1/messages` + `x-api-key`, Messages→OpenAI
+  conversion) and **Bedrock** (Converse API, **AWS SigV4** signed in pure Rust;
+  also accepts **temporary credentials** via `x-aws-session-token`, which the
+  native path does not).
+- Worker Nova Guard parity: input block + redact, output‑phase block + redact,
+  `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` (`synthetic_success`/`provider_error`),
+  permissive CORS + `OPTIONS` preflight, header/query pass‑through, SSE
+  streaming pass‑through, and an 8 MB response inspection cap.
+- New shared modules `routing` (provider routing + request/response transforms)
+  and `sigv4` (pure‑Rust AWS SigV4; unit‑tested against RFC 4231).
+
+### Changed
+- Native Anthropic now passes 4xx/5xx **error bodies through unchanged** instead
+  of converting them to an empty `chat.completion`.
+- Output‑phase enforcement picks the response shape from the actual body (so
+  Anthropic responses already converted to OpenAI shape are still inspected).
+- Output redaction now rewrites **every** choice / content block (was first‑only).
+- `jsonschema` built without its HTTP/file `$ref` resolvers (wasm‑safe; no
+  behavior change for inline schemas).
+
 ## [1.1.0] - 2026-06-25
 ### Added
 - **Nova Guard** in-process policy enforcement, loaded from a **local** policy

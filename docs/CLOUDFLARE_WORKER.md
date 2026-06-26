@@ -41,7 +41,7 @@ Then exercise it exactly like the native gateway:
 ```bash
 # Health
 curl localhost:8787/health
-# → {"status":"healthy","version":"1.1.0","runtime":"cloudflare-worker"}
+# → {"status":"healthy","version":"1.2.0","runtime":"cloudflare-worker"}
 
 # Proxy an OpenAI-compatible provider (x-provider + Bearer key, OpenAI body)
 curl localhost:8787/v1/chat/completions \
