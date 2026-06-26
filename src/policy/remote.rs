@@ -9,12 +9,26 @@
 
 use std::time::{Duration, Instant};
 
+use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::policy::config::PolicyBundle;
 use crate::policy::platform;
 use crate::policy::rules::LiveState;
+
+/// Dedicated HTTP client for the Noveum platform API. Unlike `proxy::CLIENT`
+/// (which forces HTTP/2 prior knowledge for HTTPS provider calls), this
+/// negotiates the HTTP version normally so it works against a plain HTTP/1.1
+/// control plane (e.g. a local `http://localhost:3000`) as well as HTTPS.
+static PLATFORM_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("failed to build Noveum platform HTTP client")
+});
 
 /// Default platform base URL when `NOVEUM_API_URL` is unset.
 const DEFAULT_API_URL: &str = "https://api.noveum.ai";
@@ -70,7 +84,7 @@ impl RemoteConfig {
 
 /// Fetch + translate the platform's policies into a gateway [`PolicyBundle`].
 pub async fn fetch_bundle(cfg: &RemoteConfig) -> Result<PolicyBundle, String> {
-    let resp = crate::proxy::CLIENT
+    let resp = PLATFORM_CLIENT
         .get(cfg.policies_url())
         .bearer_auth(&cfg.api_key)
         .send()
@@ -88,7 +102,7 @@ pub async fn fetch_bundle(cfg: &RemoteConfig) -> Result<PolicyBundle, String> {
 }
 
 async fn fetch_state(cfg: &RemoteConfig) -> Result<LiveState, String> {
-    let resp = crate::proxy::CLIENT
+    let resp = PLATFORM_CLIENT
         .get(cfg.state_url())
         .bearer_auth(&cfg.api_key)
         .send()
