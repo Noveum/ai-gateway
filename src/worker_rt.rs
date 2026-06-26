@@ -8,12 +8,12 @@
 //! `reqwest`/`tokio`).
 //!
 //! Parity with the native server: same provider routing, same `x-provider`
-//! contract, same Nova Guard input/output decisions + redaction, the same block
-//! response modes (`NOVEUM_GUARD_BLOCK_RESPONSE_MODE`), and the same
-//! Anthropic→OpenAI response conversion. Streaming responses pass through
-//! without output‑phase enforcement (the documented v1 limitation, identical to
-//! native). Non‑JSON `/v1/*` bodies are forwarded byte‑for‑byte. Bedrock (AWS
-//! SigV4 via Web Crypto) lands in a later phase.
+//! contract, header pass‑through, query pass‑through, same Nova Guard
+//! input/output decisions + redaction, the same block response modes
+//! (`NOVEUM_GUARD_BLOCK_RESPONSE_MODE`), and the same Anthropic→OpenAI response
+//! conversion. Streaming responses pass through without output‑phase enforcement
+//! (the documented v1 limitation, identical to native). Non‑JSON `/v1/*` bodies
+//! are forwarded byte‑for‑byte. Bedrock (AWS SigV4 via Web Crypto) lands later.
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -31,6 +31,26 @@ use crate::routing::{
 /// responses pass through uninspected (matches native; avoids OOM on the
 /// 128 MB isolate).
 const MAX_BODY: usize = 8 * 1024 * 1024;
+
+/// Request headers we never forward upstream: hop-by-hop, length/encoding (the
+/// runtime recomputes them and we send a decoded body), and our routing header.
+/// `accept-encoding` is dropped so the upstream returns an inspectable
+/// (uncompressed) body, matching native reqwest's auto-decode behavior.
+const REQUEST_SKIP_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "content-encoding",
+    "accept-encoding",
+    "connection",
+    "transfer-encoding",
+    "keep-alive",
+    "x-provider",
+];
+
+/// Response headers we drop when re-emitting a buffered/transformed body (its
+/// length and encoding change); everything else (x-request-id, rate-limit, …)
+/// is preserved.
+const RESPONSE_SKIP_HEADERS: &[&str] = &["content-length", "content-encoding"];
 
 /// Build the Nova Guard engine from an in‑memory bundle.
 ///
@@ -74,6 +94,19 @@ fn build_engine(env: &Env) -> PolicyEngine {
     PolicyEngine::from_bundle(&bundle, opts)
 }
 
+/// Copy `src` headers into a fresh `Headers`, skipping any whose (lowercased)
+/// name is in `skip`.
+fn copy_headers_excluding(src: &Headers, skip: &[&str]) -> Result<Headers> {
+    let out = Headers::new();
+    for (k, v) in src.entries() {
+        if skip.contains(&k.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        out.set(&k, &v)?;
+    }
+    Ok(out)
+}
+
 /// Build a Nova Guard block response in the engine's configured mode, using the
 /// SHARED body/status builders so it is byte-identical to the native server.
 fn guard_block_response(
@@ -112,8 +145,44 @@ async fn read_body_capped(resp: &mut Response) -> core::result::Result<Vec<u8>, 
     Ok(buf)
 }
 
+/// Apply permissive CORS headers, matching the native `CorsLayer` (any origin /
+/// method / header). Works on responses we construct (mutable headers) and on
+/// pass-through responses re-wrapped by [`passthrough`].
+fn apply_cors(resp: Response) -> Response {
+    let h = resp.headers();
+    let _ = h.set("access-control-allow-origin", "*");
+    let _ = h.set("access-control-allow-methods", "*");
+    let _ = h.set("access-control-allow-headers", "*");
+    let _ = h.set("access-control-max-age", "3600");
+    resp
+}
+
+/// Re-wrap an upstream `Fetch` response so its headers become mutable (the raw
+/// Fetch response has an immutable header set). The body is re-streamed lazily —
+/// no buffering — so SSE/streaming pass-through is preserved. This lets the
+/// outer CORS layer attach headers even on the transparent proxy path.
+fn passthrough(mut resp: Response) -> Result<Response> {
+    let status = resp.status_code();
+    // Drop length/encoding: `from_stream` re-frames the body (chunked), so a
+    // copied Content-Length would be stale, and the bytes are already decoded.
+    let headers = copy_headers_excluding(resp.headers(), RESPONSE_SKIP_HEADERS)?;
+    let stream = resp.stream()?;
+    Ok(Response::from_stream(stream)?
+        .with_headers(headers)
+        .with_status(status))
+}
+
 #[event(fetch)]
-async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    // CORS preflight — mirror the native permissive CorsLayer.
+    if req.method() == Method::Options {
+        return Ok(apply_cors(Response::empty()?.with_status(204)));
+    }
+    let resp = handle(req, env, ctx).await?;
+    Ok(apply_cors(resp))
+}
+
+async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
 
     if path == "/health" {
@@ -143,6 +212,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         );
     }
 
+    // Preserve the query string (native forwards it).
+    let query = req
+        .url()
+        .ok()
+        .and_then(|u| u.query().map(|q| q.to_string()));
+
     // Only JSON bodies are parsed/guarded/transformed. Non-JSON (multipart,
     // binary) bodies are forwarded byte-for-byte, like the native proxy.
     let is_json_req = req
@@ -157,9 +232,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let guard_active = engine.is_enabled() && engine.active_policy_count() > 0;
     let block_mode = engine.block_mode();
 
-    // Read the raw request body once (so non-JSON forwards unchanged).
+    // Read the raw request body once.
     let body_bytes = req.bytes().await.unwrap_or_default();
-    let mut body_json: Option<Value> = if is_json_req {
+
+    // Parse JSON only when we actually need to inspect it (guard on). A
+    // transparent proxy forwards the original bytes byte-for-byte.
+    let mut body_json: Option<Value> = if guard_active && is_json_req {
         serde_json::from_slice(&body_bytes).ok()
     } else {
         None
@@ -172,6 +250,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .to_string();
 
     // --- Nova Guard input phase (block, then redact/mask transforms) ---
+    let mut redacted = false;
     if guard_active {
         if let Some(j) = &body_json {
             let input_text = flatten_input_text(j);
@@ -181,43 +260,40 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         }
         if let Some(j) = body_json.as_mut() {
-            apply_input_transforms(&engine, &model, j);
+            redacted = apply_input_transforms(&engine, &model, j);
         }
     }
 
-    // --- Build the outbound request (provider-specific routing/auth) ---
-    let (url, out_headers) = if is_anthropic {
-        let headers = Headers::new();
-        headers.set("content-type", "application/json")?;
-        headers.set("anthropic-version", "2023-06-01")?;
+    // --- Build the outbound request (forward client headers + provider auth) ---
+    let out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
+    let url = if is_anthropic {
+        // Anthropic uses x-api-key + anthropic-version, not Bearer auth.
+        out_headers.delete("authorization")?;
+        out_headers.set("anthropic-version", "2023-06-01")?;
         if let Ok(Some(auth)) = req.headers().get("authorization") {
-            let key = auth.trim_start_matches("Bearer ").trim();
-            headers.set("x-api-key", key)?;
+            out_headers.set("x-api-key", auth.trim_start_matches("Bearer ").trim())?;
         }
-        ("https://api.anthropic.com/v1/messages".to_string(), headers)
+        "https://api.anthropic.com/v1/messages".to_string()
     } else {
         let route = route.expect("checked above");
-        let headers = Headers::new();
-        headers.set("content-type", "application/json")?;
-        if let Ok(Some(auth)) = req.headers().get("authorization") {
-            headers.set("authorization", &auth)?;
+        let base = upstream_url(&route, &path);
+        match &query {
+            Some(q) => format!("{base}?{q}"),
+            None => base,
         }
-        (upstream_url(&route, &path), headers)
     };
 
-    // Forward the (possibly redacted) JSON as a string, or the original bytes
-    // verbatim for non-JSON requests.
+    // Forward the redacted JSON (re-serialized) or the original bytes verbatim.
     let mut init = RequestInit::new();
     init.with_method(Method::Post).with_headers(out_headers);
-    match &body_json {
-        Some(j) => {
+    if redacted {
+        if let Some(j) = &body_json {
             init.with_body(Some(serde_json::to_string(j).unwrap_or_default().into()));
         }
-        None => {
-            let arr = js_sys::Uint8Array::new_with_length(body_bytes.len() as u32);
-            arr.copy_from(&body_bytes);
-            init.with_body(Some(arr.into()));
-        }
+    } else {
+        let arr = js_sys::Uint8Array::new_with_length(body_bytes.len() as u32);
+        arr.copy_from(&body_bytes);
+        init.with_body(Some(arr.into()));
     }
     let out_req = Request::new_with_init(&url, &init)?;
     let mut resp = Fetch::Request(out_req).send().await?;
@@ -234,13 +310,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Streaming passes through untouched (matches native v1; Anthropic SSE stays
     // in Anthropic shape, exactly like the native server).
     if is_stream {
-        return Ok(resp);
+        return passthrough(resp);
     }
 
     // Non-streaming: only buffer when we must transform (Anthropic) or run the
     // output phase; otherwise stream the upstream response straight back.
     if !is_anthropic && !guard_active {
-        return Ok(resp);
+        return passthrough(resp);
     }
 
     // Fast path: a declared length over the cap → pass through unbuffered.
@@ -251,10 +327,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .flatten()
         .and_then(|v| v.parse::<usize>().ok());
     if matches!(declared, Some(n) if n > MAX_BODY) {
-        return Ok(resp);
+        return passthrough(resp);
     }
 
     let status = resp.status_code();
+    // Preserve upstream response headers (x-request-id, rate-limit, …) on the
+    // re-emitted body; drop length/encoding since the body changes.
+    let resp_headers = copy_headers_excluding(resp.headers(), RESPONSE_SKIP_HEADERS)?;
 
     // Read with a hard cap (covers chunked / missing Content-Length).
     let bytes = match read_body_capped(&mut resp).await {
@@ -272,8 +351,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     let mut out_json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
-        // Not JSON — return the buffered bytes unchanged with the upstream status.
-        Err(_) => return Ok(Response::from_bytes(bytes)?.with_status(status)),
+        // Not JSON — return the buffered bytes unchanged, preserving headers/status.
+        Err(_) => {
+            return Ok(Response::from_bytes(bytes)?
+                .with_headers(resp_headers)
+                .with_status(status))
+        }
     };
 
     // Anthropic → OpenAI shape for parity (only successful responses carry the
@@ -304,5 +387,8 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
     }
 
-    Ok(Response::from_json(&out_json)?.with_status(status))
+    let out_bytes = serde_json::to_vec(&out_json).unwrap_or_default();
+    Ok(Response::from_bytes(out_bytes)?
+        .with_headers(resp_headers)
+        .with_status(status))
 }

@@ -102,6 +102,13 @@ and are not inspected; only `application/json` bodies run through Nova Guard.
 - **SSE streaming**: passed through unbuffered (input redaction still applies;
   output-phase enforcement is skipped on streams — the documented v1 limitation,
   identical to native).
+- **Header + query pass-through**: client request headers (e.g. `OpenAI-Beta`,
+  `OpenAI-Organization`, `anthropic-beta`) and the query string are forwarded;
+  upstream response headers (`x-request-id`, rate-limit, …) are preserved. The
+  transparent path forwards the request body byte-for-byte (only redacted bodies
+  are re-serialized).
+- **CORS**: permissive (`*`) on all responses + `OPTIONS` preflight, matching the
+  native `CorsLayer`.
 - **Nova Guard — input phase**: block + redact/mask (regex, PII, secrets, banned
   substrings, model allowlist, JSON-schema, token caps — the full shared engine).
   Input redactions are applied to the body *before* the upstream call.
