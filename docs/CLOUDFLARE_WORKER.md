@@ -82,16 +82,31 @@ After deploy, the gateway answers at `https://noveum-ai-gateway.<account>.worker
 
 ## What runs on the edge today vs. next
 
-**Working now (Phase 1):** `/health`; Nova Guard input enforcement (regex, PII,
-secrets, banned substrings, model allowlist, JSON-schema, token caps — the full
-shared engine); proxy + response pass-through for the OpenAI-compatible providers
-(`openai, groq, together, fireworks, mistral, cohere, google/gemini, deepseek,
-xai/grok, openrouter, perplexity`).
+**Working now — verified live on the global edge:**
+- `/health`.
+- **All OpenAI-compatible providers**: `openai, groq, together, fireworks,
+  mistral, cohere, google/gemini, deepseek, xai/grok, openrouter, perplexity`
+  (proxy + response pass-through).
+- **Anthropic**: path → `/v1/messages`, `Authorization: Bearer` → `x-api-key` +
+  `anthropic-version`, and the response converted back to OpenAI Chat Completions
+  shape — same as the native server.
+- **SSE streaming**: passed through unbuffered (input redaction still applies;
+  output-phase enforcement is skipped on streams — the documented v1 limitation,
+  identical to native).
+- **Nova Guard — input phase**: block + redact/mask (regex, PII, secrets, banned
+  substrings, model allowlist, JSON-schema, token caps — the full shared engine).
+  Input redactions are applied to the body *before* the upstream call.
+- **Nova Guard — output phase**: block + redact on non-streaming responses
+  (buffered up to an 8 MB inspection cap; larger responses pass through
+  uninspected, matching native).
 
-**Next phases (see [CLOUDFLARE_DEPLOYMENT.md](CLOUDFLARE_DEPLOYMENT.md)):**
-- Output-phase enforcement + explicit SSE **streaming** pass-through.
-- **Anthropic** (path + `x-api-key` transform) and **Bedrock** (**AWS SigV4 via
-  Web Crypto**).
-- Telemetry sink (Workers Analytics Engine / Queues) and Workers-KV policies.
+The same Nova Guard policy schema, decisions, and redactions run here as on the
+native server (the engine + request/response shaping are one shared codebase).
+Note the redact replacement key is **`redactWith`** (see `wrangler.toml`).
+
+**Next (see [CLOUDFLARE_DEPLOYMENT.md](CLOUDFLARE_DEPLOYMENT.md)):**
+- **Bedrock** — the one remaining provider; needs **AWS SigV4 via Web Crypto**
+  (`crypto.subtle`) since native crypto crates don't run on wasm.
+- Edge telemetry sink (Workers Analytics Engine / Queues) and Workers-KV policies.
 - Re-enable `wasm-opt` to shrink the bundle (currently ~3.3 MB unoptimized;
-  gzips well under the 10 MB paid-plan limit).
+  gzips to ~1 MB, well under the 10 MB paid-plan limit).

@@ -144,124 +144,11 @@ fn header_str<B>(req: &Request<B>, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-// Input flattening is shared with the Cloudflare Worker so the input scan is
-// identical on both deployment shapes.
-pub use crate::routing::flatten_input_text;
-
-/// Apply input transforms to every text segment in the body in place, including
-/// array-form (multimodal) content parts and array-form `system` blocks so that
-/// PII/secret redaction is never silently skipped for structured content.
-///
-/// Returns true if anything was mutated. Uses the engine's transform-only path
-/// (the aggregate block decision was already made over the flattened text), so
-/// blocking is not re-litigated per segment and cost/rate/token policies do not
-/// re-run here.
-fn apply_input_transforms(engine: &PolicyEngine, model: &str, json: &mut Value) -> bool {
-    let mut changed = false;
-    let transform = |s: &str| engine.apply_text_transforms(Phase::Input, model, s);
-
-    // Mutate one JSON string field in place if a transform changed it.
-    fn rewrite_string(
-        v: &mut Value,
-        transform: &dyn Fn(&str) -> Option<String>,
-        changed: &mut bool,
-    ) {
-        if let Value::String(s) = v {
-            if let Some(t) = transform(s) {
-                if &t != s {
-                    *v = Value::String(t);
-                    *changed = true;
-                }
-            }
-        }
-    }
-
-    // Mutate either a string field or every `.text` in an array-of-parts.
-    fn rewrite_content(
-        v: &mut Value,
-        transform: &dyn Fn(&str) -> Option<String>,
-        changed: &mut bool,
-    ) {
-        match v {
-            Value::String(_) => rewrite_string(v, transform, changed),
-            Value::Array(parts) => {
-                for part in parts.iter_mut() {
-                    if let Some(text) = part.get_mut("text") {
-                        rewrite_string(text, transform, changed);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(prompt) = json.get_mut("prompt") {
-        rewrite_string(prompt, &transform, &mut changed);
-    }
-    if let Some(system) = json.get_mut("system") {
-        // Anthropic `system` may be a string or an array of text blocks.
-        rewrite_content(system, &transform, &mut changed);
-    }
-    if let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for msg in messages.iter_mut() {
-            if let Some(content) = msg.get_mut("content") {
-                rewrite_content(content, &transform, &mut changed);
-            }
-        }
-    }
-
-    changed
-}
-
-/// Extract the assistant text from a provider response body.
-pub fn flatten_output_text(provider: &str, json: &Value) -> String {
-    match provider {
-        "anthropic" => json
-            .get("content")
-            .and_then(|c| c.as_array())
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default(),
-        "google" | "gemini" => json
-            .get("candidates")
-            .and_then(|c| c.as_array())
-            .map(|cands| {
-                cands
-                    .iter()
-                    .filter_map(|c| c.get("content").and_then(|ct| ct.get("parts")))
-                    .filter_map(|p| p.as_array())
-                    .flat_map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default(),
-        // OpenAI / compatible
-        _ => json
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .map(|choices| {
-                choices
-                    .iter()
-                    .filter_map(|c| {
-                        c.get("message")
-                            .and_then(|m| m.get("content"))
-                            .and_then(|c| c.as_str())
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default(),
-    }
-}
+// Request/response shaping is shared with the Cloudflare Worker so input/output
+// scanning + transforms are byte-identical on both deployment shapes.
+pub use crate::routing::{
+    apply_input_transforms, flatten_input_text, flatten_output_text, rewrite_output_text,
+};
 
 async fn enforce_output(
     engine: &PolicyEngine,
@@ -354,36 +241,6 @@ async fn enforce_output(
     }
 
     Response::from_parts(parts, Body::from(bytes))
-}
-
-/// Rewrite the first assistant text field with the transformed text. Best-effort
-/// for the common OpenAI/Anthropic shapes.
-fn rewrite_output_text(provider: &str, json: &mut Value, new_text: &str) -> bool {
-    match provider {
-        "anthropic" => {
-            if let Some(parts) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
-                if let Some(first_text) = parts
-                    .iter_mut()
-                    .find(|p| p.get("text").map(|t| t.is_string()).unwrap_or(false))
-                {
-                    first_text["text"] = Value::String(new_text.to_string());
-                    return true;
-                }
-            }
-            false
-        }
-        _ => {
-            if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
-                if let Some(first) = choices.first_mut() {
-                    if let Some(msg) = first.get_mut("message") {
-                        msg["content"] = Value::String(new_text.to_string());
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-    }
 }
 
 fn log_decisions(

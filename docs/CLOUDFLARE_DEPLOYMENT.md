@@ -59,8 +59,18 @@ native server, from one codebase:
 
 See **[CLOUDFLARE_WORKER.md](CLOUDFLARE_WORKER.md)** for build/test/deploy steps.
 
-**Remaining:** output-phase + SSE streaming on the edge; Anthropic + Bedrock
-(Web-Crypto SigV4); edge telemetry sink + Workers-KV policies; `wasm-opt`.
+**Phase 2 — DONE (verified live on the global edge).** Anthropic (path/auth
+transform + Anthropic→OpenAI response conversion), Nova Guard input redaction,
+Nova Guard output-phase enforcement (block + redact, with an 8 MB inspection
+cap), and SSE streaming pass-through all work on the edge with full parity to
+native. The request/response transforms (`apply_input_transforms`,
+`flatten_output_text`, `rewrite_output_text`, `transform_anthropic_to_openai_format`)
+are one shared codebase used by both targets — verified live against OpenAI,
+Groq, Gemini, and Anthropic on `noveum-ai-gateway.<account>.workers.dev`.
+
+**Remaining:** **Bedrock** (the one provider still needing AWS SigV4 via Web
+Crypto, `crypto.subtle`); edge telemetry sink + Workers-KV policies; re-enable
+`wasm-opt`.
 
 ## How Cloudflare runs code (the constraint that drives everything)
 

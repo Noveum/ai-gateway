@@ -16,7 +16,11 @@ command = "worker-build --release"
 # Nova Guard policies for the edge (inline JSON). Empty/absent = transparent
 # pass-through, identical to the native gateway with no policies. For production,
 # prefer a Workers KV binding (see docs/CLOUDFLARE_DEPLOYMENT.md).
+#
+# This example exercises all three enforcement paths so parity is demonstrable:
+#   1. block-ssn-input     — reject inputs containing a US SSN (input phase)
+#   2. redact-input-phone  — mask phone numbers BEFORE the upstream call (input)
+#   3. redact-output-email — mask emails in the model's RESPONSE (output phase)
 [vars]
 NOVEUM_GUARD_ENABLED = "true"
-# Example: block US SSNs in the input and reject non-allowlisted models.
-NOVEUM_GUARD_POLICIES = '{"policies":[{"name":"block-ssn","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"ssn","regex":"\\d{3}-\\d{2}-\\d{4}"}],"action":"block"}}]}'
+NOVEUM_GUARD_POLICIES = '{"policies":[{"name":"block-ssn-input","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"ssn","regex":"\\d{3}-\\d{2}-\\d{4}"}],"action":"block"}},{"name":"redact-input-phone","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"phone","regex":"\\d{3}-\\d{3}-\\d{4}"}],"action":"redact","redactWith":"[PHONE]"}},{"name":"redact-output-email","type":"regex_match","mode":"enforce","config":{"phase":"output","patterns":[{"name":"email","regex":"[\\w.+-]+@[\\w-]+\\.[\\w.-]+"}],"action":"redact","redactWith":"[EMAIL]"}}]}'
