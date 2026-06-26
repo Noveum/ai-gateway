@@ -75,10 +75,19 @@ After deploy, the gateway answers at `https://noveum-ai-gateway.<account>.worker
 (or a custom route/domain) from the nearest PoP to each caller.
 
 ### Configuration (Worker `[vars]` / secrets)
-- `NOVEUM_GUARD_ENABLED` — `true`/`false` (default `true`).
+- The checked-in default is a **transparent proxy** — no policies, so nothing is
+  mutated or blocked until you opt in.
 - `NOVEUM_GUARD_POLICIES` — inline `nova-guard.json` (same schema as the native
-  `NOVEUM_GUARD_POLICIES`/file). For production, prefer a **Workers KV** binding
-  so policies propagate globally without a redeploy.
+  `NOVEUM_GUARD_POLICIES`/file). Setting it activates Nova Guard. For production,
+  prefer a **Workers KV** binding so policies propagate globally without a redeploy.
+- `NOVEUM_GUARD_ENABLED` — `true`/`false` (default `true`; with no policies it's
+  still a no-op).
+- `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` — `synthetic_success` (default: HTTP 200 with
+  a refusal-style completion) or `provider_error` (HTTP 403 + error envelope).
+  Identical to the native server.
+
+Non-JSON `/v1/*` request bodies (multipart, binary) are forwarded byte-for-byte
+and are not inspected; only `application/json` bodies run through Nova Guard.
 
 ## What runs on the edge today vs. next
 

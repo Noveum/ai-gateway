@@ -147,7 +147,7 @@ fn header_str<B>(req: &Request<B>, name: &str) -> Option<String> {
 // Request/response shaping is shared with the Cloudflare Worker so input/output
 // scanning + transforms are byte-identical on both deployment shapes.
 pub use crate::routing::{
-    apply_input_transforms, flatten_input_text, flatten_output_text, rewrite_output_text,
+    apply_input_transforms, apply_output_transforms, flatten_input_text, flatten_output_text,
 };
 
 async fn enforce_output(
@@ -228,10 +228,12 @@ async fn enforce_output(
         return block_response(provider, model, block, engine.block_mode());
     }
 
-    // Output transform: rewrite the assistant text in place for the common shapes.
-    if let Some(transformed) = &result.transformed_text {
+    // Output transform: redact EVERY assistant text segment in place (all
+    // choices / content blocks), not just the first, so multi-choice responses
+    // can't leak. Re-runs the transform per segment via the shared helper.
+    if result.transformed_text.is_some() {
         let mut out_json = body_json;
-        if rewrite_output_text(provider, &mut out_json, transformed) {
+        if apply_output_transforms(engine, model, provider, &mut out_json) {
             if let Ok(v) = serde_json::to_vec(&out_json) {
                 let mut parts = parts;
                 parts.headers.remove(header::CONTENT_LENGTH);
@@ -322,19 +324,23 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_openai_output_text() {
+    fn apply_output_transforms_redacts_all_openai_choices() {
+        // Output-phase email redaction over a multi-choice response: every choice
+        // must be rewritten (regression guard — the old helper did only the first).
+        let bundle = crate::policy::config::PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"red","type":"pii_detection","mode":"enforce","config":{"phase":"output","entities":["EMAIL_ADDRESS"],"action":"redact"}}]}"#,
+        )
+        .unwrap();
+        let e = PolicyEngine::from_bundle(&bundle, crate::policy::engine::EngineOptions::default());
         let mut j = serde_json::json!({
-            "choices": [{"message": {"role": "assistant", "content": "secret stuff"}}]
+            "choices": [
+                {"message": {"role": "assistant", "content": "ping a@b.com"}},
+                {"message": {"role": "assistant", "content": "or c@d.io"}}
+            ]
         });
-        assert!(rewrite_output_text("openai", &mut j, "[REDACTED]"));
-        assert_eq!(j["choices"][0]["message"]["content"], "[REDACTED]");
-    }
-
-    #[test]
-    fn rewrite_anthropic_output_text() {
-        let mut j = serde_json::json!({"content": [{"type": "text", "text": "secret"}]});
-        assert!(rewrite_output_text("anthropic", &mut j, "[X]"));
-        assert_eq!(j["content"][0]["text"], "[X]");
+        assert!(apply_output_transforms(&e, "gpt-4o", "openai", &mut j));
+        assert_eq!(j["choices"][0]["message"]["content"], "ping [REDACTED]");
+        assert_eq!(j["choices"][1]["message"]["content"], "or [REDACTED]");
     }
 
     fn redact_email_engine() -> PolicyEngine {

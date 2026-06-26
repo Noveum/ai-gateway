@@ -221,35 +221,74 @@ pub fn flatten_output_text(provider: &str, json: &Value) -> String {
     }
 }
 
-/// Rewrite the first assistant text field with the transformed text (output-phase
-/// redaction). Best-effort for the common OpenAI/Anthropic shapes; returns true
-/// if it rewrote anything.
-pub fn rewrite_output_text(provider: &str, json: &mut Value, new_text: &str) -> bool {
+/// Apply Nova Guard output transforms (redact/mask) to EVERY assistant text
+/// segment in a response body in place — every OpenAI `choices[].message.content`,
+/// every Anthropic `content[].text`, and every Gemini
+/// `candidates[].content.parts[].text`. Mirrors [`flatten_output_text`]'s full
+/// traversal so multi-choice / multi-block responses can't leak unredacted text.
+/// Returns true if anything was mutated.
+pub fn apply_output_transforms(
+    engine: &PolicyEngine,
+    model: &str,
+    provider: &str,
+    json: &mut Value,
+) -> bool {
+    let mut changed = false;
+    let transform = |s: &str| engine.apply_text_transforms(Phase::Output, model, s);
+
+    fn rewrite_str(v: &mut Value, transform: &dyn Fn(&str) -> Option<String>, changed: &mut bool) {
+        if let Value::String(s) = v {
+            if let Some(t) = transform(s) {
+                if &t != s {
+                    *v = Value::String(t);
+                    *changed = true;
+                }
+            }
+        }
+    }
+
     match provider {
         "anthropic" => {
             if let Some(parts) = json.get_mut("content").and_then(|c| c.as_array_mut()) {
-                if let Some(first_text) = parts
-                    .iter_mut()
-                    .find(|p| p.get("text").map(|t| t.is_string()).unwrap_or(false))
-                {
-                    first_text["text"] = Value::String(new_text.to_string());
-                    return true;
-                }
-            }
-            false
-        }
-        _ => {
-            if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
-                if let Some(first) = choices.first_mut() {
-                    if let Some(msg) = first.get_mut("message") {
-                        msg["content"] = Value::String(new_text.to_string());
-                        return true;
+                for part in parts.iter_mut() {
+                    if let Some(text) = part.get_mut("text") {
+                        rewrite_str(text, &transform, &mut changed);
                     }
                 }
             }
-            false
+        }
+        "google" | "gemini" => {
+            if let Some(cands) = json.get_mut("candidates").and_then(|c| c.as_array_mut()) {
+                for cand in cands.iter_mut() {
+                    if let Some(parts) = cand
+                        .get_mut("content")
+                        .and_then(|ct| ct.get_mut("parts"))
+                        .and_then(|p| p.as_array_mut())
+                    {
+                        for part in parts.iter_mut() {
+                            if let Some(text) = part.get_mut("text") {
+                                rewrite_str(text, &transform, &mut changed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // OpenAI / compatible
+        _ => {
+            if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                for choice in choices.iter_mut() {
+                    if let Some(content) =
+                        choice.get_mut("message").and_then(|m| m.get_mut("content"))
+                    {
+                        rewrite_str(content, &transform, &mut changed);
+                    }
+                }
+            }
         }
     }
+
+    changed
 }
 
 /// Convert an Anthropic Messages API response into the OpenAI Chat Completions
@@ -438,23 +477,49 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_output_text_in_place() {
-        let mut openai =
-            json!({"choices": [{"message": {"role": "assistant", "content": "secret"}}]});
-        assert!(rewrite_output_text("openai", &mut openai, "[REDACTED]"));
-        assert_eq!(openai["choices"][0]["message"]["content"], "[REDACTED]");
+    fn apply_output_transforms_redacts_every_segment() {
+        use crate::policy::config::PolicyBundle;
+        use crate::policy::engine::EngineOptions;
 
-        let mut anthropic = json!({"content": [{"type": "text", "text": "secret"}]});
-        assert!(rewrite_output_text(
-            "anthropic",
-            &mut anthropic,
-            "[REDACTED]"
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"redact-out","type":"regex_match","mode":"enforce","config":{"phase":"output","patterns":[{"name":"s","regex":"secret"}],"action":"redact","redactWith":"[X]"}}]}"#,
+        )
+        .expect("bundle parses");
+        let engine = PolicyEngine::from_bundle(&bundle, EngineOptions::default());
+
+        // OpenAI: BOTH choices must be redacted (regression: only the first was).
+        let mut openai = json!({"choices": [
+            {"message": {"role": "assistant", "content": "secret one"}},
+            {"message": {"role": "assistant", "content": "secret two"}}
+        ]});
+        assert!(apply_output_transforms(
+            &engine,
+            "gpt-4o",
+            "openai",
+            &mut openai
         ));
-        assert_eq!(anthropic["content"][0]["text"], "[REDACTED]");
+        assert_eq!(openai["choices"][0]["message"]["content"], "[X] one");
+        assert_eq!(openai["choices"][1]["message"]["content"], "[X] two");
 
-        // Nothing to rewrite → false.
-        let mut empty = json!({"choices": []});
-        assert!(!rewrite_output_text("openai", &mut empty, "x"));
+        // Anthropic: every text block.
+        let mut anthropic = json!({"content": [
+            {"type": "text", "text": "secret a"},
+            {"type": "text", "text": "secret b"}
+        ]});
+        assert!(apply_output_transforms(
+            &engine,
+            "claude",
+            "anthropic",
+            &mut anthropic
+        ));
+        assert_eq!(anthropic["content"][0]["text"], "[X] a");
+        assert_eq!(anthropic["content"][1]["text"], "[X] b");
+
+        // No match → false.
+        let mut clean = json!({"choices": [{"message": {"content": "all clear"}}]});
+        assert!(!apply_output_transforms(
+            &engine, "gpt-4o", "openai", &mut clean
+        ));
     }
 
     #[test]

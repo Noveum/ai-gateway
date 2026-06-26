@@ -46,20 +46,26 @@ impl TokenLengthCapRule {
 /// Estimate token count for arbitrary text.
 ///
 /// Native builds use the exact `o200k_base` BPE encoding (cached singleton).
-/// The wasm32 / Cloudflare Worker build uses a `chars / 4` heuristic instead —
 /// `tiktoken-rs` bundles a multi-megabyte vocab and pulls `fancy-regex`, which
-/// would bloat the Worker bundle and risk the size/startup limits. The heuristic
-/// is conservative for a guardrail (it can only under-count pathological inputs).
+/// would bloat the Worker bundle, so the wasm32 build cannot use it.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn estimate_tokens(text: &str) -> u32 {
     let bpe = tiktoken_rs::o200k_base_singleton();
     bpe.encode_with_special_tokens(text).len() as u32
 }
 
-/// wasm32 token estimate: `ceil(chars / 4)` (≈ average English token length).
+/// wasm32 / Cloudflare Worker token estimate: a SAFE UPPER BOUND.
+///
+/// `TokenLengthCapRule` fires only when the estimate *exceeds* `max_tokens`, so
+/// the wasm estimator must never UNDER-count — otherwise an over-limit prompt
+/// (CJK, emoji, minified code) slips past the cap. For byte-level BPE (o200k),
+/// the token count is always ≤ the UTF-8 byte length (the base alphabet is
+/// single bytes; merges only ever reduce the count), so `text.len()` is a sound
+/// upper bound. It over-counts versus the exact native count, so the edge errs
+/// toward blocking — the correct failure mode for a guardrail.
 #[cfg(target_arch = "wasm32")]
 pub fn estimate_tokens(text: &str) -> u32 {
-    (text.chars().count() as f32 / 4.0).ceil() as u32
+    text.len().min(u32::MAX as usize) as u32
 }
 
 impl PolicyRule for TokenLengthCapRule {

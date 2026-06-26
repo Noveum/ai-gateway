@@ -208,6 +208,18 @@ impl Provider for AnthropicProvider {
             // Extract the ID from the JSON response for later use
             let json_id = json.get("id").and_then(|v| v.as_str()).map(String::from);
 
+            // Only convert SUCCESSFUL Messages responses to OpenAI shape. For
+            // 4xx/5xx, preserve the upstream Anthropic error envelope + status
+            // (matches the edge Worker) instead of emitting an empty
+            // "chat.completion" payload.
+            if !parts.status.is_success() {
+                debug!(
+                    "Anthropic returned {}; passing the error body through unchanged",
+                    parts.status
+                );
+                return Ok(Response::from_parts(parts, Body::from(bytes)));
+            }
+
             // Transform Anthropic API response to OpenAI format (shared with the
             // edge Worker; timestamp passed in since chrono is wasm-unavailable).
             let transformed_response =

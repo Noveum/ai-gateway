@@ -8,25 +8,37 @@
 //! `reqwest`/`tokio`).
 //!
 //! Parity with the native server: same provider routing, same `x-provider`
-//! contract, same Nova Guard input/output decisions + redaction, and the same
+//! contract, same Nova Guard input/output decisions + redaction, the same block
+//! response modes (`NOVEUM_GUARD_BLOCK_RESPONSE_MODE`), and the same
 //! Anthropic→OpenAI response conversion. Streaming responses pass through
 //! without output‑phase enforcement (the documented v1 limitation, identical to
-//! native). Bedrock (AWS SigV4 via Web Crypto) lands in a later phase.
+//! native). Non‑JSON `/v1/*` bodies are forwarded byte‑for‑byte. Bedrock (AWS
+//! SigV4 via Web Crypto) lands in a later phase.
 
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use worker::*;
 
-use crate::policy::{decision::Phase, PolicyEngine};
+use crate::policy::decision::{Phase, PolicyDecision};
+use crate::policy::synthetic::{block_body, block_status, policy_header_token, BlockResponseMode};
+use crate::policy::PolicyEngine;
 use crate::routing::{
-    apply_input_transforms, flatten_input_text, flatten_output_text, resolve_provider,
-    rewrite_output_text, transform_anthropic_to_openai_format, upstream_url,
+    apply_input_transforms, apply_output_transforms, flatten_input_text, flatten_output_text,
+    resolve_provider, transform_anthropic_to_openai_format, upstream_url,
 };
+
+/// Max response size we will buffer for output-phase inspection. Larger
+/// responses pass through uninspected (matches native; avoids OOM on the
+/// 128 MB isolate).
+const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Build the Nova Guard engine from an in‑memory bundle.
 ///
 /// On the edge, policies come from the `NOVEUM_GUARD_POLICIES` Worker var/secret
 /// (inline JSON) or KV (future); there is no filesystem. Absent/invalid config
 /// degrades to a transparent pass‑through, exactly like the native `from_env`.
+/// Honors `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` the same way `PolicyEngine::from_env`
+/// does, so block shapes match the native server.
 fn build_engine(env: &Env) -> PolicyEngine {
     use crate::policy::config::PolicyBundle;
     use crate::policy::engine::EngineOptions;
@@ -41,8 +53,14 @@ fn build_engine(env: &Env) -> PolicyEngine {
         })
         .unwrap_or(true);
 
+    let block_mode = env
+        .var("NOVEUM_GUARD_BLOCK_RESPONSE_MODE")
+        .map(|v| BlockResponseMode::from_env_str(&v.to_string()))
+        .unwrap_or(BlockResponseMode::SyntheticSuccess);
+
     let opts = EngineOptions {
         enabled,
+        block_mode,
         ..Default::default()
     };
 
@@ -56,23 +74,42 @@ fn build_engine(env: &Env) -> PolicyEngine {
     PolicyEngine::from_bundle(&bundle, opts)
 }
 
-/// Nova Guard block envelope (OpenAI-style error). Returned with HTTP 200 +
-/// `x-noveum-guard-blocked` so clients can detect a guard block distinctly from
-/// an upstream error.
-fn guard_block_response(policy_name: &str, reason: &str) -> Result<Response> {
+/// Build a Nova Guard block response in the engine's configured mode, using the
+/// SHARED body/status builders so it is byte-identical to the native server.
+fn guard_block_response(
+    provider: &str,
+    model: &str,
+    decision: &PolicyDecision,
+    mode: BlockResponseMode,
+) -> Result<Response> {
+    let body = block_body(provider, model, decision, mode);
     let headers = Headers::new();
     headers.set("content-type", "application/json")?;
     headers.set("x-noveum-guard-blocked", "true")?;
-    let body = json!({
-        "error": {
-            "message": format!("Blocked by Nova Guard policy '{policy_name}': {reason}"),
-            "type": "guard_blocked",
-            "code": "noveum_guard_blocked",
-        }
-    });
+    headers.set(
+        "x-noveum-guard-policy",
+        &policy_header_token(&decision.policy_id),
+    )?;
     Ok(Response::from_json(&body)?
         .with_headers(headers)
-        .with_status(200))
+        .with_status(block_status(mode)))
+}
+
+/// Read a response body with a hard byte cap. Reads incrementally so a chunked /
+/// missing-`Content-Length` body cannot blow past the cap and OOM the isolate.
+/// `Err(())` means the body exceeded the cap (it can't be safely re-streamed) —
+/// the caller returns 502, matching native's behavior.
+async fn read_body_capped(resp: &mut Response) -> core::result::Result<Vec<u8>, ()> {
+    let mut stream = resp.stream().map_err(|_| ())?;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        if buf.len() + chunk.len() > MAX_BODY {
+            return Err(());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 #[event(fetch)]
@@ -106,9 +143,27 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         );
     }
 
-    // Read + parse the body once (JSON chat bodies are text).
-    let body_text = req.text().await.unwrap_or_default();
-    let mut body_json: Option<Value> = serde_json::from_str(&body_text).ok();
+    // Only JSON bodies are parsed/guarded/transformed. Non-JSON (multipart,
+    // binary) bodies are forwarded byte-for-byte, like the native proxy.
+    let is_json_req = req
+        .headers()
+        .get("content-type")
+        .ok()
+        .flatten()
+        .map(|ct| ct.to_ascii_lowercase().contains("application/json"))
+        .unwrap_or(false);
+
+    let engine = build_engine(&env);
+    let guard_active = engine.is_enabled() && engine.active_policy_count() > 0;
+    let block_mode = engine.block_mode();
+
+    // Read the raw request body once (so non-JSON forwards unchanged).
+    let body_bytes = req.bytes().await.unwrap_or_default();
+    let mut body_json: Option<Value> = if is_json_req {
+        serde_json::from_slice(&body_bytes).ok()
+    } else {
+        None
+    };
     let model = body_json
         .as_ref()
         .and_then(|j| j.get("model"))
@@ -116,28 +171,19 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .unwrap_or("")
         .to_string();
 
-    let engine = build_engine(&env);
-    let guard_active = engine.is_enabled() && engine.active_policy_count() > 0;
-
     // --- Nova Guard input phase (block, then redact/mask transforms) ---
     if guard_active {
-        if let Some(json) = &body_json {
-            let input_text = flatten_input_text(json);
-            let result = engine.evaluate(Phase::Input, &model, &input_text, Some(json), None, None);
+        if let Some(j) = &body_json {
+            let input_text = flatten_input_text(j);
+            let result = engine.evaluate(Phase::Input, &model, &input_text, Some(j), None, None);
             if let Some(block) = &result.block {
-                return guard_block_response(&block.policy_name, &block.reason);
+                return guard_block_response(&provider, &model, block, block_mode);
             }
         }
-        if let Some(json) = body_json.as_mut() {
-            apply_input_transforms(&engine, &model, json);
+        if let Some(j) = body_json.as_mut() {
+            apply_input_transforms(&engine, &model, j);
         }
     }
-
-    // The body to forward (carries any input redactions).
-    let forward_body = match &body_json {
-        Some(j) => serde_json::to_string(j).unwrap_or_else(|_| body_text.clone()),
-        None => body_text.clone(),
-    };
 
     // --- Build the outbound request (provider-specific routing/auth) ---
     let (url, out_headers) = if is_anthropic {
@@ -159,10 +205,20 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (upstream_url(&route, &path), headers)
     };
 
+    // Forward the (possibly redacted) JSON as a string, or the original bytes
+    // verbatim for non-JSON requests.
     let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(out_headers)
-        .with_body(Some(forward_body.into()));
+    init.with_method(Method::Post).with_headers(out_headers);
+    match &body_json {
+        Some(j) => {
+            init.with_body(Some(serde_json::to_string(j).unwrap_or_default().into()));
+        }
+        None => {
+            let arr = js_sys::Uint8Array::new_with_length(body_bytes.len() as u32);
+            arr.copy_from(&body_bytes);
+            init.with_body(Some(arr.into()));
+        }
+    }
     let out_req = Request::new_with_init(&url, &init)?;
     let mut resp = Fetch::Request(out_req).send().await?;
 
@@ -187,26 +243,37 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Ok(resp);
     }
 
-    // Don't buffer responses beyond the inspection cap — pass them through
-    // uninspected rather than risk OOM on the 128 MB isolate (matches native).
-    const MAX_BODY: u64 = 8 * 1024 * 1024;
-    let too_large = resp
+    // Fast path: a declared length over the cap → pass through unbuffered.
+    let declared = resp
         .headers()
         .get("content-length")
         .ok()
         .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|n| n > MAX_BODY)
-        .unwrap_or(false);
-    if too_large {
+        .and_then(|v| v.parse::<usize>().ok());
+    if matches!(declared, Some(n) if n > MAX_BODY) {
         return Ok(resp);
     }
 
     let status = resp.status_code();
-    let text = resp.text().await.unwrap_or_default();
-    let mut out_json: Value = match serde_json::from_str(&text) {
+
+    // Read with a hard cap (covers chunked / missing Content-Length).
+    let bytes = match read_body_capped(&mut resp).await {
+        Ok(b) => b,
+        Err(()) => {
+            let headers = Headers::new();
+            headers.set("content-type", "application/json")?;
+            return Ok(Response::from_json(&json!({
+                "error": {"message": "upstream response exceeded gateway inspection limit", "type": "gateway_error"}
+            }))?
+            .with_headers(headers)
+            .with_status(502));
+        }
+    };
+
+    let mut out_json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
-        Err(_) => return Ok(Response::ok(text)?.with_status(status)),
+        // Not JSON — return the buffered bytes unchanged with the upstream status.
+        Err(_) => return Ok(Response::from_bytes(bytes)?.with_status(status)),
     };
 
     // Anthropic → OpenAI shape for parity (only successful responses carry the
@@ -229,10 +296,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 None,
             );
             if let Some(block) = &result.block {
-                return guard_block_response(&block.policy_name, &block.reason);
+                return guard_block_response("openai", &model, block, block_mode);
             }
-            if let Some(transformed) = &result.transformed_text {
-                rewrite_output_text("openai", &mut out_json, transformed);
+            if result.transformed_text.is_some() {
+                apply_output_transforms(&engine, &model, "openai", &mut out_json);
             }
         }
     }

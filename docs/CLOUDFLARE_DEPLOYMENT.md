@@ -19,7 +19,7 @@ both builds so they never diverge.
 | Outbound HTTP | `worker::Fetch` | `reqwest` |
 | Crypto (Bedrock SigV4) | **Web Crypto** (`crypto.subtle` HMAC‑SHA256) | `aws-sigv4` |
 | Token caps | heuristic / wasm‑safe tokenizer | `tiktoken-rs` |
-| Built from | new `worker/` crate | existing `noveum-ai-gateway` crate (published, unchanged) |
+| Built from | the **same** `noveum-ai-gateway` crate (`--target wasm32 --no-default-features`) | the **same** crate (`cargo build`, default `native` feature) |
 
 **Shared core:** the Nova Guard engine (regex/PII/secrets/banned/model‑allowlist/
 json‑schema), pricing/cost, and provider base‑URL/path mapping live in one place
@@ -145,10 +145,11 @@ streaming SSE pass‑through), **Bedrock SigV4** (→ Web Crypto), **tiktoken**
       cost than isolates; not literally per‑PoP.
 
 ### Phase 2 — Workers‑native core (the real edge play)
-Build a parallel `worker`‑based crate (workspace member or feature‑gated build)
-that handles the **OpenAI‑compatible providers** (OpenAI, Groq, Together,
-Fireworks, Mistral, Cohere, Gemini, DeepSeek, xAI, OpenRouter, Perplexity — i.e.
-everything except Bedrock):
+**Implemented in the single `noveum-ai-gateway` crate via target gating** (NOT a
+separate/workspace crate): the wasm32 build (`src/worker_rt.rs`, compiled with
+`--no-default-features`) handles **all OpenAI‑compatible providers + Anthropic**
+(OpenAI, Groq, Together, Fireworks, Mistral, Cohere, Gemini, DeepSeek, xAI,
+OpenRouter, Perplexity, Anthropic — everything except Bedrock):
 - [ ] Scaffold with `worker` 0.8.x + `wrangler`; target `wasm32-unknown-unknown`.
 - [ ] **Router:** port the `/v1/*` + `/health` routes to the `worker` router.
 - [ ] **Proxy:** reimplement `proxy_request_to_provider` using `worker::Fetch`

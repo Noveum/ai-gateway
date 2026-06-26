@@ -13,14 +13,20 @@ compatibility_date = "2024-11-01"
 [build]
 command = "worker-build --release"
 
-# Nova Guard policies for the edge (inline JSON). Empty/absent = transparent
-# pass-through, identical to the native gateway with no policies. For production,
-# prefer a Workers KV binding (see docs/CLOUDFLARE_DEPLOYMENT.md).
+# Nova Guard configuration. The checked-in default is a TRANSPARENT proxy:
+# no policies are loaded, so `wrangler dev`/`wrangler deploy` will not mutate or
+# reject any traffic. Opt in by setting `NOVEUM_GUARD_POLICIES` (inline JSON, the
+# same schema as the native `nova-guard.json`) — uncomment the example below or,
+# for production, use a `wrangler secret` / Workers KV (see
+# docs/CLOUDFLARE_DEPLOYMENT.md). Optional: `NOVEUM_GUARD_BLOCK_RESPONSE_MODE`
+# (`guard_error` | `provider_error`).
 #
-# This example exercises all three enforcement paths so parity is demonstrable:
-#   1. block-ssn-input     — reject inputs containing a US SSN (input phase)
-#   2. redact-input-phone  — mask phone numbers BEFORE the upstream call (input)
-#   3. redact-output-email — mask emails in the model's RESPONSE (output phase)
+# Example policy set exercising all three enforcement paths (do NOT enable
+# blindly on a shared deployment — it will block SSNs and redact phones/emails):
+#   NOVEUM_GUARD_POLICIES = '{"policies":[
+#     {"name":"block-ssn-input","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"ssn","regex":"\\d{3}-\\d{2}-\\d{4}"}],"action":"block"}},
+#     {"name":"redact-input-phone","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"phone","regex":"\\d{3}-\\d{3}-\\d{4}"}],"action":"redact","redactWith":"[PHONE]"}},
+#     {"name":"redact-output-email","type":"regex_match","mode":"enforce","config":{"phase":"output","patterns":[{"name":"email","regex":"[\\w.+-]+@[\\w-]+\\.[\\w.-]+"}],"action":"redact","redactWith":"[EMAIL]"}}
+#   ]}'
 [vars]
-NOVEUM_GUARD_ENABLED = "true"
-NOVEUM_GUARD_POLICIES = '{"policies":[{"name":"block-ssn-input","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"ssn","regex":"\\d{3}-\\d{2}-\\d{4}"}],"action":"block"}},{"name":"redact-input-phone","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"phone","regex":"\\d{3}-\\d{3}-\\d{4}"}],"action":"redact","redactWith":"[PHONE]"}},{"name":"redact-output-email","type":"regex_match","mode":"enforce","config":{"phase":"output","patterns":[{"name":"email","regex":"[\\w.+-]+@[\\w-]+\\.[\\w.-]+"}],"action":"redact","redactWith":"[EMAIL]"}}]}'
+# (no NOVEUM_GUARD_POLICIES → transparent proxy; set it to enable Nova Guard)
