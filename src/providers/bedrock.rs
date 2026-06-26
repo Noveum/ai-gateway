@@ -556,7 +556,7 @@ impl Provider for BedrockProvider {
                 // CORS headers
                 .header("access-control-allow-origin", "*")
                 .header("access-control-allow-methods", "POST, OPTIONS")
-                .header("access-control-allow-headers", "content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region")
+                .header("access-control-allow-headers", "content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region, x-aws-session-token")
                 .header("access-control-expose-headers", "*")
                 // SSE specific headers for better client compatibility
                 .header("x-accel-buffering", "no")
@@ -630,7 +630,7 @@ impl Provider for BedrockProvider {
             builder = builder
                 .header("access-control-allow-origin", "*")
                 .header("access-control-allow-methods", "POST, OPTIONS")
-                .header("access-control-allow-headers", "content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region")
+                .header("access-control-allow-headers", "content-type, x-provider, x-aws-access-key-id, x-aws-secret-access-key, x-aws-region, x-aws-session-token")
                 .header("access-control-expose-headers", "*");
 
             // Add the request ID header if we have one
