@@ -474,13 +474,55 @@ include_usage else `len/4` estimate); **no metrics → no record → no trace.**
 inbound trace context read today.** `RequestMetrics` carries full request/response
 bodies + `streamed_data`; a `to_otel_log()` (flat, non-OTLP) already exists.
 
-## Appendix C — LLM-observability platforms + propagation (prior round)
+## Appendix C — LLM-observability platforms + propagation
 
-**OTel gen_ai (span attrs)** — see Appendix E (refreshed). **Platforms:** Langfuse
-(traces/sessions/users/scores, prompt mgmt, evals), LangSmith, Arize Phoenix
-(OTel-native), Traceloop/OpenLLMetry (emits gen_ai spans; lags on names), Datadog
-LLM Obs, Braintrust, Helicone (sessions via `Helicone-Session-Id/-Path/-Name`),
-Portkey (native dashboard). **Propagation patterns:** W3C `traceparent`
+**OTel gen_ai (span attrs)** — see Appendix E.
+
+**The de-facto observability baseline (8 platforms converge on this — what the
+Noveum trace platform should support to stay competitive):** (1) trace→span tree;
+(2) **typed spans** for LLM topology — a near-universal set: LLM/generation, tool,
+retriever, embedding, chain/workflow, agent (+ guardrail, evaluator, reranker,
+prompt in the richest); (3) **OTLP ingestion is table stakes** (all but Helicone
+expose a native OTLP endpoint + map `gen_ai.*`); (4) token+cost from a pricing
+table incl. **cached-token differential pricing**; (5) latency + **TTFT** +
+p50/p95/p99 (tokens/sec is NOT a named metric anywhere); (6) **session/thread**
+grouping; (7) **scores** from 4 sources (user feedback, LLM-judge, code, human
+annotation); (8) **prompt mgmt + versioning + replay playground**; (9) PII
+masking/opt-out; (10) self-hosting.
+
+**Span-type taxonomies (for choosing Noveum's):** Langfuse 10 observation types
+(event/span/generation/agent/tool/chain/retriever/evaluator/embedding/guardrail);
+Arize Phoenix 10 OpenInference kinds (LLM/EMBEDDING/CHAIN/RETRIEVER/RERANKER/TOOL/
+AGENT/GUARDRAIL/EVALUATOR/PROMPT); LangSmith 7 run_types (chain/llm/embedding/
+prompt/tool/retriever/parser); Datadog 7 (llm/workflow/agent/tool/task/embedding/
+retrieval); Braintrust 7 eval-oriented (llm/score/function/eval/task/tool/review);
+Traceloop 4 decorators (workflow/task/agent/tool); Helicone none (request+session).
+The `noveum-trace` SDK encodes type as a **name prefix** (`llm.`/`tool.`/`agent.`/
+`retrieval.`/`chain.`) — consider adopting a richer typed-span set later.
+
+**Per-platform highlights:** **Langfuse** — OTLP `/api/public/otel`, metrics API
+(`timeToFirstToken`, p50–p99), scores NUMERIC/CATEGORICAL/BOOLEAN, OSS self-host.
+**LangSmith** — `langsmith.span.kind` or `gen_ai.operation.name`, Threads via
+`thread_id`, `first_token_p99`, Presidio/Comprehend masking. **Arize Phoenix** —
+OpenInference, OTLP 6006/4317, latency quantiles, `__REDACTED__` masking, Elastic
+License self-host. **Traceloop/OpenLLMetry** — pure OTel (older `prompt/completion`
+spelling), `traceloop.span.kind`, content-logging ON by default
+(`TRACELOOP_TRACE_CONTENT=false` to opt out). **Datadog LLM Obs** — 7 span kinds,
+cost in nanodollars, Sensitive Data Scanner redaction, SaaS-only. **Braintrust** —
+eval-first, OTLP `/otel/v1/traces` (`x-bt-parent`), hybrid VPC data plane.
+**Helicone** ⚠️ — request/session model (`Helicone-Session-Id/-Path/-Name`,
+`Helicone-User-Id`), scores integer/bool only, **no native OTLP**, exact-cache.
+**Portkey** — OTLP `/v1/otel` + W3C `traceparent`/`baggage`, `x-portkey-trace-id`/
+`-span-id`/`-parent-span-id`, semantic cache (cosine ≥0.95), hybrid VPC.
+
+**Cross-platform contrasts that matter for us:** OTLP ingestion + `gen_ai.*`
+mapping is universal (we should ingest it too, normalizing deprecated names);
+**cache-hit-rate** is a named metric only on the gateway-first tools (Helicone/
+Portkey) — a gap we can own; **managed PII redaction** is strongest on Datadog
+(SDS) + Portkey (Guardrails) — Nova Guard already gives us this; feedback/score
+value ranges differ per platform (design Noveum's score model deliberately).
+
+**Propagation patterns:** W3C `traceparent`
 (keep trace-id, new span-id, parent=incoming) — LiteLLM honors it; Helicone
 `Helicone-Session-Id`; Portkey `x-portkey-trace-id`/`-span-id`/`-parent-span-id`
 (+ W3C); LiteLLM `metadata.trace_id`/`existing_trace_id`. **Streaming usage:**
