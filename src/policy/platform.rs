@@ -19,14 +19,6 @@ use serde_json::{json, Value};
 use crate::policy::config::PolicyBundle;
 use crate::policy::rules::LiveState;
 
-fn map_mode(mode: &str) -> &'static str {
-    match mode.to_ascii_uppercase().as_str() {
-        "ENFORCE" => "enforce",
-        "OFF" => "off",
-        _ => "shadow",
-    }
-}
-
 fn map_action(_action: &str) -> &'static str {
     // Platform Phase 0 only defines BLOCK; map everything to the gateway's `block`.
     "block"
@@ -77,15 +69,51 @@ pub fn translate_policies(platform: &Value) -> Value {
                 .and_then(|n| n.as_str())
                 .unwrap_or(policy_type)
                 .to_string();
-            let mode = map_mode(p.get("mode").and_then(|m| m.as_str()).unwrap_or("SHADOW"));
+            // The platform's `mode` field is deprecated — the UI no longer sets it,
+            // so it serializes as `null`, and backend enforcement keys off `enabled`
+            // (already checked above). So an enabled policy *enforces* unless it
+            // carries an explicit SHADOW/OFF mode. Defaulting a mode-less policy to
+            // `shadow` (the previous behavior) silently turned every platform policy
+            // into a no-op that recorded decisions but never blocked.
+            let mode = match p
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .map(|m| m.to_ascii_uppercase())
+                .as_deref()
+            {
+                Some("OFF") => continue, // explicitly disabled → don't enforce at all
+                Some("SHADOW") => "shadow",
+                _ => "enforce", // "ENFORCE", or the common null/absent case
+            };
+            // Carry the platform's `failClosed` through so `cost_cap`/`rate_limit`
+            // block (rather than fail open) when `/state` is unreachable.
+            let fail_closed = p
+                .get("failClosed")
+                .and_then(|f| f.as_bool())
+                .unwrap_or(false);
+            // Carry the platform `policyId` so decisions + BLOCKED usage events
+            // reference the real id (not the policy name).
+            let policy_id = p.get("policyId").and_then(|v| v.as_str());
+            // Carry `priority` so the engine evaluates policies in the platform's
+            // order (lower number = higher precedence); otherwise every policy
+            // collapses to the default priority and ordering is lost.
+            let priority = p.get("priority").and_then(|v| v.as_i64());
             let config =
                 normalize_config(policy_type, p.get("config").cloned().unwrap_or(json!({})));
-            policies.push(json!({
+            let mut out = json!({
                 "name": name,
                 "type": policy_type,
                 "mode": mode,
+                "failClosed": fail_closed,
                 "config": config,
-            }));
+            });
+            if let Some(id) = policy_id {
+                out["policyId"] = json!(id);
+            }
+            if let Some(pr) = priority {
+                out["priority"] = json!(pr);
+            }
+            policies.push(out);
         }
     }
 
@@ -146,7 +174,7 @@ mod tests {
     #[test]
     fn translates_cost_cap_and_rate_limit_with_casing() {
         let platform = json!({"policies": [
-            {"policyId":"p1","name":"Monthly budget","type":"COST_CAP","mode":"ENFORCE","enabled":true,
+            {"policyId":"p1","name":"Monthly budget","type":"COST_CAP","mode":"ENFORCE","enabled":true,"failClosed":true,"priority":10,
              "config":{"window":"30d_rolling","maxUsd":100.0,"softUsd":80.0,"action":"BLOCK"}},
             {"policyId":"p2","name":"Rate","type":"RATE_LIMIT","mode":"SHADOW","enabled":true,
              "config":{"windows":[{"period":"1m","maxRequests":60,"action":"BLOCK"}]}},
@@ -159,6 +187,9 @@ mod tests {
         assert_eq!(pols.len(), 2, "disabled + non-phase-0 types are skipped");
         assert_eq!(pols[0]["type"], "cost_cap");
         assert_eq!(pols[0]["mode"], "enforce");
+        assert_eq!(pols[0]["policyId"], "p1", "policyId carried through");
+        assert_eq!(pols[0]["priority"], 10, "priority carried through");
+        assert_eq!(pols[0]["failClosed"], true, "failClosed carried through");
         assert_eq!(pols[0]["config"]["action"], "block");
         assert_eq!(pols[0]["config"]["window"], "30d_rolling");
         assert_eq!(pols[0]["config"]["maxUsd"], 100.0);
@@ -169,6 +200,54 @@ mod tests {
         let bundle = translate_bundle(&platform).expect("bundle parses");
         let engine = PolicyEngine::from_bundle(&bundle, EngineOptions::default());
         assert_eq!(engine.active_policy_count(), 2);
+    }
+
+    #[test]
+    fn mode_defaults_to_enforce_when_absent_or_null() {
+        // The backend's `mode` field is deprecated and typically serialized as
+        // `null` (or omitted). Enforcement keys off `enabled`, so a mode-less
+        // enabled policy must ENFORCE — not silently degrade to shadow.
+        let platform = json!({"policies": [
+            {"policyId":"a","name":"no-mode","type":"COST_CAP","enabled":true,
+             "config":{"window":"1d_rolling","maxUsd":5.0,"action":"BLOCK"}},
+            {"policyId":"b","name":"null-mode","type":"COST_CAP","mode":null,"enabled":true,
+             "config":{"window":"1d_rolling","maxUsd":5.0,"action":"BLOCK"}},
+        ]});
+        let out = translate_policies(&platform);
+        let pols = out["policies"].as_array().unwrap();
+        assert_eq!(pols.len(), 2);
+        assert_eq!(pols[0]["mode"], "enforce", "absent mode → enforce");
+        assert_eq!(pols[1]["mode"], "enforce", "null mode → enforce");
+    }
+
+    #[test]
+    fn explicit_off_mode_is_skipped() {
+        let platform = json!({"policies": [
+            {"policyId":"a","name":"off","type":"COST_CAP","mode":"OFF","enabled":true,
+             "config":{"window":"1d_rolling","maxUsd":5.0,"action":"BLOCK"}},
+            {"policyId":"b","name":"on","type":"COST_CAP","mode":"ENFORCE","enabled":true,
+             "config":{"window":"1d_rolling","maxUsd":5.0,"action":"BLOCK"}},
+        ]});
+        let out = translate_policies(&platform);
+        let pols = out["policies"].as_array().unwrap();
+        assert_eq!(pols.len(), 1, "OFF mode is dropped");
+        assert_eq!(pols[0]["name"], "on");
+    }
+
+    #[test]
+    fn enabled_mode_less_cost_cap_actually_blocks() {
+        // End-to-end guard against the shadow-default regression: a platform
+        // cost_cap with no `mode` and spend over the cap MUST produce a block.
+        let platform = json!({"policies":[{"policyId":"x","name":"cap","type":"COST_CAP","enabled":true,
+            "config":{"window":"1d_rolling","maxUsd":10.0,"action":"BLOCK"}}]});
+        let bundle = translate_bundle(&platform).unwrap();
+        let engine = PolicyEngine::from_bundle(&bundle, EngineOptions::default());
+        let live = state_to_live_state(&json!({"cost":{"1d_rolling": 25.0}, "rate":{}}));
+        let result = engine.evaluate(Phase::Input, "gpt-4o", "hello", None, None, Some(&live));
+        assert!(
+            result.block.is_some(),
+            "a mode-less enabled cost_cap over the cap must block"
+        );
     }
 
     #[test]

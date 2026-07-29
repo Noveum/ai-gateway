@@ -38,6 +38,9 @@ const MAX_BODY: usize = 8 * 1024 * 1024;
 pub struct GuardState {
     pub engine: Arc<PolicyEngine>,
     pub live: Option<Arc<crate::policy::remote::RemoteLiveState>>,
+    /// Reports BLOCKED usage events to the platform. `None` when platform-managed
+    /// Nova Guard (and thus usage reporting) isn't configured.
+    pub usage: Option<crate::policy::usage::UsageReporter>,
 }
 
 pub async fn guard_middleware(
@@ -110,6 +113,31 @@ pub async fn guard_middleware(
                 provider = %provider, model = %model, policy = %block.policy_id,
                 reason = %block.reason, "Nova Guard blocked request (input phase)"
             );
+            // Report a BLOCKED usage event for cost_cap/rate_limit blocks. The
+            // platform only accepts those as usage blocks (text-rule blocks like
+            // PII/regex map to no `blockedBy`, so they're not reported). Sent in
+            // place of the model call; the platform doesn't meter it and fires the
+            // owner "limit hit" email.
+            //
+            // Require live state to have been present: only a block backed by real
+            // counters is a genuine limit breach. A fail-closed block caused by an
+            // unreachable `/state` is *not* reported — it isn't a "limit hit" and
+            // must not trigger the owner email (matches the SDK).
+            if live_state.is_some() {
+                if let Some(reporter) = &gs.usage {
+                    if let Some(blocked_by) =
+                        crate::policy::usage::blocked_by_for(&block.policy_type)
+                    {
+                        reporter.report(crate::policy::usage::UsageEvent::blocked(
+                            crate::policy::usage::new_event_id(),
+                            model.clone(),
+                            blocked_by,
+                            Some(block.policy_id.clone()),
+                            Some(block.reason.clone()),
+                        ));
+                    }
+                }
+            }
             return block_response(&provider, &model, block, engine.block_mode());
         }
 

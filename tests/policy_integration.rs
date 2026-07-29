@@ -53,9 +53,11 @@ async fn canned_secret_handler() -> Response {
 
 fn router(engine: PolicyEngine) -> Router {
     // No platform live-state in tests (`live: None`) → cost_cap/rate_limit fail open.
+    // No usage reporter either (`usage: None`).
     let guard_state = noveum_ai_gateway::policy::middleware::GuardState {
         engine: Arc::new(engine),
         live: None,
+        usage: None,
     };
     Router::new()
         .route("/v1/chat/completions", post(echo_handler))

@@ -46,6 +46,21 @@ impl PolicyMeta {
     }
 }
 
+/// Format a USD amount for a human-readable policy reason. Uses 2 decimals for
+/// normal amounts, but keeps up to 6 (trimmed) for sub-cent caps so a tiny cap
+/// like `$0.00001` isn't rounded to a meaningless `$0.00` in the audit log.
+fn fmt_usd(v: f64) -> String {
+    // Anything that rounds to zero at 6 decimals (incl. 0.0 and -0.0) → "0.00".
+    if v.abs() < 0.000_000_5 {
+        "0.00".to_string()
+    } else if v.abs() < 0.01 {
+        let s = format!("{v:.6}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        format!("{v:.2}")
+    }
+}
+
 /// `cost_cap` / `rate_limit` need a cross-request live-state backend to evaluate
 /// spend/rate. None is currently bundled, so they always fail open. A policy
 /// authored with `failClosed: true` would otherwise block 100% of traffic
@@ -120,6 +135,12 @@ pub struct EngineOptions {
     /// When live state is unavailable, fail open (allow) unless a policy opts into
     /// fail-closed.
     pub fail_open_default: bool,
+    /// Whether a live cost/rate state backend (the platform bridge) is wired in.
+    /// When `false`, `cost_cap`/`rate_limit` `failClosed` is neutralized at compile
+    /// time — no state can ever arrive, so honoring it would block all traffic
+    /// permanently. When `true`, `failClosed` is honored (a transient `/state`
+    /// outage blocks, as intended).
+    pub live_state_backed: bool,
 }
 
 impl EngineOptions {
@@ -143,6 +164,7 @@ impl EngineOptions {
             enabled,
             block_mode,
             fail_open_default: true,
+            live_state_backed: false,
         }
     }
 }
@@ -153,6 +175,7 @@ impl Default for EngineOptions {
             enabled: true,
             block_mode: BlockResponseMode::SyntheticSuccess,
             fail_open_default: true,
+            live_state_backed: false,
         }
     }
 }
@@ -161,16 +184,18 @@ pub struct PolicyEngine {
     state: ArcSwap<EngineState>,
     block_mode: BlockResponseMode,
     fail_open_default: bool,
+    live_state_backed: bool,
 }
 
 impl PolicyEngine {
     /// Build an engine from a bundle and options.
     pub fn from_bundle(bundle: &PolicyBundle, opts: EngineOptions) -> Self {
-        let state = Self::compile(bundle, opts.enabled);
+        let state = Self::compile(bundle, opts.enabled, opts.live_state_backed);
         Self {
             state: ArcSwap::from_pointee(state),
             block_mode: opts.block_mode,
             fail_open_default: opts.fail_open_default,
+            live_state_backed: opts.live_state_backed,
         }
     }
 
@@ -217,6 +242,7 @@ impl PolicyEngine {
             enabled,
             block_mode,
             fail_open_default: true,
+            live_state_backed: false,
         };
 
         if !enabled {
@@ -231,10 +257,21 @@ impl PolicyEngine {
         Self::from_bundle(&bundle, opts)
     }
 
-    fn compile(bundle: &PolicyBundle, enabled: bool) -> EngineState {
+    fn compile(bundle: &PolicyBundle, enabled: bool, live_state_backed: bool) -> EngineState {
         let mut text_policies = Vec::new();
         let mut cost_caps = Vec::new();
         let mut rate_limits = Vec::new();
+
+        // Only neutralize `failClosed` when there's no state backend to enforce
+        // against; with the platform bridge wired, `failClosed` is honored.
+        let stateful_meta = |p: &Policy| {
+            let meta = PolicyMeta::from_policy(p);
+            if live_state_backed {
+                meta
+            } else {
+                neutralize_stateful_fail_closed(meta)
+            }
+        };
 
         // Sort by priority (lower first) then by name for determinism.
         let mut policies: Vec<&Policy> = bundle.policies.iter().filter(|p| p.is_active()).collect();
@@ -245,7 +282,7 @@ impl PolicyEngine {
                 PolicyType::CostCap => {
                     match serde_json::from_value::<CostCapConfig>(p.config.clone()) {
                         Ok(config) => cost_caps.push(CostCapPolicy {
-                            meta: neutralize_stateful_fail_closed(PolicyMeta::from_policy(p)),
+                            meta: stateful_meta(p),
                             config,
                         }),
                         Err(e) => {
@@ -256,7 +293,7 @@ impl PolicyEngine {
                 PolicyType::RateLimit => {
                     match serde_json::from_value::<RateLimitConfig>(p.config.clone()) {
                         Ok(config) => rate_limits.push(RateLimitPolicy {
-                            meta: neutralize_stateful_fail_closed(PolicyMeta::from_policy(p)),
+                            meta: stateful_meta(p),
                             config,
                         }),
                         Err(e) => {
@@ -295,7 +332,11 @@ impl PolicyEngine {
     /// enabled/disabled flag is preserved.
     pub fn swap_bundle(&self, bundle: &PolicyBundle) {
         let enabled = self.state.load().enabled;
-        self.state.store(Arc::new(Self::compile(bundle, enabled)));
+        self.state.store(Arc::new(Self::compile(
+            bundle,
+            enabled,
+            self.live_state_backed,
+        )));
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -534,8 +575,9 @@ impl PolicyEngine {
                     d.severity = Severity::Critical;
                     d.action = cc.config.action;
                     d.reason = format!(
-                        "spend ${spent:.2} over {window_key} reached cap ${:.2}",
-                        cc.config.max_usd
+                        "spend ${} over {window_key} reached cap ${}",
+                        fmt_usd(spent),
+                        fmt_usd(cc.config.max_usd)
                     );
                     d
                 } else if over_soft {
@@ -546,8 +588,9 @@ impl PolicyEngine {
                     d.severity = Severity::High;
                     d.action = PolicyAction::FlagOnly; // soft cap warns, never blocks
                     d.reason = format!(
-                        "spend ${spent:.2} over {window_key} crossed soft cap ${:.2}",
-                        cc.config.soft_usd.unwrap_or_default()
+                        "spend ${} over {window_key} crossed soft cap ${}",
+                        fmt_usd(spent),
+                        fmt_usd(cc.config.soft_usd.unwrap_or_default())
                     );
                     d
                 } else {
@@ -661,6 +704,21 @@ fn window_label(w: CostWindow) -> &'static str {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn fmt_usd_keeps_precision_for_sub_cent_caps() {
+        assert_eq!(fmt_usd(50.0), "50.00");
+        assert_eq!(fmt_usd(0.01), "0.01");
+        assert_eq!(fmt_usd(0.0), "0.00");
+        // Sub-cent values must not collapse to "$0.00".
+        assert_eq!(fmt_usd(0.001), "0.001");
+        assert_eq!(fmt_usd(0.00001), "0.00001");
+        assert_eq!(fmt_usd(0.000075), "0.000075");
+        // Values that round to zero at 6 decimals collapse cleanly to "0.00"
+        // (not a bare "0"), including negative zero.
+        assert_eq!(fmt_usd(0.0000001), "0.00");
+        assert_eq!(fmt_usd(-0.0), "0.00");
+    }
 
     fn engine(json: &str) -> PolicyEngine {
         let bundle = PolicyBundle::from_json_str(json).unwrap();

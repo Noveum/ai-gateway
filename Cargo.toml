@@ -117,6 +117,8 @@ reqwest = { version = "0.12.9", features = ["stream", "json", "rustls-tls", "htt
 serde_json = "1.0"
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot for router tests
 http-body-util = "0.1"                              # BodyExt::collect for response-body assertions
+wiremock = "0.6"                                    # mock Noveum platform API for NovaGuard integration tests
+axum = "0.7"                                        # build a test router around the guard middleware
 
 [[test]]
 name = "run_integration_tests"

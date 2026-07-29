@@ -39,6 +39,11 @@ pub mod source;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod remote;
 
+// Best-effort usage reporting (POST .../policies/usage) — advances the platform's
+// cost/rate counters (ALLOWED) and records limit blocks (BLOCKED). Native-only.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod usage;
+
 // The Tower/Axum guard middleware is native-only; the Cloudflare Worker wires the
 // engine into `worker_rt` instead.
 #[cfg(not(target_arch = "wasm32"))]

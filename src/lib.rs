@@ -78,6 +78,10 @@ pub struct AppState {
     /// Optional provider of platform live cost/rate state (for `cost_cap`/
     /// `rate_limit`). `None` when platform-managed Nova Guard isn't configured.
     pub live: Option<Arc<crate::policy::remote::RemoteLiveState>>,
+    /// Optional reporter of BLOCKED usage events (from the guard middleware).
+    /// `None` when platform-managed Nova Guard isn't configured. ALLOWED events
+    /// are reported by the telemetry usage exporter instead.
+    pub usage: Option<crate::policy::usage::UsageReporter>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -87,12 +91,14 @@ impl AppState {
         metrics: Arc<MetricsRegistry>,
         policy: Arc<PolicyEngine>,
         live: Option<Arc<crate::policy::remote::RemoteLiveState>>,
+        usage: Option<crate::policy::usage::UsageReporter>,
     ) -> Self {
         Self {
             config,
             metrics,
             policy,
             live,
+            usage,
         }
     }
 }
@@ -126,6 +132,7 @@ pub fn build_router(state: AppState) -> Router {
             policy::middleware::GuardState {
                 engine: state.policy.clone(),
                 live: state.live.clone(),
+                usage: state.usage.clone(),
             },
             policy::middleware::guard_middleware,
         ))

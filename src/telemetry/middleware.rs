@@ -238,6 +238,7 @@ async fn handle_regular_response(
         provider_request_id,
         request_body: req_body,
         response_body: resp_body,
+        guard_blocked: parts.headers.contains_key("x-noveum-guard-blocked"),
         ..Default::default()
     };
 
@@ -285,6 +286,9 @@ async fn handle_streaming_response(
 
     let metrics_registry = registry.clone();
     let mut accumulated_text = String::with_capacity(MAX_ACCUMULATED_TEXT);
+    // Guard blocks are never streamed (synthetic blocks are non-streaming), but
+    // read the marker before `parts` is moved into the stream task for symmetry.
+    let guard_blocked = parts.headers.contains_key("x-noveum-guard-blocked");
 
     // Process the stream
     tokio::spawn(async move {
@@ -446,6 +450,7 @@ async fn handle_streaming_response(
                     None
                 },
                 is_streaming: true,
+                guard_blocked,
                 ..Default::default()
             };
             metrics_registry.record_metrics(metrics).await;

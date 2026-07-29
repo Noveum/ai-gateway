@@ -3,6 +3,8 @@ pub mod middleware;
 pub mod plugins;
 pub mod provider_metrics;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use self::plugins::NovaGuardUsagePlugin;
 pub use self::{metrics::MetricsRegistry, middleware::metrics_middleware, plugins::ConsolePlugin};
 
 use serde::{Deserialize, Serialize};
@@ -136,6 +138,11 @@ pub struct RequestMetrics {
     // Streaming response data
     pub streamed_data: Option<Vec<Value>>,
     pub is_streaming: bool,
+
+    /// True when this response is a Nova Guard synthetic block, not a real
+    /// provider call. Usage reporting skips these (the BLOCKED usage event is
+    /// emitted by the guard middleware instead) so a block isn't double-counted.
+    pub guard_blocked: bool,
 }
 
 impl RequestMetrics {

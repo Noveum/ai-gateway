@@ -75,23 +75,59 @@ async fn main() {
     info!("Initializing Nova Guard policy engine");
     use noveum_ai_gateway::policy::engine::EngineOptions;
     use noveum_ai_gateway::policy::remote::{RemoteConfig, RemoteLiveState};
+    use noveum_ai_gateway::policy::usage::UsageReporter;
+    use noveum_ai_gateway::telemetry::NovaGuardUsagePlugin;
     let remote_cfg = RemoteConfig::from_env();
-    let (policy_engine, live) = match remote_cfg {
+    let (policy_engine, live, usage) = match remote_cfg {
         Some(cfg) => {
             info!(
                 project = %cfg.project_id, api = %cfg.base_url,
                 "Nova Guard: fetching policies from the Noveum platform"
             );
-            let engine = match noveum_ai_gateway::policy::remote::fetch_bundle(&cfg).await {
-                Ok(bundle) => PolicyEngine::from_bundle(&bundle, EngineOptions::from_env()),
+            // A live-state backend (the platform bridge) is wired here, so the
+            // engine honors `failClosed` (a `/state` outage blocks). This holds
+            // even on the local fallback below, so a later poller swap-in of
+            // platform policies enforces `failClosed` correctly too.
+            let mut opts = EngineOptions::from_env();
+            opts.live_state_backed = true;
+            let (engine, etag) = match noveum_ai_gateway::policy::remote::fetch_bundle_with_etag(
+                &cfg,
+            )
+            .await
+            {
+                Ok((bundle, etag)) => (PolicyEngine::from_bundle(&bundle, opts.clone()), etag),
                 Err(e) => {
                     tracing::warn!(error = %e, "Nova Guard: platform policy fetch failed; falling back to local bundle");
-                    PolicyEngine::from_env().await
+                    let bundle = noveum_ai_gateway::policy::source::load_from_env()
+                            .await
+                            .unwrap_or_else(|le| {
+                                tracing::warn!(error = %le, "Nova Guard: local bundle load failed; starting pass-through");
+                                noveum_ai_gateway::policy::PolicyBundle::default()
+                            });
+                    (PolicyEngine::from_bundle(&bundle, opts.clone()), None)
                 }
             };
-            (Arc::new(engine), Some(Arc::new(RemoteLiveState::new(cfg))))
+            let engine = Arc::new(engine);
+            // Background poller: refresh policies from `/effective` ~60s and
+            // hot-swap the engine (self-heals if the startup fetch failed).
+            noveum_ai_gateway::policy::remote::spawn_policy_poller(
+                cfg.clone(),
+                engine.clone(),
+                etag,
+            );
+            // Spawn the usage reporter and register the ALLOWED exporter. BLOCKED
+            // events are reported from the guard middleware via the same reporter.
+            let reporter = UsageReporter::spawn(cfg.clone());
+            metrics_registry
+                .register_exporter(Box::new(NovaGuardUsagePlugin::new(reporter.clone())))
+                .await;
+            (
+                engine,
+                Some(Arc::new(RemoteLiveState::new(cfg))),
+                Some(reporter),
+            )
         }
-        None => (Arc::new(PolicyEngine::from_env().await), None),
+        None => (Arc::new(PolicyEngine::from_env().await), None, None),
     };
     info!(
         "Nova Guard: {} active policies ({}{})",
@@ -102,7 +138,7 @@ async fn main() {
             "disabled (pass-through)"
         },
         if live.is_some() {
-            ", platform live-state"
+            ", platform live-state + usage reporting"
         } else {
             ""
         }
@@ -115,6 +151,7 @@ async fn main() {
         metrics_registry.clone(),
         policy_engine.clone(),
         live,
+        usage,
     );
     let app = build_router(state);
 
