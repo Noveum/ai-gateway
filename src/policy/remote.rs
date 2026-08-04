@@ -141,15 +141,37 @@ pub async fn fetch_bundle_conditional(
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    // Check the status BEFORE parsing: error bodies are often not JSON at all
+    // (a CDN/WAF 403 serves HTML), and "invalid JSON" would mask the real
+    // failure. Preserve the raw body in the error instead.
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "policies fetch returned {status}: {}",
+            truncate_body(&body)
+        ));
+    }
     let json: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| format!("invalid JSON ({status}): {e}"))?;
-    if !status.is_success() {
-        return Err(format!("policies fetch returned {status}: {json}"));
-    }
     let bundle = platform::translate_bundle(&json)?;
     Ok(PolicyFetch::Modified { bundle, etag })
+}
+
+/// Trim an error body for logging (WAF/CDN error pages can be large HTML).
+fn truncate_body(body: &str) -> String {
+    const MAX: usize = 512;
+    let trimmed = body.trim();
+    if trimmed.len() <= MAX {
+        trimmed.to_string()
+    } else {
+        let mut end = MAX;
+        while end > 0 && !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… ({} bytes)", &trimmed[..end], trimmed.len())
+    }
 }
 
 /// Fetch + translate the platform's effective policies, returning the `ETag` too
@@ -405,13 +427,18 @@ async fn fetch_state_conditional(
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    // Status first — error bodies may be non-JSON (see fetch_bundle_conditional).
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "state fetch returned {status}: {}",
+            truncate_body(&body)
+        ));
+    }
     let json: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| format!("invalid JSON ({status}): {e}"))?;
-    if !status.is_success() {
-        return Err(format!("state fetch returned {status}: {json}"));
-    }
     let stale = json.get("stale").and_then(|s| s.as_bool()).unwrap_or(false);
     Ok(StateFetch::Modified {
         state: Box::new(platform::state_to_live_state(&json)),
