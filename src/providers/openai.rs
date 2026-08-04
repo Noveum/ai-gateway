@@ -30,11 +30,13 @@ impl OpenAIProvider {
     pub fn new() -> Self {
         // `OPENAI_BASE_URL` override (standard OpenAI SDK convention) lets the
         // gateway target a compatible upstream — chiefly a local mock in the
-        // hermetic E2E, or a self-hosted compatible endpoint.
+        // hermetic E2E, or a self-hosted compatible endpoint. Normalize first
+        // (trim, drop trailing slashes) and only then reject empty values, so
+        // whitespace or a bare "///" can't produce a broken base URL.
         let base_url = std::env::var("OPENAI_BASE_URL")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim_end_matches('/').to_string())
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "https://api.openai.com".to_string());
         Self { base_url }
     }
@@ -192,6 +194,9 @@ mod tests {
 
     #[test]
     fn base_url_and_name() {
+        // `new()` reads OPENAI_BASE_URL; clear it so the test asserts the
+        // default regardless of the process environment (e.g. a CI job).
+        std::env::remove_var("OPENAI_BASE_URL");
         let p = OpenAIProvider::new();
         assert_eq!(p.base_url(), "https://api.openai.com");
         assert_eq!(p.name(), "openai");

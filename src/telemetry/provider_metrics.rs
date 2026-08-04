@@ -60,6 +60,21 @@ impl ProviderMetrics {
     /// output tokens in `message_delta`), so a later chunk must never wipe
     /// fields an earlier chunk already supplied.
     pub fn merge_streaming(&mut self, newer: ProviderMetrics) {
+        // A later chunk that REPLACES a populated model/token value without
+        // carrying a new cost invalidates any earlier cost — otherwise the
+        // final record pairs updated tokens with an obsolete price and the
+        // middleware never recomputes it (cost is still `Some`).
+        fn replaces<T: PartialEq + Copy>(old: Option<T>, new: Option<T>) -> bool {
+            matches!((old, new), (Some(a), Some(b)) if a != b)
+        }
+        let model_replaced = !Self::is_placeholder_model(&newer.model)
+            && !Self::is_placeholder_model(&self.model)
+            && newer.model != self.model;
+        let cost_is_stale = newer.cost.is_none()
+            && (model_replaced
+                || replaces(self.input_tokens, newer.input_tokens)
+                || replaces(self.output_tokens, newer.output_tokens));
+
         if (!Self::is_placeholder_model(&newer.model) || Self::is_placeholder_model(&self.model))
             && !newer.model.is_empty()
         {
@@ -68,7 +83,11 @@ impl ProviderMetrics {
         self.input_tokens = newer.input_tokens.or(self.input_tokens);
         self.output_tokens = newer.output_tokens.or(self.output_tokens);
         self.total_tokens = newer.total_tokens.or(self.total_tokens);
-        self.cost = newer.cost.or(self.cost);
+        self.cost = if cost_is_stale {
+            None // downstream recomputes from the merged model + tokens
+        } else {
+            newer.cost.or(self.cost)
+        };
         self.request_id = newer.request_id.or(self.request_id.take());
         self.project_id = newer.project_id.or(self.project_id.take());
         self.organization_id = newer.organization_id.or(self.organization_id.take());
@@ -287,7 +306,10 @@ mod tests {
     }
 
     #[test]
-    fn merge_streaming_newer_values_win_but_none_does_not_erase() {
+    fn merge_streaming_invalidates_cost_when_tokens_are_replaced() {
+        // A later chunk replaces a populated token count without carrying a new
+        // cost: the earlier cost is now stale and must be cleared so the
+        // middleware recomputes it from the merged view.
         let mut acc = ProviderMetrics {
             model: "gpt-4o".to_string(),
             input_tokens: Some(10),
@@ -301,6 +323,33 @@ mod tests {
         });
         assert_eq!(acc.model, "gpt-4o");
         assert_eq!(acc.input_tokens, Some(12));
-        assert_eq!(acc.cost, Some(0.01), "None must not erase a known cost");
+        assert_eq!(acc.cost, None, "replaced tokens must invalidate the cost");
+    }
+
+    #[test]
+    fn merge_streaming_keeps_cost_when_nothing_it_priced_changes() {
+        let mut acc = ProviderMetrics {
+            model: "gpt-4o".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cost: Some(0.01),
+            ..Default::default()
+        };
+        // Same values re-reported, plus a field that was previously None.
+        acc.merge_streaming(ProviderMetrics {
+            model: "gpt-4o".to_string(),
+            input_tokens: Some(10),
+            total_tokens: Some(15),
+            ..Default::default()
+        });
+        assert_eq!(acc.cost, Some(0.01), "unchanged tokens keep the cost");
+        // A newer chunk carrying its own cost always wins.
+        acc.merge_streaming(ProviderMetrics {
+            output_tokens: Some(9),
+            cost: Some(0.02),
+            ..Default::default()
+        });
+        assert_eq!(acc.cost, Some(0.02));
+        assert_eq!(acc.output_tokens, Some(9));
     }
 }

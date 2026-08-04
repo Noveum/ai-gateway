@@ -246,6 +246,15 @@ struct StateCache {
 /// every guarded request while staying short enough to recover quickly.
 const ERROR_BACKOFF: Duration = Duration::from_secs(3);
 
+/// Hard bound on how long an in-request `/state` refresh may run. The refresh
+/// happens on the request path with the cache lock held (that is what
+/// single-flights it), so a *slow* platform must not be allowed to stall every
+/// guarded request for the full client timeout (10s) — beyond this budget the
+/// refresh is abandoned, treated as a fetch error (unavailable + backoff), and
+/// `failClosed` semantics take over. `/state` is served from a 30s server-side
+/// cache, so a healthy platform answers well inside this.
+const STATE_REFRESH_BUDGET: Duration = Duration::from_secs(2);
+
 /// A cached provider of the platform's live cost/rate counters, used by the guard
 /// middleware to supply `LiveState` to `cost_cap`/`rate_limit` enforcement.
 pub struct RemoteLiveState {
@@ -302,7 +311,18 @@ impl RemoteLiveState {
         }
 
         let prev_etag = guard.snap.as_ref().and_then(|s| s.etag.clone());
-        let result = fetch_state_conditional(&self.cfg, prev_etag.as_deref()).await;
+        let result = match tokio::time::timeout(
+            STATE_REFRESH_BUDGET,
+            fetch_state_conditional(&self.cfg, prev_etag.as_deref()),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "state fetch exceeded the {}s in-request refresh budget",
+                STATE_REFRESH_BUDGET.as_secs()
+            )),
+        };
         match result {
             Ok(StateFetch::NotModified) => {
                 guard.last_error_at = None;
@@ -351,18 +371,51 @@ const PENDING_SPEND_TTL: Duration = Duration::from_secs(45);
 
 /// In-process ledger of spend the gateway has admitted but the platform's
 /// counters cannot reflect yet (usage is posted asynchronously and `/state` is
-/// cached). Admitted requests' *estimated* costs are added here and counted on
-/// top of the platform spend when evaluating cost caps, closing the window in
-/// which a burst of requests all pass an almost-exhausted cap.
+/// cached). Admitted requests' *estimated* costs are reserved here and counted
+/// on top of the platform spend when evaluating cost caps, closing the window
+/// in which a burst of requests all pass an almost-exhausted cap.
+///
+/// Admission is race-free by construction: [`PendingSpend::reserve`] records
+/// this request's estimate and returns the other in-flight reservations in one
+/// critical section, *before* the policy evaluation reads them — so two
+/// concurrent requests always see each other's reservation, whichever
+/// evaluates first. A request that ends up blocked releases its reservation.
 ///
 /// Entries expire after [`PENDING_SPEND_TTL`] (by then the real usage event has
 /// been reported and folded into `/state`). Briefly double-counting an entry
 /// that already landed only errs toward blocking *near the cap*, which is the
-/// correct direction for a hard cap. This is per-process: a true cross-instance
-/// guarantee needs an atomic reservation on the platform side.
+/// correct direction for a hard cap. The running total is maintained
+/// incrementally so reads are O(1) amortized (pruning walks only the expired
+/// prefix). This is per-process: a true cross-instance guarantee needs an
+/// atomic reservation on the platform side.
 #[derive(Default)]
 pub struct PendingSpend {
-    entries: std::sync::Mutex<std::collections::VecDeque<(Instant, f64)>>,
+    inner: std::sync::Mutex<PendingInner>,
+}
+
+#[derive(Default)]
+struct PendingInner {
+    /// `(reserved_at, reservation_id, cost)` in insertion (= time) order.
+    entries: std::collections::VecDeque<(Instant, u64, f64)>,
+    /// Running sum of `entries` costs.
+    total: f64,
+    next_id: u64,
+}
+
+impl PendingInner {
+    fn prune(&mut self) {
+        while let Some(&(at, _, cost)) = self.entries.front() {
+            if at.elapsed() >= PENDING_SPEND_TTL {
+                self.total -= cost;
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.entries.is_empty() {
+            self.total = 0.0; // reset any accumulated float drift
+        }
+    }
 }
 
 impl PendingSpend {
@@ -370,26 +423,46 @@ impl PendingSpend {
         Self::default()
     }
 
-    /// Record the estimated cost of a request that is about to be forwarded.
-    pub fn add(&self, cost_usd: f64) {
+    /// Atomically reserve this request's estimated cost and return
+    /// `(reservation, other_pending_total)` — the total of every *other*
+    /// un-expired reservation, to be folded into the spend the policy engine
+    /// evaluates. `reservation` is `None` when the estimate is not positive.
+    pub fn reserve(&self, cost_usd: f64) -> (Option<u64>, f64) {
+        let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
+        inner.prune();
+        let others = inner.total;
         if cost_usd <= 0.0 {
-            return;
+            return (None, others);
         }
-        let mut e = self.entries.lock().expect("pending-spend lock poisoned");
-        e.push_back((Instant::now(), cost_usd));
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.entries.push_back((Instant::now(), id, cost_usd));
+        inner.total += cost_usd;
+        (Some(id), others)
     }
 
-    /// Total un-expired pending spend, pruning expired entries.
-    pub fn sum(&self) -> f64 {
-        let mut e = self.entries.lock().expect("pending-spend lock poisoned");
-        while let Some((at, _)) = e.front() {
-            if at.elapsed() >= PENDING_SPEND_TTL {
-                e.pop_front();
-            } else {
-                break;
+    /// Release a reservation whose request was NOT forwarded (blocked): it will
+    /// consume nothing, so it must stop counting against the cap immediately.
+    pub fn release(&self, reservation: u64) {
+        let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
+        if let Some(idx) = inner
+            .entries
+            .iter()
+            .position(|&(_, id, _)| id == reservation)
+        {
+            let (_, _, cost) = inner.entries.remove(idx).expect("index just found");
+            inner.total -= cost;
+            if inner.entries.is_empty() {
+                inner.total = 0.0;
             }
         }
-        e.iter().map(|(_, c)| c).sum()
+    }
+
+    /// Total un-expired pending spend (prunes expired entries; O(1) amortized).
+    pub fn sum(&self) -> f64 {
+        let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
+        inner.prune();
+        inner.total
     }
 }
 
@@ -445,4 +518,43 @@ async fn fetch_state_conditional(
         etag,
         stale,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserve_returns_only_other_reservations() {
+        let p = PendingSpend::new();
+        let (r1, others1) = p.reserve(0.01);
+        assert!(r1.is_some());
+        assert_eq!(others1, 0.0, "first reservation sees no other spend");
+        let (r2, others2) = p.reserve(0.02);
+        assert!(r2.is_some());
+        assert!((others2 - 0.01).abs() < 1e-12, "second sees the first");
+        assert!((p.sum() - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn release_removes_a_blocked_reservation() {
+        let p = PendingSpend::new();
+        let (r1, _) = p.reserve(0.01);
+        let (_r2, _) = p.reserve(0.02);
+        p.release(r1.unwrap());
+        assert!((p.sum() - 0.02).abs() < 1e-12);
+        // Releasing twice (or an unknown id) is a no-op.
+        p.release(r1.unwrap());
+        p.release(999);
+        assert!((p.sum() - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn non_positive_estimates_are_not_reserved() {
+        let p = PendingSpend::new();
+        let (r, others) = p.reserve(0.0);
+        assert!(r.is_none());
+        assert_eq!(others, 0.0);
+        assert_eq!(p.sum(), 0.0);
+    }
 }

@@ -598,8 +598,10 @@ impl PolicyEngine {
         // Org-sourced policies enforce against org-scope counters when the
         // control plane supplies them; otherwise fall back to the project
         // counters (an org cap then only bounds each project separately).
+        // Checked per counter kind — a partial `org` section carrying only
+        // rate data must not make cost lookups miss (and vice versa).
         let spend = live_state.and_then(|s| {
-            if cc.meta.org_scoped && s.has_org_counters() {
+            if cc.meta.org_scoped && !s.org_cost_usd_by_window.is_empty() {
                 s.org_cost_usd_by_window.get(window_key).copied()
             } else {
                 s.cost_usd_by_window.get(window_key).copied()
@@ -680,12 +682,18 @@ impl PolicyEngine {
         match live_state {
             Some(state) => {
                 // Org-sourced policies read org-scope counters when available
-                // (see eval_cost_cap).
-                let use_org = rl.meta.org_scoped && state.has_org_counters();
-                let (requests, tokens) = if use_org {
-                    (&state.org_requests_by_window, &state.org_tokens_by_window)
+                // (see eval_cost_cap). Requests and tokens are selected
+                // independently so a partial `org` section (only one kind
+                // populated) still enforces the other kind against project data.
+                let requests = if rl.meta.org_scoped && !state.org_requests_by_window.is_empty() {
+                    &state.org_requests_by_window
                 } else {
-                    (&state.requests_by_window, &state.tokens_by_window)
+                    &state.requests_by_window
+                };
+                let tokens = if rl.meta.org_scoped && !state.org_tokens_by_window.is_empty() {
+                    &state.org_tokens_by_window
+                } else {
+                    &state.tokens_by_window
                 };
                 for w in &rl.config.windows {
                     if let Some(max) = w.max_requests {
@@ -1045,6 +1053,39 @@ mod tests {
         ls2.cost_usd_by_window.insert("30d_rolling".into(), 10.0);
         let r2 = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls2));
         assert!(!r2.is_blocked());
+    }
+
+    #[test]
+    fn partial_org_section_falls_back_per_counter_kind() {
+        // A staged platform rollout may ship an `org` section with only ONE
+        // counter kind. The missing kind must fall back to project counters,
+        // not degrade to "state unavailable" / silently allow.
+        // Org section has only rate data → an org cost cap uses project spend.
+        let cap = engine(
+            r#"{"policies":[{"name":"orgcap","type":"cost_cap","mode":"enforce","source":"org",
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
+        );
+        let mut ls = LiveState::default();
+        ls.cost_usd_by_window.insert("30d_rolling".into(), 150.0);
+        ls.org_requests_by_window.insert("1m".into(), 1); // org rate only
+        let r = cap.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+        assert!(
+            r.is_blocked(),
+            "org cost cap must fall back to (over-cap) project spend"
+        );
+        // Org section has only cost data → an org rate limit uses project rate.
+        let rl = engine(
+            r#"{"policies":[{"name":"orgrl","type":"rate_limit","mode":"enforce","source":"org",
+            "config":{"windows":[{"period":"1m","maxRequests":60,"action":"block"}]}}]}"#,
+        );
+        let mut ls2 = LiveState::default();
+        ls2.requests_by_window.insert("1m".into(), 100);
+        ls2.org_cost_usd_by_window.insert("30d_rolling".into(), 1.0); // org cost only
+        let r2 = rl.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls2));
+        assert!(
+            r2.is_blocked(),
+            "org rate limit must fall back to (over-limit) project requests"
+        );
     }
 
     #[test]

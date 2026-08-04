@@ -96,25 +96,10 @@ pub async fn guard_middleware(
         None => None,
     };
 
-    // Fold locally admitted-but-unreported spend into the counters, so N
-    // concurrent requests near an almost-exhausted cap can't all pass against
-    // the same (not-yet-advanced) platform spend.
-    let pending_spend = gs.pending.sum();
-    if pending_spend > 0.0 {
-        if let Some(ls) = live_state.as_mut() {
-            for v in ls.cost_usd_by_window.values_mut() {
-                *v += pending_spend;
-            }
-            for v in ls.org_cost_usd_by_window.values_mut() {
-                *v += pending_spend;
-            }
-        }
-    }
-
     let mut forward_bytes = bytes.clone();
     let mut body_mutated = false;
-    // This request's predicted cost; charged to the pending ledger if forwarded.
-    let mut est_request_cost = 0.0_f64;
+    // This request's pending-spend reservation; released again if it blocks.
+    let mut reservation: Option<u64> = None;
 
     if let Some(mut body_json) = json.clone() {
         let input_text = flatten_input_text(&body_json);
@@ -125,12 +110,32 @@ pub async fn guard_middleware(
         let max_output_tokens = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
             .iter()
             .find_map(|k| body_json.get(*k).and_then(|v| v.as_u64()));
-        est_request_cost = crate::policy::pricing::estimate_request_cost(
+        let est_request_cost = crate::policy::pricing::estimate_request_cost(
             &model,
             est_input_tokens,
             max_output_tokens,
         )
         .unwrap_or(0.0);
+
+        // Reserve this request's predicted cost and read the other in-flight
+        // reservations in ONE critical section — reserving *before* evaluating
+        // means two concurrent requests always see each other's reservation, so
+        // a burst near an almost-exhausted cap can't all pass on the same
+        // stale total. Blocked requests release the reservation below.
+        if gs.usage.is_some() {
+            let (res, other_pending) = gs.pending.reserve(est_request_cost);
+            reservation = res;
+            if other_pending > 0.0 {
+                if let Some(ls) = live_state.as_mut() {
+                    for v in ls.cost_usd_by_window.values_mut() {
+                        *v += other_pending;
+                    }
+                    for v in ls.org_cost_usd_by_window.values_mut() {
+                        *v += other_pending;
+                    }
+                }
+            }
+        }
 
         let result = engine.evaluate(
             Phase::Input,
@@ -144,6 +149,11 @@ pub async fn guard_middleware(
         log_decisions("input", &provider, &model, &result.decisions);
 
         if let Some(block) = &result.block {
+            // A blocked request never reaches the provider — its reservation
+            // must stop counting against the cap immediately.
+            if let Some(res) = reservation.take() {
+                gs.pending.release(res);
+            }
             info!(
                 provider = %provider, model = %model, policy = %block.policy_id,
                 reason = %block.reason, "Nova Guard blocked request (input phase)"
@@ -204,11 +214,9 @@ pub async fn guard_middleware(
         }
     }
 
-    // Charge this request's predicted cost to the pending ledger the moment it
-    // is admitted (before forwarding), so concurrent requests see it.
-    if gs.usage.is_some() {
-        gs.pending.add(est_request_cost);
-    }
+    // The reservation (if any) stays in the ledger for admitted requests and
+    // expires on its own once the real usage lands in the platform counters.
+    let _ = reservation;
 
     let mut parts = parts;
     if body_mutated {

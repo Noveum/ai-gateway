@@ -135,7 +135,12 @@ impl MetricsExtractor for OpenAICompatibleMetricsExtractor {
             // reported completion count so those tokens aren't priced as $0.
             if let (Some(total), Some(prompt)) = (metrics.total_tokens, metrics.input_tokens) {
                 let billed_output = total.saturating_sub(prompt);
-                if billed_output > metrics.output_tokens.unwrap_or(0) {
+                // Fill an absent count even when the derived value is 0 —
+                // input tokens are still billable and cost needs both counts.
+                if metrics
+                    .output_tokens
+                    .is_none_or(|reported| billed_output > reported)
+                {
                     metrics.output_tokens = Some(billed_output);
                 }
             }
@@ -210,6 +215,16 @@ mod tests {
         });
         let m3 = OpenAICompatibleMetricsExtractor.extract_metrics(&body3);
         assert_eq!(m3.output_tokens, Some(13));
+        // completion_tokens absent and total == prompt: the derived 0 must be
+        // filled in so the (billable) input tokens are still costed.
+        let body4 = serde_json::json!({
+            "model": "gemini-3.6-flash",
+            "usage": {"prompt_tokens": 7, "total_tokens": 7}
+        });
+        let m4 = OpenAICompatibleMetricsExtractor.extract_metrics(&body4);
+        assert_eq!(m4.output_tokens, Some(0));
+        let expected_input_only = (7.0 / 1e6) * 1.50;
+        assert!((m4.cost.unwrap() - expected_input_only).abs() < 1e-12);
     }
 
     #[test]

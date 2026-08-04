@@ -9,8 +9,9 @@
 
 /// `(model_id, input_usd_per_1m, output_usd_per_1m)`.
 pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
-    // OpenAI — developers.openai.com/api/docs/models (verified 2026-08)
-    ("gpt-5.6-luna", 1.00, 6.00),
+    // OpenAI — developers.openai.com/api/docs/pricing (verified 2026-08-04;
+    // Luna reflects the 2026-07-30 price reduction from $1/$6)
+    ("gpt-5.6-luna", 0.20, 1.20),
     ("gpt-5", 1.25, 10.00),
     ("gpt-5-mini", 0.25, 2.00),
     ("gpt-5-nano", 0.05, 0.40),
@@ -24,7 +25,8 @@ pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
     ("o1", 15.00, 60.00),
     ("text-embedding-3-small", 0.02, 0.00),
     ("text-embedding-3-large", 0.13, 0.00),
-    // Anthropic — platform.claude.com/docs (Sonnet 5 introductory rate, 2026-08)
+    // Anthropic — platform.claude.com/docs. Sonnet 5 is the INTRODUCTORY rate,
+    // scheduled to rise to $3/$15 on 2026-09-01 — update this row then.
     ("claude-sonnet-5", 2.00, 10.00),
     ("claude-opus-4-8", 5.00, 25.00),
     ("claude-opus-4-7", 5.00, 25.00),
@@ -258,7 +260,7 @@ mod tests {
         // Current-generation ids must resolve to their own (verified) rates,
         // not fall back to an older family or to $0.
         let luna = lookup("gpt-5.6-luna").unwrap();
-        assert_eq!((luna.input_per_1m, luna.output_per_1m), (1.00, 6.00));
+        assert_eq!((luna.input_per_1m, luna.output_per_1m), (0.20, 1.20));
         let sonnet5 = lookup("claude-sonnet-5").unwrap();
         assert_eq!((sonnet5.input_per_1m, sonnet5.output_per_1m), (2.00, 10.00));
         let flash = lookup("gemini-3.6-flash").unwrap();
@@ -266,7 +268,7 @@ mod tests {
         // Dated snapshots resolve to the same family.
         assert_eq!(
             lookup("gpt-5.6-luna-2026-05-01").unwrap().input_per_1m,
-            1.00
+            0.20
         );
         assert_eq!(
             lookup("claude-sonnet-5-20260601").unwrap().input_per_1m,
