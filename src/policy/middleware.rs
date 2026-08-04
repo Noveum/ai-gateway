@@ -41,6 +41,11 @@ pub struct GuardState {
     /// Reports BLOCKED usage events to the platform. `None` when platform-managed
     /// Nova Guard (and thus usage reporting) isn't configured.
     pub usage: Option<crate::policy::usage::UsageReporter>,
+    /// In-process ledger of estimated spend for requests already admitted but not
+    /// yet reflected in the platform counters (usage posts asynchronously,
+    /// `/state` is cached). Added on top of the platform spend when evaluating
+    /// cost caps so a burst near the cap can't all slip through.
+    pub pending: Arc<crate::policy::remote::PendingSpend>,
 }
 
 pub async fn guard_middleware(
@@ -86,23 +91,53 @@ pub async fn guard_middleware(
 
     // Live cost/rate counters from the platform (for cost_cap/rate_limit). `None`
     // when platform-managed Nova Guard isn't configured → those policies fail open.
-    let live_state = match &gs.live {
+    let mut live_state = match &gs.live {
         Some(remote) => remote.get().await,
         None => None,
     };
 
+    // Fold locally admitted-but-unreported spend into the counters, so N
+    // concurrent requests near an almost-exhausted cap can't all pass against
+    // the same (not-yet-advanced) platform spend.
+    let pending_spend = gs.pending.sum();
+    if pending_spend > 0.0 {
+        if let Some(ls) = live_state.as_mut() {
+            for v in ls.cost_usd_by_window.values_mut() {
+                *v += pending_spend;
+            }
+            for v in ls.org_cost_usd_by_window.values_mut() {
+                *v += pending_spend;
+            }
+        }
+    }
+
     let mut forward_bytes = bytes.clone();
     let mut body_mutated = false;
+    // This request's predicted cost; charged to the pending ledger if forwarded.
+    let mut est_request_cost = 0.0_f64;
 
     if let Some(mut body_json) = json.clone() {
         let input_text = flatten_input_text(&body_json);
+        let est_input_tokens =
+            crate::telemetry::provider_metrics::ProviderMetrics::estimate_tokens_from_text(
+                &input_text,
+            );
+        let max_output_tokens = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+            .iter()
+            .find_map(|k| body_json.get(*k).and_then(|v| v.as_u64()));
+        est_request_cost = crate::policy::pricing::estimate_request_cost(
+            &model,
+            est_input_tokens,
+            max_output_tokens,
+        )
+        .unwrap_or(0.0);
 
         let result = engine.evaluate(
             Phase::Input,
             &model,
             &input_text,
             Some(&body_json),
-            None,
+            Some(est_input_tokens),
             live_state.as_ref(),
         );
 
@@ -150,6 +185,29 @@ pub async fn guard_middleware(
                 body_mutated = true;
             }
         }
+
+        // When the platform is metering usage, ask OpenAI to append the final
+        // usage chunk to streaming responses (`stream_options.include_usage`).
+        // Without it a default stream carries no token counts, the ALLOWED event
+        // posts $0, and cost caps silently never advance. The extra final chunk
+        // is standard OpenAI shape (empty `choices` + `usage`) that SDKs handle.
+        if gs.usage.is_some()
+            && provider.eq_ignore_ascii_case("openai")
+            && body_json.get("stream").and_then(|s| s.as_bool()) == Some(true)
+            && body_json.get("stream_options").is_none()
+        {
+            body_json["stream_options"] = serde_json::json!({ "include_usage": true });
+            if let Ok(v) = serde_json::to_vec(&body_json) {
+                forward_bytes = v.into();
+                body_mutated = true;
+            }
+        }
+    }
+
+    // Charge this request's predicted cost to the pending ledger the moment it
+    // is admitted (before forwarding), so concurrent requests see it.
+    if gs.usage.is_some() {
+        gs.pending.add(est_request_cost);
     }
 
     let mut parts = parts;

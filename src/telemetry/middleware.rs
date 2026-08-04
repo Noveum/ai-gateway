@@ -344,7 +344,9 @@ async fn handle_streaming_response(
                                             "Found metrics in streaming chunk: {:?}",
                                             chunk_metrics
                                         );
-                                        accumulated_metrics = chunk_metrics;
+                                        // Merge, don't overwrite: providers spread
+                                        // model/input/output across chunks.
+                                        accumulated_metrics.merge_streaming(chunk_metrics);
                                         final_metrics_found = true;
                                     }
                                 }
@@ -403,21 +405,69 @@ async fn handle_streaming_response(
                 None
             };
 
+            // Estimate input tokens from the request body too — a stream with
+            // no usage data must still report *some* real cost, not $0, or
+            // platform cost caps silently never advance.
+            let estimated_input_tokens = req_body
+                .as_ref()
+                .map(|rb| {
+                    ProviderMetrics::estimate_tokens_from_text(&crate::routing::flatten_input_text(
+                        rb,
+                    ))
+                })
+                .filter(|&t| t > 0);
+
             debug!(
-                "Estimated output tokens from {} bytes of text: {:?}",
-                accumulated_text.len(),
-                estimated_output_tokens
+                "Estimated tokens for usage-less stream: input={:?} output={:?}",
+                estimated_input_tokens, estimated_output_tokens
             );
 
             accumulated_metrics = ProviderMetrics {
                 model,
                 provider_latency: Duration::from_millis(0),
+                input_tokens: estimated_input_tokens,
                 output_tokens: estimated_output_tokens,
-                // We don't have input tokens or total tokens
                 ..Default::default()
             };
 
             final_metrics_found = true;
+        }
+
+        if final_metrics_found {
+            // Any stream that ends without provider-reported token counts still
+            // gets estimated ones (request text for input, accumulated SSE text
+            // for output) — an unmetered call must not be reported as free.
+            if accumulated_metrics.input_tokens.is_none() {
+                accumulated_metrics.input_tokens = req_body
+                    .as_ref()
+                    .map(|rb| {
+                        ProviderMetrics::estimate_tokens_from_text(
+                            &crate::routing::flatten_input_text(rb),
+                        )
+                    })
+                    .filter(|&t| t > 0);
+            }
+            if accumulated_metrics.output_tokens.is_none() && !accumulated_text.is_empty() {
+                accumulated_metrics.output_tokens =
+                    Some((accumulated_text.len() as f64 / 4.0).ceil() as u32);
+            }
+
+            // Streaming chunks often carry the model in one event and token
+            // counts in another, so cost may not have been computable per-chunk
+            // (e.g. Anthropic priced its `message_delta` under the placeholder
+            // model "claude" → no cost). Recompute from the merged view.
+            if accumulated_metrics.cost.is_none() {
+                if let (Some(i), Some(o)) = (
+                    accumulated_metrics.input_tokens,
+                    accumulated_metrics.output_tokens,
+                ) {
+                    let cost =
+                        crate::policy::pricing::estimate_cost(&accumulated_metrics.model, i, o);
+                    if cost > 0.0 {
+                        accumulated_metrics.cost = Some(cost);
+                    }
+                }
+            }
         }
 
         // Record final metrics if we found them

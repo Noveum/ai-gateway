@@ -40,6 +40,18 @@ impl MetricsExporter for NovaGuardUsagePlugin {
         if !Self::should_report(&metrics) {
             return Ok(());
         }
+        // A successful call reporting $0 means the platform's cost counters
+        // won't advance for it — i.e. cost caps can't see this traffic. Make
+        // that loudly observable (unknown model id missing from the pricing
+        // table, or usage extraction failed).
+        if metrics.cost.unwrap_or(0.0) <= 0.0 {
+            tracing::warn!(
+                model = %metrics.model,
+                input_tokens = ?metrics.input_tokens,
+                output_tokens = ?metrics.output_tokens,
+                "Nova Guard: ALLOWED usage event carries $0 cost; this call is invisible to cost caps"
+            );
+        }
         // Fresh event id per call; the reporter reuses it across retries so the
         // platform dedups. cost/tokens default to 0 when the provider body
         // carried no usage (unknown model, missing `usage` object, etc.).

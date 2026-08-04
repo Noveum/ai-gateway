@@ -47,6 +47,35 @@ impl ProviderMetrics {
         estimated_tokens
     }
 
+    /// Whether a model id is a real identifier (vs. an extractor placeholder
+    /// like `"claude"`, `"llama"`, or `"unknown"` used when a chunk carries no
+    /// model field).
+    fn is_placeholder_model(model: &str) -> bool {
+        matches!(model, "" | "unknown" | "claude" | "llama")
+    }
+
+    /// Fold metrics extracted from a later streaming chunk into this running
+    /// accumulation. Streaming providers spread metrics across events (e.g.
+    /// Anthropic sends the model + input tokens in `message_start` and the
+    /// output tokens in `message_delta`), so a later chunk must never wipe
+    /// fields an earlier chunk already supplied.
+    pub fn merge_streaming(&mut self, newer: ProviderMetrics) {
+        if (!Self::is_placeholder_model(&newer.model) || Self::is_placeholder_model(&self.model))
+            && !newer.model.is_empty()
+        {
+            self.model = newer.model;
+        }
+        self.input_tokens = newer.input_tokens.or(self.input_tokens);
+        self.output_tokens = newer.output_tokens.or(self.output_tokens);
+        self.total_tokens = newer.total_tokens.or(self.total_tokens);
+        self.cost = newer.cost.or(self.cost);
+        self.request_id = newer.request_id.or(self.request_id.take());
+        self.project_id = newer.project_id.or(self.project_id.take());
+        self.organization_id = newer.organization_id.or(self.organization_id.take());
+        self.user_id = newer.user_id.or(self.user_id.take());
+        self.experiment_id = newer.experiment_id.or(self.experiment_id.take());
+    }
+
     /// Extract tracking headers from the original request headers
     pub fn extract_tracking_headers(headers: &HeaderMap) -> Self {
         let mut metrics = Self::default();
@@ -229,5 +258,49 @@ pub fn get_metrics_extractor(provider: &str) -> Box<dyn MetricsExtractor> {
         "together" | "mistral" | "cohere" | "google" | "gemini" | "deepseek" | "xai" | "grok"
         | "openrouter" | "perplexity" => Box::new(OpenAICompatibleMetricsExtractor),
         _ => Box::new(OpenAIMetricsExtractor), // Default to OpenAI format
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_streaming_combines_fields_across_chunks() {
+        // Anthropic shape: message_start carries model + input tokens, a later
+        // message_delta carries output tokens under the placeholder model
+        // "claude". The merge must keep the real model and both token counts.
+        let mut acc = ProviderMetrics::default();
+        acc.merge_streaming(ProviderMetrics {
+            model: "claude-sonnet-5".to_string(),
+            input_tokens: Some(13),
+            ..Default::default()
+        });
+        acc.merge_streaming(ProviderMetrics {
+            model: "claude".to_string(), // placeholder — must not clobber
+            output_tokens: Some(4),
+            ..Default::default()
+        });
+        assert_eq!(acc.model, "claude-sonnet-5");
+        assert_eq!(acc.input_tokens, Some(13));
+        assert_eq!(acc.output_tokens, Some(4));
+    }
+
+    #[test]
+    fn merge_streaming_newer_values_win_but_none_does_not_erase() {
+        let mut acc = ProviderMetrics {
+            model: "gpt-4o".to_string(),
+            input_tokens: Some(10),
+            cost: Some(0.01),
+            ..Default::default()
+        };
+        acc.merge_streaming(ProviderMetrics {
+            model: "unknown".to_string(),
+            input_tokens: Some(12), // a later, better value wins
+            ..Default::default()
+        });
+        assert_eq!(acc.model, "gpt-4o");
+        assert_eq!(acc.input_tokens, Some(12));
+        assert_eq!(acc.cost, Some(0.01), "None must not erase a known cost");
     }
 }

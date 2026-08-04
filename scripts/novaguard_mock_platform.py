@@ -10,27 +10,41 @@ Implements the three project-scoped endpoints the gateway calls:
                                                       the cost counter (so caps
                                                       climb and eventually trip)
 
-Config via env:
-  MOCK_PORT        (default 8787)
-  MOCK_MAX_USD     cost_cap maxUsd            (default 0.01)
-  MOCK_WINDOW      cost_cap window            (default 1d_rolling)
-  MOCK_SEED_USD    initial cost in the window (default 0.0)
-  MOCK_FAIL_CLOSED policy failClosed          (default true)
+plus a mock OpenAI-compatible provider (so the ALLOWED path can be exercised
+hermetically, with the gateway's OPENAI_BASE_URL pointed here):
 
-Every request is logged to stderr; received usage events are printed so you can
-watch ALLOWED/BLOCKED events arrive. Bearer auth is accepted but not verified
-(any token passes) — this is a test double, not the real auth plane.
+  POST /v1/chat/completions                        -> 200 chat completion with a
+                                                      configurable usage block
+
+Config via env:
+  MOCK_PORT              (default 8787)
+  MOCK_MAX_USD           cost_cap maxUsd            (default 0.01)
+  MOCK_WINDOW            cost_cap window            (default 1d_rolling)
+  MOCK_SEED_USD          initial cost in the window (default 0.0)
+  MOCK_FAIL_CLOSED       policy failClosed          (default true)
+  MOCK_EVENTS_FILE       append every received usage event as JSONL here
+  MOCK_PROMPT_TOKENS     mock provider prompt_tokens     (default 100000)
+  MOCK_COMPLETION_TOKENS mock provider completion_tokens (default 100000)
+
+Every request is logged to stderr; received usage events are printed (and, when
+MOCK_EVENTS_FILE is set, appended as JSON lines so a test harness can assert on
+them). Bearer auth is accepted but not verified (any token passes) — this is a
+test double, not the real auth plane.
 """
 import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("MOCK_PORT", "8787"))
 MAX_USD = float(os.environ.get("MOCK_MAX_USD", "0.01"))
 WINDOW = os.environ.get("MOCK_WINDOW", "1d_rolling")
 FAIL_CLOSED = os.environ.get("MOCK_FAIL_CLOSED", "true").lower() in ("1", "true", "yes")
+EVENTS_FILE = os.environ.get("MOCK_EVENTS_FILE", "")
+PROMPT_TOKENS = int(os.environ.get("MOCK_PROMPT_TOKENS", "100000"))
+COMPLETION_TOKENS = int(os.environ.get("MOCK_COMPLETION_TOKENS", "100000"))
 
 _lock = threading.Lock()
 # Live, mutable state. ALLOWED usage events accumulate into `cost` so a cost cap
@@ -63,6 +77,13 @@ POLICIES_ETAG = '"mock-policies-v1"'
 
 def log(*a):
     print("[mock-platform]", *a, file=sys.stderr, flush=True)
+
+
+def record_event(event):
+    if not EVENTS_FILE:
+        return
+    with open(EVENTS_FILE, "a") as f:
+        f.write(json.dumps(event) + "\n")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,11 +120,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b""
         if self.path.endswith("/policies/usage"):
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length else b"[]"
             try:
-                data = json.loads(raw)
+                data = json.loads(raw or b"[]")
             except Exception:
                 return self._send(400, {"success": False, "error": "bad json"})
             events = data if isinstance(data, list) else [data]
@@ -111,6 +132,7 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 for e in events:
                     accepted += 1
+                    record_event(e)
                     outcome = e.get("outcome", "ALLOWED")
                     if outcome == "BLOCKED":
                         blocked += 1
@@ -125,6 +147,30 @@ class Handler(BaseHTTPRequestHandler):
                     log("  <- ALLOWED event: model=%s costUsd=%.5f (window total now %.5f)"
                         % (e.get("model"), cost, _state["cost"][WINDOW]))
             return self._send(202, {"success": True, "accepted": accepted, "persisted": persisted, "blocked": blocked})
+        if self.path.startswith("/v1/chat/completions"):
+            # Mock OpenAI provider: echo the model, fixed content, configurable usage.
+            try:
+                req = json.loads(raw or b"{}")
+            except Exception:
+                req = {}
+            model = req.get("model", "gpt-4o")
+            log("POST /v1/chat/completions (mock provider) model=%s -> 200" % model)
+            return self._send(200, {
+                "id": "chatcmpl-mock-e2e",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "mock completion"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": PROMPT_TOKENS,
+                    "completion_tokens": COMPLETION_TOKENS,
+                    "total_tokens": PROMPT_TOKENS + COMPLETION_TOKENS,
+                },
+            })
         return self._send(404, {"error": "not found"})
 
     def log_message(self, *a):
@@ -133,8 +179,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    log("listening on http://127.0.0.1:%d  (maxUsd=%s window=%s seedUsd=%s failClosed=%s)"
-        % (PORT, MAX_USD, WINDOW, _seed, FAIL_CLOSED))
+    log("listening on http://127.0.0.1:%d  (maxUsd=%s window=%s seedUsd=%s failClosed=%s eventsFile=%r)"
+        % (PORT, MAX_USD, WINDOW, _seed, FAIL_CLOSED, EVENTS_FILE))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

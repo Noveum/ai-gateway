@@ -258,6 +258,32 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Response::error("Not Found", 404);
     }
 
+    // Platform-managed Nova Guard (remote policy fetch, live cost/rate state,
+    // usage reporting) is native-only: none of that machinery is compiled for
+    // wasm32, so honoring these vars here would silently proxy traffic with ZERO
+    // enforcement or metering while the operator believes the platform bridge is
+    // active. Refuse loudly instead of failing open.
+    let remote_configured = ["NOVEUM_API_KEY", "NOVEUM_GUARD_PROJECT_ID"]
+        .iter()
+        .all(|k| {
+            env.secret(k)
+                .map(|v| !v.to_string().trim().is_empty())
+                .or_else(|_| env.var(k).map(|v| !v.to_string().trim().is_empty()))
+                .unwrap_or(false)
+        });
+    if remote_configured {
+        let headers = Headers::new();
+        headers.set("content-type", "application/json")?;
+        return Ok(Response::from_json(&json!({
+            "error": {
+                "message": "platform-managed Nova Guard (NOVEUM_API_KEY/NOVEUM_GUARD_PROJECT_ID) is not supported on the Cloudflare Worker deployment; unset these vars and use an inline NOVEUM_GUARD_POLICIES bundle, or deploy the native gateway",
+                "type": "gateway_configuration_error"
+            }
+        }))?
+        .with_headers(headers)
+        .with_status(503));
+    }
+
     let provider = req
         .headers()
         .get("x-provider")

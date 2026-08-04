@@ -9,7 +9,8 @@
 
 /// `(model_id, input_usd_per_1m, output_usd_per_1m)`.
 pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
-    // OpenAI — platform.openai.com/docs/pricing
+    // OpenAI — developers.openai.com/api/docs/models (verified 2026-08)
+    ("gpt-5.6-luna", 1.00, 6.00),
     ("gpt-5", 1.25, 10.00),
     ("gpt-5-mini", 0.25, 2.00),
     ("gpt-5-nano", 0.05, 0.40),
@@ -23,7 +24,8 @@ pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
     ("o1", 15.00, 60.00),
     ("text-embedding-3-small", 0.02, 0.00),
     ("text-embedding-3-large", 0.13, 0.00),
-    // Anthropic — docs.claude.com/pricing
+    // Anthropic — platform.claude.com/docs (Sonnet 5 introductory rate, 2026-08)
+    ("claude-sonnet-5", 2.00, 10.00),
     ("claude-opus-4-8", 5.00, 25.00),
     ("claude-opus-4-7", 5.00, 25.00),
     ("claude-opus-4-6", 5.00, 25.00),
@@ -31,7 +33,9 @@ pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
     ("claude-sonnet-4-5", 3.00, 15.00),
     ("claude-haiku-4-5", 1.00, 5.00),
     ("claude-fable-5", 10.00, 50.00),
-    // Google Gemini — ai.google.dev/pricing (Pro: <=200K-token tier; doubles above)
+    // Google Gemini — ai.google.dev/gemini-api/docs (3.6 Flash verified 2026-08;
+    // Pro: <=200K-token tier; doubles above)
+    ("gemini-3.6-flash", 1.50, 7.50),
     ("gemini-2.5-pro", 1.25, 10.00),
     ("gemini-2.5-flash", 0.30, 2.50),
     ("gemini-2.5-flash-lite", 0.10, 0.40),
@@ -149,6 +153,29 @@ pub fn estimate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 
     }
 }
 
+/// Assumed completion size when the request doesn't set `max_tokens`: cost caps
+/// need *some* forward estimate of the call being admitted, and most chat
+/// completions finish well under this. Erring high only blocks slightly before
+/// the cap instead of after it — the right direction for a hard cap.
+const DEFAULT_ASSUMED_OUTPUT_TOKENS: u64 = 1024;
+
+/// Predict the cost of a request *before* forwarding it: estimated input tokens
+/// plus the request's `max_tokens` (or a conservative default) at the model's
+/// output rate. `None` when the model has no pricing entry — the caller decides
+/// whether an unmeterable call fails open or closed.
+pub fn estimate_request_cost(
+    model: &str,
+    input_tokens: u32,
+    max_output_tokens: Option<u64>,
+) -> Option<f64> {
+    let p = lookup(model)?;
+    let out = max_output_tokens.unwrap_or(DEFAULT_ASSUMED_OUTPUT_TOKENS);
+    Some(
+        (input_tokens as f64 / 1_000_000.0) * p.input_per_1m
+            + (out as f64 / 1_000_000.0) * p.output_per_1m,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +251,41 @@ mod tests {
     fn anthropic_and_bedrock_priced() {
         assert!(lookup("claude-opus-4-8").is_some());
         assert!(lookup("anthropic.claude-haiku-4-5-20251001-v1:0").is_some());
+    }
+
+    #[test]
+    fn current_generation_models_priced() {
+        // Current-generation ids must resolve to their own (verified) rates,
+        // not fall back to an older family or to $0.
+        let luna = lookup("gpt-5.6-luna").unwrap();
+        assert_eq!((luna.input_per_1m, luna.output_per_1m), (1.00, 6.00));
+        let sonnet5 = lookup("claude-sonnet-5").unwrap();
+        assert_eq!((sonnet5.input_per_1m, sonnet5.output_per_1m), (2.00, 10.00));
+        let flash = lookup("gemini-3.6-flash").unwrap();
+        assert_eq!((flash.input_per_1m, flash.output_per_1m), (1.50, 7.50));
+        // Dated snapshots resolve to the same family.
+        assert_eq!(
+            lookup("gpt-5.6-luna-2026-05-01").unwrap().input_per_1m,
+            1.00
+        );
+        assert_eq!(
+            lookup("claude-sonnet-5-20260601").unwrap().input_per_1m,
+            2.00
+        );
+    }
+
+    #[test]
+    fn estimate_request_cost_predicts_with_and_without_max_tokens() {
+        // gpt-4o: 10 input @ 2.50/1M + 1000 max output @ 10.00/1M
+        let c = estimate_request_cost("gpt-4o", 10, Some(1000)).unwrap();
+        let expected = (10.0 / 1e6) * 2.50 + (1000.0 / 1e6) * 10.00;
+        assert!((c - expected).abs() < 1e-12);
+        // Without max_tokens the default assumed completion applies.
+        let d = estimate_request_cost("gpt-4o", 10, None).unwrap();
+        let expected_default =
+            (10.0 / 1e6) * 2.50 + (DEFAULT_ASSUMED_OUTPUT_TOKENS as f64 / 1e6) * 10.00;
+        assert!((d - expected_default).abs() < 1e-12);
+        // Unpriced model → None (caller decides open/closed).
+        assert!(estimate_request_cost("no-such-model", 10, Some(10)).is_none());
     }
 }

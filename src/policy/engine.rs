@@ -32,16 +32,23 @@ struct PolicyMeta {
     policy_type: PolicyType,
     mode: PolicyMode,
     fail_closed: bool,
+    /// Org-sourced (from the platform's merged `/effective` set): enforce
+    /// against org-scope counters when the control plane provides them.
+    org_scoped: bool,
 }
 
 impl PolicyMeta {
     fn from_policy(p: &Policy) -> Self {
+        let org_scoped = p.source.as_deref().is_some_and(|s| {
+            s.eq_ignore_ascii_case("org") || s.eq_ignore_ascii_case("organization")
+        });
         Self {
             id: p.id().to_string(),
             name: p.name.clone(),
             policy_type: p.policy_type,
             mode: p.mode,
             fail_closed: p.fail_closed,
+            org_scoped,
         }
     }
 }
@@ -266,6 +273,12 @@ impl PolicyEngine {
         // against; with the platform bridge wired, `failClosed` is honored.
         let stateful_meta = |p: &Policy| {
             let meta = PolicyMeta::from_policy(p);
+            if meta.org_scoped {
+                info!(
+                    policy = %meta.id,
+                    "org-sourced policy: enforcing against org counters when /state provides them, else project counters"
+                );
+            }
             if live_state_backed {
                 meta
             } else {
@@ -418,11 +431,19 @@ impl PolicyEngine {
         let model_lc = model.to_lowercase();
         let mut working_text: Cow<str> = Cow::Borrowed(text);
 
+        // The request's own completion budget, for predictive cost-cap admission.
+        let max_output_tokens = json.and_then(|j| {
+            ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+                .iter()
+                .find_map(|k| j.get(*k).and_then(|v| v.as_u64()))
+        });
+
         // 1) Cost-cap + rate-limit policies run first (input phase only); they can
         //    block before any text scanning.
         if phase.applies_to(Phase::Input) {
             for cc in &state.cost_caps {
-                let decision = self.eval_cost_cap(cc, &model_lc, input_tokens, live_state);
+                let decision =
+                    self.eval_cost_cap(cc, &model_lc, input_tokens, max_output_tokens, live_state);
                 if decision.is_blocking() && result.block.is_none() {
                     result.block = Some(decision.clone());
                 }
@@ -546,7 +567,8 @@ impl PolicyEngine {
         &self,
         cc: &CostCapPolicy,
         model: &str,
-        _input_tokens: Option<u32>,
+        input_tokens: Option<u32>,
+        max_output_tokens: Option<u64>,
         live_state: Option<&LiveState>,
     ) -> PolicyDecision {
         // Out-of-scope models pass.
@@ -556,29 +578,73 @@ impl PolicyEngine {
             }
         }
 
+        // A model with no pricing entry can never advance the cost counters (its
+        // usage reports $0), so this cap could never trip on it. For a
+        // fail-closed policy that means "cannot meter" → block; fail-open
+        // policies keep allowing (advisory behavior).
+        if cc.meta.fail_closed && crate::policy::pricing::lookup(model).is_none() {
+            let mut d = PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
+            d.flagged = true;
+            d.score = 1.0;
+            d.severity = Severity::Critical;
+            d.action = cc.config.action;
+            d.reason = format!(
+                "model '{model}' has no pricing entry; cost cannot be metered; failing closed"
+            );
+            return d;
+        }
+
         let window_key = window_label(cc.config.window);
-        let spend = live_state.and_then(|s| s.cost_usd_by_window.get(window_key).copied());
+        // Org-sourced policies enforce against org-scope counters when the
+        // control plane supplies them; otherwise fall back to the project
+        // counters (an org cap then only bounds each project separately).
+        let spend = live_state.and_then(|s| {
+            if cc.meta.org_scoped && s.has_org_counters() {
+                s.org_cost_usd_by_window.get(window_key).copied()
+            } else {
+                s.cost_usd_by_window.get(window_key).copied()
+            }
+        });
 
         match spend {
             Some(spent) => {
+                // Predict this request's own cost so an almost-exhausted cap
+                // blocks *before* forwarding, not one request after. Unpriced
+                // models predict None → 0 (fail-closed ones were rejected above).
+                let est_request = crate::policy::pricing::estimate_request_cost(
+                    model,
+                    input_tokens.unwrap_or(0),
+                    max_output_tokens,
+                )
+                .unwrap_or(0.0);
                 let over_hard = spent >= cc.config.max_usd;
+                let would_exceed = spent + est_request >= cc.config.max_usd;
                 let over_soft = cc
                     .config
                     .soft_usd
                     .map(|soft| spent >= soft)
                     .unwrap_or(false);
-                if over_hard {
+                if over_hard || would_exceed {
                     let mut d =
                         PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
                     d.flagged = true;
                     d.score = 1.0;
                     d.severity = Severity::Critical;
                     d.action = cc.config.action;
-                    d.reason = format!(
-                        "spend ${} over {window_key} reached cap ${}",
-                        fmt_usd(spent),
-                        fmt_usd(cc.config.max_usd)
-                    );
+                    d.reason = if over_hard {
+                        format!(
+                            "spend ${} over {window_key} reached cap ${}",
+                            fmt_usd(spent),
+                            fmt_usd(cc.config.max_usd)
+                        )
+                    } else {
+                        format!(
+                            "spend ${} over {window_key} plus estimated request cost ${} would exceed cap ${}",
+                            fmt_usd(spent),
+                            fmt_usd(est_request),
+                            fmt_usd(cc.config.max_usd)
+                        )
+                    };
                     d
                 } else if over_soft {
                     let mut d =
@@ -613,9 +679,17 @@ impl PolicyEngine {
     ) -> PolicyDecision {
         match live_state {
             Some(state) => {
+                // Org-sourced policies read org-scope counters when available
+                // (see eval_cost_cap).
+                let use_org = rl.meta.org_scoped && state.has_org_counters();
+                let (requests, tokens) = if use_org {
+                    (&state.org_requests_by_window, &state.org_tokens_by_window)
+                } else {
+                    (&state.requests_by_window, &state.tokens_by_window)
+                };
                 for w in &rl.config.windows {
                     if let Some(max) = w.max_requests {
-                        if let Some(&count) = state.requests_by_window.get(&w.period) {
+                        if let Some(&count) = requests.get(&w.period) {
                             if count >= max {
                                 let mut d = PolicyDecision::allow(
                                     &rl.meta.id,
@@ -636,7 +710,7 @@ impl PolicyEngine {
                         }
                     }
                     if let Some(max) = w.max_tokens {
-                        if let Some(&count) = state.tokens_by_window.get(&w.period) {
+                        if let Some(&count) = tokens.get(&w.period) {
                             if count >= max {
                                 let mut d = PolicyDecision::allow(
                                     &rl.meta.id,
@@ -703,7 +777,6 @@ fn window_label(w: CostWindow) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn fmt_usd_keeps_precision_for_sub_cent_caps() {
@@ -869,6 +942,124 @@ mod tests {
         );
     }
 
+    fn backed_engine(json: &str) -> PolicyEngine {
+        let bundle = PolicyBundle::from_json_str(json).unwrap();
+        PolicyEngine::from_bundle(
+            &bundle,
+            EngineOptions {
+                live_state_backed: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn cost_cap_fail_closed_blocks_unpriced_model() {
+        // A model with no pricing entry can never advance the cost counters, so
+        // a fail-closed cap must treat it as unmeterable and block.
+        let e = backed_engine(
+            r#"{"policies":[{"name":"budget","type":"cost_cap","mode":"enforce","failClosed":true,
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
+        );
+        let mut ls = LiveState::default();
+        ls.cost_usd_by_window.insert("30d_rolling".into(), 0.0);
+        let r = e.evaluate(
+            Phase::Input,
+            "totally-unknown-model",
+            "hi",
+            None,
+            None,
+            Some(&ls),
+        );
+        assert!(r.is_blocked(), "unpriced model must fail closed");
+        assert!(r.block.unwrap().reason.contains("no pricing entry"));
+        // Fail-open policies keep allowing unpriced models (advisory behavior).
+        let open = backed_engine(
+            r#"{"policies":[{"name":"budget","type":"cost_cap","mode":"enforce",
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
+        );
+        let r2 = open.evaluate(
+            Phase::Input,
+            "totally-unknown-model",
+            "hi",
+            None,
+            None,
+            Some(&ls),
+        );
+        assert!(!r2.is_blocked());
+    }
+
+    #[test]
+    fn cost_cap_blocks_when_predicted_request_cost_would_exceed() {
+        // Spend is *under* the cap, but this request's own predicted cost
+        // (input tokens + max_tokens at gpt-4o rates) would push it over: the
+        // request must be blocked BEFORE forwarding, not one request later.
+        let e = engine(
+            r#"{"policies":[{"name":"budget","type":"cost_cap","mode":"enforce",
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
+        );
+        let mut ls = LiveState::default();
+        ls.cost_usd_by_window.insert("30d_rolling".into(), 99.999);
+        let body = serde_json::json!({"model":"gpt-4o","max_tokens": 1000});
+        let r = e.evaluate(
+            Phase::Input,
+            "gpt-4o",
+            "hi",
+            Some(&body),
+            Some(10),
+            Some(&ls),
+        );
+        assert!(
+            r.is_blocked(),
+            "predicted request cost must pre-empt the cap"
+        );
+        assert!(r.block.unwrap().reason.contains("would exceed"));
+        // Well under the cap the same request passes.
+        let mut ls2 = LiveState::default();
+        ls2.cost_usd_by_window.insert("30d_rolling".into(), 50.0);
+        let r2 = e.evaluate(
+            Phase::Input,
+            "gpt-4o",
+            "hi",
+            Some(&body),
+            Some(10),
+            Some(&ls2),
+        );
+        assert!(!r2.is_blocked());
+    }
+
+    #[test]
+    fn org_sourced_cost_cap_reads_org_counters() {
+        let json = r#"{"policies":[{"name":"orgcap","type":"cost_cap","mode":"enforce","source":"org",
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#;
+        let e = engine(json);
+        // Project spend is under the cap, org spend is over: must block.
+        let mut ls = LiveState::default();
+        ls.cost_usd_by_window.insert("30d_rolling".into(), 10.0);
+        ls.org_cost_usd_by_window
+            .insert("30d_rolling".into(), 150.0);
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+        assert!(r.is_blocked(), "org policy must enforce against org spend");
+        // Without org counters it falls back to the (under-cap) project spend.
+        let mut ls2 = LiveState::default();
+        ls2.cost_usd_by_window.insert("30d_rolling".into(), 10.0);
+        let r2 = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls2));
+        assert!(!r2.is_blocked());
+    }
+
+    #[test]
+    fn org_sourced_rate_limit_reads_org_counters() {
+        let e = engine(
+            r#"{"policies":[{"name":"orgrl","type":"rate_limit","mode":"enforce","source":"organization",
+            "config":{"windows":[{"period":"1m","maxRequests":60,"action":"block"}]}}]}"#,
+        );
+        let mut ls = LiveState::default();
+        ls.requests_by_window.insert("1m".into(), 1);
+        ls.org_requests_by_window.insert("1m".into(), 100);
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+        assert!(r.is_blocked());
+    }
+
     #[test]
     fn rate_limit_blocks_over_request_cap() {
         let e = engine(
@@ -971,11 +1162,8 @@ mod tests {
 
     #[test]
     fn empty_live_state_struct_constructs() {
-        let ls = LiveState {
-            cost_usd_by_window: HashMap::new(),
-            requests_by_window: HashMap::new(),
-            tokens_by_window: HashMap::new(),
-        };
+        let ls = LiveState::default();
         assert!(ls.cost_usd_by_window.is_empty());
+        assert!(!ls.has_org_counters());
     }
 }

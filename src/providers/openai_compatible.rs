@@ -127,6 +127,18 @@ impl MetricsExtractor for OpenAICompatibleMetricsExtractor {
                 .get("total_tokens")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
+
+            // Some compat layers (notably Gemini's OpenAI endpoint) omit
+            // reasoning/thinking tokens from `completion_tokens` — or omit the
+            // field entirely — while still billing them in `total_tokens`.
+            // Billed output is total - prompt; take it when it exceeds the
+            // reported completion count so those tokens aren't priced as $0.
+            if let (Some(total), Some(prompt)) = (metrics.total_tokens, metrics.input_tokens) {
+                let billed_output = total.saturating_sub(prompt);
+                if billed_output > metrics.output_tokens.unwrap_or(0) {
+                    metrics.output_tokens = Some(billed_output);
+                }
+            }
         }
 
         if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
@@ -168,6 +180,36 @@ mod tests {
         let p = OpenAICompatibleProvider::new("xai", "https://api.x.ai", false);
         assert_eq!(p.name(), "xai");
         assert_eq!(p.base_url(), "https://api.x.ai");
+    }
+
+    #[test]
+    fn derives_billed_output_from_total_minus_prompt() {
+        // Gemini's OpenAI-compat layer can omit thinking tokens from
+        // completion_tokens (or omit the field): billed output must be derived
+        // from total - prompt so those tokens aren't priced as $0.
+        let body = serde_json::json!({
+            "model": "gemini-3.6-flash",
+            "usage": {"prompt_tokens": 5, "total_tokens": 18}
+        });
+        let m = OpenAICompatibleMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(5));
+        assert_eq!(m.output_tokens, Some(13), "billed output = total - prompt");
+        let expected = (5.0 / 1e6) * 1.50 + (13.0 / 1e6) * 7.50;
+        assert!((m.cost.unwrap() - expected).abs() < 1e-12);
+        // An understated completion_tokens is corrected the same way.
+        let body2 = serde_json::json!({
+            "model": "gemini-3.6-flash",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 18}
+        });
+        let m2 = OpenAICompatibleMetricsExtractor.extract_metrics(&body2);
+        assert_eq!(m2.output_tokens, Some(13));
+        // A consistent usage object is left alone.
+        let body3 = serde_json::json!({
+            "model": "gemini-3.6-flash",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 13, "total_tokens": 18}
+        });
+        let m3 = OpenAICompatibleMetricsExtractor.extract_metrics(&body3);
+        assert_eq!(m3.output_tokens, Some(13));
     }
 
     #[test]

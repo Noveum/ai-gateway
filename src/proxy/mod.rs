@@ -92,7 +92,7 @@ pub async fn send_provider_request(
     _provider: &Box<dyn Provider>,
     config: Arc<AppConfig>,
 ) -> Result<Response<Body>, AppError> {
-    let client = &*CLIENT;
+    let client = client::client_for_url(&url);
 
     let reqwest_headers = headers
         .iter()

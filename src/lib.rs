@@ -133,6 +133,7 @@ pub fn build_router(state: AppState) -> Router {
                 engine: state.policy.clone(),
                 live: state.live.clone(),
                 usage: state.usage.clone(),
+                pending: Arc::new(policy::remote::PendingSpend::new()),
             },
             policy::middleware::guard_middleware,
         ))

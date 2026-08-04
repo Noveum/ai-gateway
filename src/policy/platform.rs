@@ -98,6 +98,9 @@ pub fn translate_policies(platform: &Value) -> Value {
             // order (lower number = higher precedence); otherwise every policy
             // collapses to the default priority and ordering is lost.
             let priority = p.get("priority").and_then(|v| v.as_i64());
+            // Carry `source` (`project`/`org`) so org-wide caps can be evaluated
+            // against org-scope counters instead of each project's own spend.
+            let source = p.get("source").and_then(|v| v.as_str());
             let config =
                 normalize_config(policy_type, p.get("config").cloned().unwrap_or(json!({})));
             let mut out = json!({
@@ -112,6 +115,9 @@ pub fn translate_policies(platform: &Value) -> Value {
             }
             if let Some(pr) = priority {
                 out["priority"] = json!(pr);
+            }
+            if let Some(s) = source {
+                out["source"] = json!(s);
             }
             policies.push(out);
         }
@@ -133,35 +139,55 @@ pub fn translate_bundle(platform: &Value) -> Result<PolicyBundle, String> {
 /// "tokens_1h":n,...}}`. The gateway keys cost by window (`1d_rolling`) and rate
 /// by bare period (`1m`), which is what `eval_cost_cap`/`eval_rate_limit` expect.
 pub fn state_to_live_state(state: &Value) -> LiveState {
-    let mut cost_usd_by_window = HashMap::new();
-    if let Some(cost) = state.get("cost").and_then(|c| c.as_object()) {
-        for (window, v) in cost {
-            if window == "perModel" {
-                continue;
-            }
-            if let Some(n) = v.as_f64() {
-                cost_usd_by_window.insert(window.clone(), n);
+    fn parse_scope(
+        scope: &Value,
+    ) -> (
+        HashMap<String, f64>,
+        HashMap<String, u64>,
+        HashMap<String, u64>,
+    ) {
+        let mut cost_usd_by_window = HashMap::new();
+        if let Some(cost) = scope.get("cost").and_then(|c| c.as_object()) {
+            for (window, v) in cost {
+                if window == "perModel" {
+                    continue;
+                }
+                if let Some(n) = v.as_f64() {
+                    cost_usd_by_window.insert(window.clone(), n);
+                }
             }
         }
+
+        let mut requests_by_window = HashMap::new();
+        let mut tokens_by_window = HashMap::new();
+        if let Some(rate) = scope.get("rate").and_then(|r| r.as_object()) {
+            for (key, v) in rate {
+                let n = v.as_u64().unwrap_or(0);
+                if let Some(period) = key.strip_prefix("requests_") {
+                    requests_by_window.insert(period.to_string(), n);
+                } else if let Some(period) = key.strip_prefix("tokens_") {
+                    tokens_by_window.insert(period.to_string(), n);
+                }
+            }
+        }
+        (cost_usd_by_window, requests_by_window, tokens_by_window)
     }
 
-    let mut requests_by_window = HashMap::new();
-    let mut tokens_by_window = HashMap::new();
-    if let Some(rate) = state.get("rate").and_then(|r| r.as_object()) {
-        for (key, v) in rate {
-            let n = v.as_u64().unwrap_or(0);
-            if let Some(period) = key.strip_prefix("requests_") {
-                requests_by_window.insert(period.to_string(), n);
-            } else if let Some(period) = key.strip_prefix("tokens_") {
-                tokens_by_window.insert(period.to_string(), n);
-            }
-        }
-    }
+    let (cost_usd_by_window, requests_by_window, tokens_by_window) = parse_scope(state);
+    // Optional org-scope aggregates (`{"org": {"cost": {...}, "rate": {...}}}`) —
+    // used to evaluate org-sourced policies against org-wide spend. Absent on
+    // platforms that don't ship them yet; org policies then fall back to the
+    // project counters.
+    let (org_cost_usd_by_window, org_requests_by_window, org_tokens_by_window) =
+        state.get("org").map(parse_scope).unwrap_or_default();
 
     LiveState {
         cost_usd_by_window,
         requests_by_window,
         tokens_by_window,
+        org_cost_usd_by_window,
+        org_requests_by_window,
+        org_tokens_by_window,
     }
 }
 
@@ -248,6 +274,43 @@ mod tests {
             result.block.is_some(),
             "a mode-less enabled cost_cap over the cap must block"
         );
+    }
+
+    #[test]
+    fn source_is_carried_through_translation() {
+        let platform = json!({"policies": [
+            {"policyId":"p1","name":"org cap","type":"COST_CAP","enabled":true,"source":"org",
+             "config":{"window":"30d_rolling","maxUsd":100.0,"action":"BLOCK"}},
+            {"policyId":"p2","name":"proj cap","type":"COST_CAP","enabled":true,"source":"project",
+             "config":{"window":"1d_rolling","maxUsd":5.0,"action":"BLOCK"}}
+        ]});
+        let out = translate_policies(&platform);
+        let pols = out["policies"].as_array().unwrap();
+        assert_eq!(pols[0]["source"], "org");
+        assert_eq!(pols[1]["source"], "project");
+        // And it survives bundle parsing.
+        let bundle = translate_bundle(&platform).unwrap();
+        assert_eq!(bundle.policies[0].source.as_deref(), Some("org"));
+    }
+
+    #[test]
+    fn state_parses_optional_org_scope() {
+        let state = json!({
+            "cost": {"1d_rolling": 1.0},
+            "rate": {"requests_1m": 2},
+            "org": {
+                "cost": {"1d_rolling": 500.0},
+                "rate": {"requests_1m": 999}
+            }
+        });
+        let ls = state_to_live_state(&state);
+        assert_eq!(ls.cost_usd_by_window.get("1d_rolling"), Some(&1.0));
+        assert_eq!(ls.org_cost_usd_by_window.get("1d_rolling"), Some(&500.0));
+        assert_eq!(ls.org_requests_by_window.get("1m"), Some(&999));
+        assert!(ls.has_org_counters());
+        // Without the org section the org maps stay empty.
+        let plain = state_to_live_state(&json!({"cost":{"1d_rolling":1.0},"rate":{}}));
+        assert!(!plain.has_org_counters());
     }
 
     #[test]

@@ -28,9 +28,15 @@ impl Default for OpenAIProvider {
 
 impl OpenAIProvider {
     pub fn new() -> Self {
-        Self {
-            base_url: "https://api.openai.com".to_string(),
-        }
+        // `OPENAI_BASE_URL` override (standard OpenAI SDK convention) lets the
+        // gateway target a compatible upstream — chiefly a local mock in the
+        // hermetic E2E, or a self-hosted compatible endpoint.
+        let base_url = std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| "https://api.openai.com".to_string());
+        Self { base_url }
     }
 }
 

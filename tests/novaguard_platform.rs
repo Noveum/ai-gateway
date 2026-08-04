@@ -256,6 +256,7 @@ async fn middleware_blocks_over_cap_and_reports_blocked_event() {
         engine,
         live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
         usage: Some(UsageReporter::spawn(c.clone())),
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
     };
     let app = Router::new()
         .route("/v1/chat/completions", post(echo_handler))
@@ -303,6 +304,7 @@ async fn middleware_allows_under_cap_and_reports_no_block() {
         engine,
         live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
         usage: Some(UsageReporter::spawn(c.clone())),
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
     };
     let app = Router::new()
         .route("/v1/chat/completions", post(echo_handler))
@@ -352,6 +354,7 @@ async fn fail_closed_blocks_when_state_unavailable() {
         engine,
         live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
         usage: Some(UsageReporter::spawn(c.clone())),
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
     };
     let app = Router::new()
         .route("/v1/chat/completions", post(echo_handler))
@@ -368,5 +371,116 @@ async fn fail_closed_blocks_when_state_unavailable() {
     assert!(
         resp.headers().contains_key("x-noveum-guard-blocked"),
         "failClosed policy must block when /state is unavailable"
+    );
+}
+
+#[tokio::test]
+async fn platform_client_sends_stable_user_agent() {
+    // Production api.noveum.ai's edge rejects UA-less requests with 403 before
+    // they reach the app — every platform call must carry the gateway UA.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(eff_path()))
+        .and(wiremock::matchers::header_regex(
+            "user-agent",
+            r"^noveum-ai-gateway/\d+\.\d+\.\d+",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cost_cap_payload(10.0)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = cfg(&server.uri());
+    let (bundle, _etag) = fetch_bundle_with_etag(&c).await.expect("fetch succeeds");
+    assert_eq!(bundle.policies.len(), 1);
+    // The mock's `.expect(1)` verifies the UA matched on drop.
+}
+
+#[tokio::test]
+async fn expired_state_that_cannot_be_revalidated_is_unavailable() {
+    // Warm an under-cap snapshot, then take the platform down: once the TTL
+    // lapses, get() must report None (unavailable) — NOT serve the stale
+    // under-cap snapshot — so failClosed policies block instead of forwarding.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"cost":{"1d_rolling":1.0},"rate":{},"stale":false,"ttlSeconds":30}),
+        ))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let c = cfg(&server.uri());
+    let live = RemoteLiveState::with_ttl(c, Duration::from_millis(50));
+    let warm = live.get().await;
+    assert!(warm.is_some(), "warm-up snapshot fetch succeeds");
+
+    tokio::time::sleep(Duration::from_millis(80)).await; // let the TTL lapse
+    assert!(
+        live.get().await.is_none(),
+        "expired snapshot + failing /state must be unavailable, not stale-served"
+    );
+    // Within the error backoff, callers keep seeing unavailable (fast path).
+    assert!(live.get().await.is_none());
+}
+
+#[tokio::test]
+async fn pending_spend_blocks_concurrent_burst_near_cap() {
+    // The platform's counters lag (usage posts async, /state is cached). Two
+    // back-to-back requests against an almost-exhausted cap must not BOTH pass:
+    // the first request's predicted cost is charged to the in-process pending
+    // ledger and the second evaluates against spend + pending.
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    // Platform spend stays frozen at 0 (counters lag) with a tiny cap.
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"cost":{"1d_rolling":0.0},"rate":{},"stale":false,"ttlSeconds":30}),
+        ))
+        .mount(&server)
+        .await;
+    mount_usage_ok(&server).await;
+
+    let c = cfg(&server.uri());
+    // Cap of $0.02: one gpt-4o call with max_tokens 1000 predicts ~$0.01.
+    let bundle = translate_bundle(&cost_cap_payload(0.02)).unwrap();
+    let engine = Arc::new(PolicyEngine::from_bundle(&bundle, backed_opts()));
+    let gs = GuardState {
+        engine,
+        live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
+        usage: Some(UsageReporter::spawn(c.clone())),
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    let body =
+        json!({"model":"gpt-4o","max_tokens":1000,"messages":[{"role":"user","content":"hi"}]});
+    let mk = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let first = app.clone().oneshot(mk()).await.unwrap();
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "first request fits under the cap"
+    );
+    let second = app.oneshot(mk()).await.unwrap();
+    assert!(
+        second.headers().contains_key("x-noveum-guard-blocked"),
+        "second request must see the first one's pending spend and block"
     );
 }

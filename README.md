@@ -142,6 +142,15 @@ PORT=8080 noveum-ai-gateway
 | `NOVEUM_GUARD_POLICIES_FILE` | — | Path to a local `nova-guard.json` policy bundle |
 | `NOVEUM_GUARD_POLICIES` | — | Inline JSON policy bundle (alternative to the file) |
 | `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` or `provider_error` |
+| `NOVEUM_API_KEY` | — | Noveum platform API key: with `NOVEUM_GUARD_PROJECT_ID`, activates platform-managed Nova Guard (policies + live cost/rate state fetched from the platform, usage reported back). Native gateway only — the Cloudflare Worker rejects this configuration |
+| `NOVEUM_GUARD_PROJECT_ID` | — | Noveum project whose Nova Guard policies to enforce |
+| `NOVEUM_API_URL` | `https://api.noveum.ai` | Platform API base URL |
+
+> **Cost caps are enforced against reported spend plus a per-process estimate of
+> in-flight requests.** Usage is reported asynchronously and `/state` is cached,
+> so a cap can be briefly overshot by roughly the cost of the requests admitted
+> in that window per gateway instance; a strict cross-instance guarantee needs a
+> platform-side atomic reservation, which the API does not offer yet.
 
 ## 📚 Usage Examples
 

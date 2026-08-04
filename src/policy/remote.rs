@@ -26,6 +26,11 @@ use crate::policy::rules::LiveState;
 pub(crate) static PLATFORM_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .use_rustls_tls()
+        // A stable, explicit User-Agent. The production api.noveum.ai edge
+        // (CDN/WAF) rejects requests with no UA with a 403 before they reach the
+        // application, which silently killed the whole platform bridge (policies,
+        // state, and usage all go through this client).
+        .user_agent(concat!("noveum-ai-gateway/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()
@@ -207,69 +212,78 @@ struct StateSnapshot {
 
 struct StateCache {
     snap: Option<StateSnapshot>,
-    /// When the current in-flight refresh started (`None` = none in flight).
-    /// Single-flights the refetch so a burst of concurrent requests hitting an
-    /// expired TTL doesn't stampede `/state` with N identical GETs.
-    refreshing_since: Option<Instant>,
+    /// When the last refresh attempt *failed* (`None` = last attempt succeeded).
+    /// Within [`ERROR_BACKOFF`] of a failure, callers get `None` (state
+    /// unavailable) immediately instead of re-hitting an unreachable platform on
+    /// every request.
+    last_error_at: Option<Instant>,
 }
 
-/// How long a `refreshing` flag may persist before another caller is allowed to
-/// retry — guards against a refresh future being cancelled (e.g. the client
-/// disconnected mid-fetch) and leaving the flag stuck forever. Comfortably above
-/// the platform client's request timeout.
-const REFRESH_STUCK_AFTER: Duration = Duration::from_secs(15);
+/// After a failed refresh, how long callers report "state unavailable" without
+/// retrying the fetch. Keeps an outage from adding connect-timeout latency to
+/// every guarded request while staying short enough to recover quickly.
+const ERROR_BACKOFF: Duration = Duration::from_secs(3);
 
 /// A cached provider of the platform's live cost/rate counters, used by the guard
 /// middleware to supply `LiveState` to `cost_cap`/`rate_limit` enforcement.
 pub struct RemoteLiveState {
     cfg: RemoteConfig,
     cache: Mutex<StateCache>,
+    ttl: Duration,
 }
 
 impl RemoteLiveState {
     pub fn new(cfg: RemoteConfig) -> Self {
+        Self::with_ttl(cfg, STATE_TTL)
+    }
+
+    /// Like [`RemoteLiveState::new`] with an explicit snapshot TTL (tests).
+    pub fn with_ttl(cfg: RemoteConfig, ttl: Duration) -> Self {
         Self {
             cfg,
             cache: Mutex::new(StateCache {
                 snap: None,
-                refreshing_since: None,
+                last_error_at: None,
             }),
+            ttl,
         }
     }
 
     /// Return the current live state, revalidating if the cache is older than
-    /// [`STATE_TTL`]. Sends `If-None-Match`; a `304` just refreshes the snapshot's
-    /// timestamp. On fetch error, falls back to the last cached snapshot (even if
-    /// stale) so a transient platform blip doesn't flip every policy open.
+    /// the TTL. Sends `If-None-Match`; a `304` just refreshes the snapshot's
+    /// timestamp.
     ///
-    /// Refreshes are single-flighted: while one caller is refetching an expired
-    /// snapshot, concurrent callers return the last snapshot (or `None` if there
-    /// is none yet) rather than each issuing their own `/state` request.
+    /// **An expired snapshot that cannot be revalidated is unavailable** —
+    /// `None` is returned so `failClosed` policies block and fail-open policies
+    /// allow, exactly as they would before any snapshot existed. Serving an
+    /// arbitrarily old under-cap snapshot here would let a `/state` outage
+    /// silently defeat fail-closed enforcement after warm-up.
+    ///
+    /// The lock is held across the refresh, which single-flights it: concurrent
+    /// callers hitting an expired TTL wait for the one in-flight fetch and then
+    /// read its (fresh) result, rather than serving stale data or stampeding
+    /// `/state`. After a failed refresh, callers within [`ERROR_BACKOFF`] get
+    /// `None` immediately (no per-request connect timeouts during an outage).
     pub async fn get(&self) -> Option<LiveState> {
-        let prev_etag = {
-            let mut guard = self.cache.lock().await;
-            if let Some(snap) = &guard.snap {
-                if snap.at.elapsed() < STATE_TTL {
-                    return Some(snap.state.clone());
-                }
-            }
-            // Stale or empty. If another caller is already refreshing (and hasn't
-            // gotten stuck), serve the stale snapshot instead of piling on.
-            let in_flight = guard
-                .refreshing_since
-                .is_some_and(|t| t.elapsed() < REFRESH_STUCK_AFTER);
-            if in_flight {
-                return guard.snap.as_ref().map(|s| s.state.clone());
-            }
-            guard.refreshing_since = Some(Instant::now());
-            guard.snap.as_ref().and_then(|s| s.etag.clone())
-        };
-
-        let result = fetch_state_conditional(&self.cfg, prev_etag.as_deref()).await;
         let mut guard = self.cache.lock().await;
-        guard.refreshing_since = None; // refresh done (success or failure)
+        if let Some(snap) = &guard.snap {
+            if snap.at.elapsed() < self.ttl {
+                return Some(snap.state.clone());
+            }
+        }
+        // Snapshot expired (or none yet). If the platform just failed, don't
+        // pile on — report unavailable until the backoff lapses.
+        if let Some(t) = guard.last_error_at {
+            if t.elapsed() < ERROR_BACKOFF {
+                return None;
+            }
+        }
+
+        let prev_etag = guard.snap.as_ref().and_then(|s| s.etag.clone());
+        let result = fetch_state_conditional(&self.cfg, prev_etag.as_deref()).await;
         match result {
             Ok(StateFetch::NotModified) => {
+                guard.last_error_at = None;
                 if let Some(snap) = guard.snap.as_mut() {
                     snap.at = Instant::now(); // revalidated; reset the freshness clock
                     return Some(snap.state.clone());
@@ -281,12 +295,14 @@ impl RemoteLiveState {
                 None
             }
             Ok(StateFetch::Modified { state, etag, stale }) => {
+                guard.last_error_at = None;
                 if stale {
                     // Counters came from the durable fallback (cache was down);
                     // they're conservative but real, so we still enforce against
                     // them — just make the condition observable.
                     warn!("Nova Guard: live-state served stale (durable fallback)");
                 }
+                let state = *state;
                 guard.snap = Some(StateSnapshot {
                     at: Instant::now(),
                     state: state.clone(),
@@ -295,18 +311,72 @@ impl RemoteLiveState {
                 Some(state)
             }
             Err(e) => {
-                warn!(error = %e, "Nova Guard: live-state fetch failed; using last cached snapshot");
-                guard.snap.as_ref().map(|s| s.state.clone())
+                guard.last_error_at = Some(Instant::now());
+                warn!(
+                    error = %e,
+                    "Nova Guard: live-state fetch failed and snapshot is expired; treating as unavailable"
+                );
+                None
             }
         }
     }
 }
 
-/// Result of a conditional `/state` fetch.
+/// How long a locally admitted request's estimated cost stays in the pending
+/// ledger before it is assumed to have landed in the platform counters
+/// (usage-flush interval + `/state` cache TTLs, with margin).
+const PENDING_SPEND_TTL: Duration = Duration::from_secs(45);
+
+/// In-process ledger of spend the gateway has admitted but the platform's
+/// counters cannot reflect yet (usage is posted asynchronously and `/state` is
+/// cached). Admitted requests' *estimated* costs are added here and counted on
+/// top of the platform spend when evaluating cost caps, closing the window in
+/// which a burst of requests all pass an almost-exhausted cap.
+///
+/// Entries expire after [`PENDING_SPEND_TTL`] (by then the real usage event has
+/// been reported and folded into `/state`). Briefly double-counting an entry
+/// that already landed only errs toward blocking *near the cap*, which is the
+/// correct direction for a hard cap. This is per-process: a true cross-instance
+/// guarantee needs an atomic reservation on the platform side.
+#[derive(Default)]
+pub struct PendingSpend {
+    entries: std::sync::Mutex<std::collections::VecDeque<(Instant, f64)>>,
+}
+
+impl PendingSpend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the estimated cost of a request that is about to be forwarded.
+    pub fn add(&self, cost_usd: f64) {
+        if cost_usd <= 0.0 {
+            return;
+        }
+        let mut e = self.entries.lock().expect("pending-spend lock poisoned");
+        e.push_back((Instant::now(), cost_usd));
+    }
+
+    /// Total un-expired pending spend, pruning expired entries.
+    pub fn sum(&self) -> f64 {
+        let mut e = self.entries.lock().expect("pending-spend lock poisoned");
+        while let Some((at, _)) = e.front() {
+            if at.elapsed() >= PENDING_SPEND_TTL {
+                e.pop_front();
+            } else {
+                break;
+            }
+        }
+        e.iter().map(|(_, c)| c).sum()
+    }
+}
+
+/// Result of a conditional `/state` fetch. The state is boxed to keep the
+/// variants close in size (`LiveState` carries six maps).
 enum StateFetch {
     NotModified,
     Modified {
-        state: LiveState,
+        state: Box<LiveState>,
         etag: Option<String>,
         stale: bool,
     },
@@ -344,7 +414,7 @@ async fn fetch_state_conditional(
     }
     let stale = json.get("stale").and_then(|s| s.as_bool()).unwrap_or(false);
     Ok(StateFetch::Modified {
-        state: platform::state_to_live_state(&json),
+        state: Box::new(platform::state_to_live_state(&json)),
         etag,
         stale,
     })

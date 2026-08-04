@@ -38,6 +38,23 @@ pub struct LiveState {
     pub requests_by_window: std::collections::HashMap<String, u64>,
     /// Token counts keyed by window label.
     pub tokens_by_window: std::collections::HashMap<String, u64>,
+    /// Organization-scope spend counters, present only when the control plane's
+    /// `/state` payload carries an `org` section. Org-sourced policies evaluate
+    /// against these (falling back to the project counters when absent).
+    pub org_cost_usd_by_window: std::collections::HashMap<String, f64>,
+    /// Organization-scope request counters (see `org_cost_usd_by_window`).
+    pub org_requests_by_window: std::collections::HashMap<String, u64>,
+    /// Organization-scope token counters (see `org_cost_usd_by_window`).
+    pub org_tokens_by_window: std::collections::HashMap<String, u64>,
+}
+
+impl LiveState {
+    /// Whether the control plane supplied any organization-scope counters.
+    pub fn has_org_counters(&self) -> bool {
+        !self.org_cost_usd_by_window.is_empty()
+            || !self.org_requests_by_window.is_empty()
+            || !self.org_tokens_by_window.is_empty()
+    }
 }
 
 /// Everything a rule may inspect for one evaluation.

@@ -68,6 +68,12 @@ pub struct Policy {
     pub priority: i32,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Where the policy came from in the platform's merged `/effective` set:
+    /// `"project"` or `"org"`/`"organization"`. Org-sourced `cost_cap`/
+    /// `rate_limit` policies are evaluated against org-scope counters when the
+    /// control plane provides them. Absent for local bundles.
+    #[serde(default)]
+    pub source: Option<String>,
     /// Type-specific configuration, parsed by the matching rule.
     #[serde(default)]
     pub config: serde_json::Value,

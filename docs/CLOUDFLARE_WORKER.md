@@ -89,6 +89,22 @@ After deploy, the gateway answers at `https://noveum-ai-gateway.<account>.worker
 Non-JSON `/v1/*` request bodies (multipart, binary) are forwarded byte-for-byte
 and are not inspected; only `application/json` bodies run through Nova Guard.
 
+### Platform-managed Nova Guard is native-only
+
+**Do not set `NOVEUM_API_KEY`/`NOVEUM_GUARD_PROJECT_ID` on the Worker.** The
+platform bridge (remote policy fetch, live cost/rate state, usage reporting) is
+not compiled for `wasm32`, so a Worker cannot enforce or meter platform
+policies. Rather than silently proxying traffic with zero enforcement, the
+Worker **refuses `/v1/*` requests with a 503 configuration error** when both
+vars are set. Use an inline `NOVEUM_GUARD_POLICIES` bundle on the Worker, or
+deploy the native gateway for platform-managed mode.
+
+Relatedly, inline `cost_cap`/`rate_limit` policies on the Worker have no live
+spend/rate backend: they always evaluate as "state unavailable", and a
+`failClosed: true` flag on them is neutralized at compile time (with a warning)
+because honoring it would block 100% of traffic forever. Live cost/rate
+enforcement requires the native gateway with the platform bridge.
+
 ## What runs on the edge today vs. next
 
 **Working now — verified live on the global edge:**
