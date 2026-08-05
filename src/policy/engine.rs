@@ -230,29 +230,12 @@ impl PolicyEngine {
     /// engine from an in-memory bundle via [`PolicyEngine::from_bundle`].
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn from_env() -> Self {
-        // Treat a broad set of falsey values as "disabled" (case-insensitive,
-        // trimmed) so a kill-switch like `NOVEUM_GUARD_ENABLED=Off` actually
-        // disables enforcement.
-        let enabled = std::env::var("NOVEUM_GUARD_ENABLED")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "false" | "0" | "no" | "off" | "disabled" | ""
-                )
-            })
-            .unwrap_or(true);
-        let block_mode = std::env::var("NOVEUM_GUARD_BLOCK_RESPONSE_MODE")
-            .map(|v| BlockResponseMode::from_env_str(&v))
-            .unwrap_or(BlockResponseMode::SyntheticSuccess);
+        // Single source of truth for the env parsing (falsey-value list,
+        // block-mode mapping) — shared with the platform path via
+        // `EngineOptions::from_env` so the three call sites can't drift.
+        let opts = EngineOptions::from_env();
 
-        let opts = EngineOptions {
-            enabled,
-            block_mode,
-            fail_open_default: true,
-            live_state_backed: false,
-        };
-
-        if !enabled {
+        if !opts.enabled {
             return Self::from_bundle(&PolicyBundle::default(), opts);
         }
 

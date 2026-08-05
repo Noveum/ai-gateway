@@ -103,6 +103,18 @@ pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
     ("sonar-reasoning-pro", 2.00, 8.00),
 ];
 
+/// Long-context pricing tiers: `(model_id, threshold_input_tokens,
+/// high_input_usd_per_1m, high_output_usd_per_1m)`. When a request's input
+/// exceeds the threshold, the whole request is estimated at the high-context
+/// rate (matching how providers bill qualifying requests). Only models with a
+/// documented tier are listed; others charge flat rates at any length.
+const LONG_CONTEXT_PRICING: &[(&str, u32, f64, f64)] = &[
+    // GPT-5.6 Luna: >272K input bills 2x input / 1.5x output.
+    ("gpt-5.6-luna", 272_000, 2.00, 9.00),
+    // Gemini 2.5 Pro: >200K prompt tokens doubles both rates.
+    ("gemini-2.5-pro", 200_000, 2.50, 15.00),
+];
+
 /// Pricing for one model: USD per 1M input/output tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPrice {
@@ -148,10 +160,32 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
     })
 }
 
-/// Estimate the USD cost of a call given token counts. Unknown models cost 0.0
-/// (the caller decides whether unknown-model cost should fail open or closed).
+/// Look up pricing for a model at a given input size, applying the model's
+/// documented long-context tier when `input_tokens` exceeds its threshold.
+pub fn lookup_for_context(model: &str, input_tokens: u32) -> Option<ModelPrice> {
+    let base = lookup(model)?;
+    let m = model.to_lowercase();
+    for &(id, threshold, hi_in, hi_out) in LONG_CONTEXT_PRICING {
+        // Same matching rule as `lookup`: exact id or a dated snapshot of it.
+        let is_family = m == id
+            || (m.len() > id.len()
+                && m.starts_with(id)
+                && matches!(m.as_bytes()[id.len()], b'-' | b':' | b'.' | b'@' | b'/'));
+        if is_family && input_tokens > threshold {
+            return Some(ModelPrice {
+                input_per_1m: hi_in,
+                output_per_1m: hi_out,
+            });
+        }
+    }
+    Some(base)
+}
+
+/// Estimate the USD cost of a call given token counts. Applies long-context
+/// tier rates when the input size qualifies. Unknown models cost 0.0 (the
+/// caller decides whether unknown-model cost should fail open or closed).
 pub fn estimate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
-    match lookup(model) {
+    match lookup_for_context(model, input_tokens) {
         Some(p) => {
             (input_tokens as f64 / 1_000_000.0) * p.input_per_1m
                 + (output_tokens as f64 / 1_000_000.0) * p.output_per_1m
@@ -164,21 +198,39 @@ pub fn estimate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 
 /// need *some* forward estimate of the call being admitted, and most chat
 /// completions finish well under this. Erring high only blocks slightly before
 /// the cap instead of after it — the right direction for a hard cap. (An
-/// unbounded request can of course exceed this; the post-completion pending
-/// window and the platform counters absorb the difference.)
+/// unbounded request can exceed this — models allow up to 128K output — but
+/// reserving a model's full output ceiling for every unbounded chat request
+/// would block ordinary traffic whenever cap headroom drops below ~$1;
+/// operators who want stricter admission raise the assumption via
+/// `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS`.)
 pub const DEFAULT_ASSUMED_OUTPUT_TOKENS: u64 = 1024;
 
+/// The assumed completion size for requests without an explicit output limit:
+/// `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` when set, else
+/// [`DEFAULT_ASSUMED_OUTPUT_TOKENS`]. Read once (it feeds every admission).
+pub fn assumed_output_tokens() -> u64 {
+    static ASSUMED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ASSUMED.get_or_init(|| {
+        std::env::var("NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_ASSUMED_OUTPUT_TOKENS)
+    })
+}
+
 /// Predict the cost of a request *before* forwarding it: estimated input tokens
-/// plus the request's `max_tokens` (or a conservative default) at the model's
-/// output rate. `None` when the model has no pricing entry — the caller decides
-/// whether an unmeterable call fails open or closed.
+/// plus the request's `max_tokens` (or the configured assumed completion size)
+/// at the model's applicable (context-dependent) rates. `None` when the model
+/// has no pricing entry — the caller decides whether an unmeterable call fails
+/// open or closed.
 pub fn estimate_request_cost(
     model: &str,
     input_tokens: u32,
     max_output_tokens: Option<u64>,
 ) -> Option<f64> {
-    let p = lookup(model)?;
-    let out = max_output_tokens.unwrap_or(DEFAULT_ASSUMED_OUTPUT_TOKENS);
+    let p = lookup_for_context(model, input_tokens)?;
+    let out = max_output_tokens.unwrap_or_else(assumed_output_tokens);
     Some(
         (input_tokens as f64 / 1_000_000.0) * p.input_per_1m
             + (out as f64 / 1_000_000.0) * p.output_per_1m,
@@ -287,6 +339,31 @@ mod tests {
             lookup("claude-sonnet-5-20260601").unwrap().input_per_1m,
             2.00
         );
+    }
+
+    #[test]
+    fn long_context_tier_applies_above_threshold() {
+        // Below/at the threshold: standard rates.
+        let base = lookup_for_context("gpt-5.6-luna", 272_000).unwrap();
+        assert_eq!((base.input_per_1m, base.output_per_1m), (1.00, 6.00));
+        // Above it: the documented high-context rates (2x in / 1.5x out).
+        let hi = lookup_for_context("gpt-5.6-luna", 272_001).unwrap();
+        assert_eq!((hi.input_per_1m, hi.output_per_1m), (2.00, 9.00));
+        // Dated snapshots of a tiered family get the tier too.
+        let hi_snap = lookup_for_context("gpt-5.6-luna-2026-05-01", 300_000).unwrap();
+        assert_eq!(hi_snap.input_per_1m, 2.00);
+        // Gemini 2.5 Pro doubles above 200K prompt tokens.
+        let g = lookup_for_context("gemini-2.5-pro", 250_000).unwrap();
+        assert_eq!((g.input_per_1m, g.output_per_1m), (2.50, 15.00));
+        // Models without a documented tier keep flat rates at any size.
+        let flat = lookup_for_context("gpt-4o", 5_000_000).unwrap();
+        assert_eq!(flat.input_per_1m, 2.50);
+        // estimate_cost and estimate_request_cost pick the tier as well.
+        let c = estimate_cost("gpt-5.6-luna", 300_000, 1000);
+        let expected = (300_000.0 / 1e6) * 2.00 + (1000.0 / 1e6) * 9.00;
+        assert!((c - expected).abs() < 1e-9);
+        let r = estimate_request_cost("gpt-5.6-luna", 300_000, Some(1000)).unwrap();
+        assert!((r - expected).abs() < 1e-9);
     }
 
     #[test]

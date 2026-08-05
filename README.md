@@ -145,6 +145,7 @@ PORT=8080 noveum-ai-gateway
 | `NOVEUM_API_KEY` | — | Noveum platform API key: with `NOVEUM_GUARD_PROJECT_ID`, activates platform-managed Nova Guard (policies + live cost/rate state fetched from the platform, usage reported back). Native gateway only — the Cloudflare Worker rejects this configuration |
 | `NOVEUM_GUARD_PROJECT_ID` | — | Noveum project whose Nova Guard policies to enforce |
 | `NOVEUM_API_URL` | `https://api.noveum.ai` | Platform API base URL |
+| `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Assumed completion size for cost/rate admission when a request sets no `max_tokens`. Raise it for stricter (earlier-blocking) hard-cap admission of unbounded requests |
 
 > **Cost caps are enforced against reported spend plus a per-process estimate of
 > in-flight requests.** Usage is reported asynchronously and `/state` is cached,

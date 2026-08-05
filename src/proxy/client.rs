@@ -3,16 +3,13 @@ use once_cell::sync::Lazy;
 use std::time::Duration;
 use tracing::info;
 
-pub fn create_client(config: &AppConfig) -> reqwest::Client {
-    info!("Creating HTTP client with optimized settings");
-
+/// Shared pool/TCP/TLS/timeout/compression configuration for both provider
+/// clients — kept in one place so [`CLIENT`] and [`NEGOTIATING_CLIENT`] can't
+/// drift apart on anything except their HTTP-version strategy.
+fn base_builder(config: &AppConfig) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .pool_max_idle_per_host(config.max_connections)
         .pool_idle_timeout(Duration::from_secs(30))
-        .http2_prior_knowledge()
-        .http2_keep_alive_interval(Duration::from_secs(5))
-        .http2_keep_alive_timeout(Duration::from_secs(10))
-        .http2_adaptive_window(true)
         .tcp_keepalive(Duration::from_secs(5))
         .tcp_nodelay(true)
         .use_rustls_tls()
@@ -20,6 +17,16 @@ pub fn create_client(config: &AppConfig) -> reqwest::Client {
         .connect_timeout(Duration::from_secs(3))
         .gzip(true)
         .brotli(true)
+}
+
+pub fn create_client(config: &AppConfig) -> reqwest::Client {
+    info!("Creating HTTP client with optimized settings");
+
+    base_builder(config)
+        .http2_prior_knowledge()
+        .http2_keep_alive_interval(Duration::from_secs(5))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_adaptive_window(true)
         .build()
         .expect("Failed to create HTTP client")
 }
@@ -37,16 +44,7 @@ pub static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 /// error before the request ever reached the provider.
 pub static NEGOTIATING_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     let config = AppConfig::new();
-    reqwest::Client::builder()
-        .pool_max_idle_per_host(config.max_connections)
-        .pool_idle_timeout(std::time::Duration::from_secs(30))
-        .tcp_keepalive(std::time::Duration::from_secs(5))
-        .tcp_nodelay(true)
-        .use_rustls_tls()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .gzip(true)
-        .brotli(true)
+    base_builder(&config)
         .build()
         .expect("Failed to create negotiating HTTP client")
 });

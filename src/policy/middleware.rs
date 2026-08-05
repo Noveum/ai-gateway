@@ -117,7 +117,7 @@ pub async fn guard_middleware(
         )
         .unwrap_or(0.0);
         let est_tokens = u64::from(est_input_tokens)
-            + max_output_tokens.unwrap_or(crate::policy::pricing::DEFAULT_ASSUMED_OUTPUT_TOKENS);
+            + max_output_tokens.unwrap_or_else(crate::policy::pricing::assumed_output_tokens);
 
         // Reserve this request's predicted usage (cost + one request + tokens)
         // and read the other in-flight reservations in ONE critical section —
