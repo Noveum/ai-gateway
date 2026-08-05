@@ -598,11 +598,15 @@ impl PolicyEngine {
         // Org-sourced policies enforce against org-scope counters when the
         // control plane supplies them; otherwise fall back to the project
         // counters (an org cap then only bounds each project separately).
-        // Checked per counter kind — a partial `org` section carrying only
-        // rate data must not make cost lookups miss (and vice versa).
+        // The fallback is PER WINDOW KEY — an org section that carries other
+        // windows but not this policy's window must not turn a known project
+        // spend into "state unavailable".
         let spend = live_state.and_then(|s| {
-            if cc.meta.org_scoped && !s.org_cost_usd_by_window.is_empty() {
-                s.org_cost_usd_by_window.get(window_key).copied()
+            if cc.meta.org_scoped {
+                s.org_cost_usd_by_window
+                    .get(window_key)
+                    .or_else(|| s.cost_usd_by_window.get(window_key))
+                    .copied()
             } else {
                 s.cost_usd_by_window.get(window_key).copied()
             }
@@ -682,22 +686,35 @@ impl PolicyEngine {
         match live_state {
             Some(state) => {
                 // Org-sourced policies read org-scope counters when available
-                // (see eval_cost_cap). Requests and tokens are selected
-                // independently so a partial `org` section (only one kind
-                // populated) still enforces the other kind against project data.
-                let requests = if rl.meta.org_scoped && !state.org_requests_by_window.is_empty() {
-                    &state.org_requests_by_window
-                } else {
-                    &state.requests_by_window
+                // (see eval_cost_cap). The fallback is PER PERIOD and per
+                // counter kind — an org section missing this window's period
+                // (or one whole kind) still enforces against the matching
+                // project counter instead of silently skipping the check.
+                let requests_for = |period: &str| {
+                    if rl.meta.org_scoped {
+                        state
+                            .org_requests_by_window
+                            .get(period)
+                            .or_else(|| state.requests_by_window.get(period))
+                            .copied()
+                    } else {
+                        state.requests_by_window.get(period).copied()
+                    }
                 };
-                let tokens = if rl.meta.org_scoped && !state.org_tokens_by_window.is_empty() {
-                    &state.org_tokens_by_window
-                } else {
-                    &state.tokens_by_window
+                let tokens_for = |period: &str| {
+                    if rl.meta.org_scoped {
+                        state
+                            .org_tokens_by_window
+                            .get(period)
+                            .or_else(|| state.tokens_by_window.get(period))
+                            .copied()
+                    } else {
+                        state.tokens_by_window.get(period).copied()
+                    }
                 };
                 for w in &rl.config.windows {
                     if let Some(max) = w.max_requests {
-                        if let Some(&count) = requests.get(&w.period) {
+                        if let Some(count) = requests_for(&w.period) {
                             if count >= max {
                                 let mut d = PolicyDecision::allow(
                                     &rl.meta.id,
@@ -718,7 +735,7 @@ impl PolicyEngine {
                         }
                     }
                     if let Some(max) = w.max_tokens {
-                        if let Some(&count) = tokens.get(&w.period) {
+                        if let Some(count) = tokens_for(&w.period) {
                             if count >= max {
                                 let mut d = PolicyDecision::allow(
                                     &rl.meta.id,
@@ -1085,6 +1102,21 @@ mod tests {
         assert!(
             r2.is_blocked(),
             "org rate limit must fall back to (over-limit) project requests"
+        );
+        // Org section populated but MISSING this policy's window key: the
+        // fallback must be per key, not per map — a known project spend must
+        // not degrade to "state unavailable".
+        let cap30 = engine(
+            r#"{"policies":[{"name":"orgcap","type":"cost_cap","mode":"enforce","source":"org",
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
+        );
+        let mut ls3 = LiveState::default();
+        ls3.org_cost_usd_by_window.insert("1d_rolling".into(), 1.0); // other window only
+        ls3.cost_usd_by_window.insert("30d_rolling".into(), 150.0);
+        let r3 = cap30.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls3));
+        assert!(
+            r3.is_blocked(),
+            "missing org window must fall back to the matching project window"
         );
     }
 

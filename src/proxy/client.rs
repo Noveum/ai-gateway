@@ -77,13 +77,22 @@ fn url_host(url: &str) -> Option<&str> {
     authority.rsplit('@').next()?.split(':').next()
 }
 
+/// Whether a host is a Bedrock *runtime* endpoint
+/// (`bedrock-runtime.{region}.amazonaws.com`) — the only AWS hosts the gateway
+/// calls that are known-good under direct HTTP/2. Any other `*.amazonaws.com`
+/// host (other AWS services, custom endpoints) negotiates normally.
+fn is_bedrock_runtime_host(host: &str) -> bool {
+    host.strip_prefix("bedrock-runtime.")
+        .is_some_and(|rest| rest.ends_with(".amazonaws.com"))
+}
+
 /// Pick the right client for an upstream URL: h2-prior-knowledge for the known
 /// first-party provider hosts, a normally-negotiating client for everything
-/// else (cleartext mocks, custom/overridden endpoints, AWS SigV4 hosts).
+/// else (cleartext mocks, custom/overridden endpoints, non-Bedrock AWS hosts).
 pub fn client_for_url(url: &str) -> &'static reqwest::Client {
     let is_known_h2 = url.starts_with("https://")
         && url_host(url)
-            .is_some_and(|h| H2_PROVIDER_HOSTS.contains(&h) || h.ends_with(".amazonaws.com"));
+            .is_some_and(|h| H2_PROVIDER_HOSTS.contains(&h) || is_bedrock_runtime_host(h));
     if is_known_h2 {
         &CLIENT
     } else {
@@ -118,6 +127,17 @@ mod tests {
         // HTTP/1.1-only, so it must not get the prior-knowledge client.
         assert!(std::ptr::eq(
             client_for_url("https://my-gateway.corp.example/v1/chat/completions"),
+            &*NEGOTIATING_CLIENT
+        ));
+        // Non-Bedrock AWS hosts (other services, custom endpoints under the
+        // amazonaws.com suffix) must negotiate too — only bedrock-runtime is
+        // known-good under direct h2.
+        assert!(std::ptr::eq(
+            client_for_url("https://s3.us-east-1.amazonaws.com/bucket/key"),
+            &*NEGOTIATING_CLIENT
+        ));
+        assert!(std::ptr::eq(
+            client_for_url("https://my-proxy.execute-api.us-east-1.amazonaws.com/v1"),
             &*NEGOTIATING_CLIENT
         ));
     }

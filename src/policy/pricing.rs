@@ -9,9 +9,14 @@
 
 /// `(model_id, input_usd_per_1m, output_usd_per_1m)`.
 pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
-    // OpenAI — developers.openai.com/api/docs/pricing (verified 2026-08-04;
-    // Luna reflects the 2026-07-30 price reduction from $1/$6)
-    ("gpt-5.6-luna", 0.20, 1.20),
+    // OpenAI — developers.openai.com/api/docs/models (GPT-5.6 family rates
+    // confirmed against the official model pages 2026-08-04; the widely
+    // reported 2026-07-30 "price cut" does not match what the model pages
+    // bill, and overstating errs toward blocking early — the safe direction
+    // for cost caps). Long-context (>272K input) tiers are NOT modeled.
+    ("gpt-5.6-luna", 1.00, 6.00),
+    ("gpt-5.6-terra", 2.50, 15.00),
+    ("gpt-5.6-sol", 5.00, 30.00),
     ("gpt-5", 1.25, 10.00),
     ("gpt-5-mini", 0.25, 2.00),
     ("gpt-5-nano", 0.05, 0.40),
@@ -158,8 +163,10 @@ pub fn estimate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 
 /// Assumed completion size when the request doesn't set `max_tokens`: cost caps
 /// need *some* forward estimate of the call being admitted, and most chat
 /// completions finish well under this. Erring high only blocks slightly before
-/// the cap instead of after it — the right direction for a hard cap.
-const DEFAULT_ASSUMED_OUTPUT_TOKENS: u64 = 1024;
+/// the cap instead of after it — the right direction for a hard cap. (An
+/// unbounded request can of course exceed this; the post-completion pending
+/// window and the platform counters absorb the difference.)
+pub const DEFAULT_ASSUMED_OUTPUT_TOKENS: u64 = 1024;
 
 /// Predict the cost of a request *before* forwarding it: estimated input tokens
 /// plus the request's `max_tokens` (or a conservative default) at the model's
@@ -260,7 +267,13 @@ mod tests {
         // Current-generation ids must resolve to their own (verified) rates,
         // not fall back to an older family or to $0.
         let luna = lookup("gpt-5.6-luna").unwrap();
-        assert_eq!((luna.input_per_1m, luna.output_per_1m), (0.20, 1.20));
+        assert_eq!((luna.input_per_1m, luna.output_per_1m), (1.00, 6.00));
+        // Terra/Sol must have their own rows — falling through to the shorter
+        // "gpt-5" family prefix would undercount them (Sol by 4x).
+        let terra = lookup("gpt-5.6-terra").unwrap();
+        assert_eq!((terra.input_per_1m, terra.output_per_1m), (2.50, 15.00));
+        let sol = lookup("gpt-5.6-sol").unwrap();
+        assert_eq!((sol.input_per_1m, sol.output_per_1m), (5.00, 30.00));
         let sonnet5 = lookup("claude-sonnet-5").unwrap();
         assert_eq!((sonnet5.input_per_1m, sonnet5.output_per_1m), (2.00, 10.00));
         let flash = lookup("gemini-3.6-flash").unwrap();
@@ -268,7 +281,7 @@ mod tests {
         // Dated snapshots resolve to the same family.
         assert_eq!(
             lookup("gpt-5.6-luna-2026-05-01").unwrap().input_per_1m,
-            0.20
+            1.00
         );
         assert_eq!(
             lookup("claude-sonnet-5-20260601").unwrap().input_per_1m,

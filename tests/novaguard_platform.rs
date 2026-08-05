@@ -484,3 +484,65 @@ async fn pending_spend_blocks_concurrent_burst_near_cap() {
         "second request must see the first one's pending spend and block"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_burst_respects_max_requests_one() {
+    // The reviewer's reproduction: maxRequests=1 with frozen zero platform
+    // counters and a burst of simultaneous requests. Request/token reservations
+    // are folded into the rate counters atomically at admission, so exactly ONE
+    // request may pass — not all of them.
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"cost":{"1d_rolling":0.0},"rate":{"requests_1m":0},"stale":false,"ttlSeconds":30}),
+        ))
+        .mount(&server)
+        .await;
+    mount_usage_ok(&server).await;
+
+    let c = cfg(&server.uri());
+    let platform = json!({"policies":[{
+        "policyId":"pol_rl","name":"one per minute","type":"RATE_LIMIT",
+        "enabled":true,"failClosed":true,
+        "config":{"windows":[{"period":"1m","maxRequests":1,"action":"BLOCK"}]}
+    }]});
+    let bundle = translate_bundle(&platform).unwrap();
+    let engine = Arc::new(PolicyEngine::from_bundle(&bundle, backed_opts()));
+    let gs = GuardState {
+        engine,
+        live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
+        usage: Some(UsageReporter::spawn(c.clone())),
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let futures: Vec<_> = (0..10)
+        .map(|_| {
+            let app = app.clone();
+            let body = serde_json::to_vec(&body).unwrap();
+            async move {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                resp.headers().contains_key("x-noveum-guard-blocked")
+            }
+        })
+        .collect();
+    let results = futures_util::future::join_all(futures).await;
+    let allowed = results.iter().filter(|blocked| !**blocked).count();
+    let blocked = results.iter().filter(|blocked| **blocked).count();
+    assert_eq!(
+        allowed, 1,
+        "maxRequests=1 with frozen counters must admit exactly one of the burst"
+    );
+    assert_eq!(blocked, 9);
+}

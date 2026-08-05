@@ -397,13 +397,11 @@ async fn handle_streaming_response(
                 provider, model
             );
 
-            // Rough token estimation based on accumulated text length
-            // Approximation: ~4 characters per token for English text
-            let estimated_output_tokens = if !accumulated_text.is_empty() {
-                Some((accumulated_text.len() as f64 / 4.0).ceil() as u32)
-            } else {
-                None
-            };
+            // Estimate output from the actual generated content (extracted
+            // from the parsed chunks) — not the raw SSE envelope, whose JSON
+            // framing would inflate the count by an order of magnitude.
+            let estimated_output_tokens =
+                estimate_stream_output_tokens(&streamed_chunks, &accumulated_text);
 
             // Estimate input tokens from the request body too — a stream with
             // no usage data must still report *some* real cost, not $0, or
@@ -447,9 +445,9 @@ async fn handle_streaming_response(
                     })
                     .filter(|&t| t > 0);
             }
-            if accumulated_metrics.output_tokens.is_none() && !accumulated_text.is_empty() {
+            if accumulated_metrics.output_tokens.is_none() {
                 accumulated_metrics.output_tokens =
-                    Some((accumulated_text.len() as f64 / 4.0).ceil() as u32);
+                    estimate_stream_output_tokens(&streamed_chunks, &accumulated_text);
             }
 
             // Streaming chunks often carry the model in one event and token
@@ -513,4 +511,68 @@ async fn handle_streaming_response(
     });
 
     Response::from_parts(parts, Body::from_stream(ReceiverStream::new(rx)))
+}
+
+/// Estimate output tokens for a stream that ended without provider usage data.
+/// Prefers the actual generated content — `choices[].delta.content` (and
+/// `message.content`) text pulled from the parsed chunks — because estimating
+/// from the raw accumulated SSE bytes would count the `data:` framing and JSON
+/// envelope of every chunk as model output and overestimate by an order of
+/// magnitude. Falls back to the raw text length only when no content could be
+/// parsed at all.
+fn estimate_stream_output_tokens(chunks: &[Value], accumulated_text: &str) -> Option<u32> {
+    let content_chars: usize = chunks
+        .iter()
+        .filter_map(|c| c.get("choices").and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|choice| {
+            choice
+                .get("delta")
+                .or_else(|| choice.get("message"))
+                .and_then(|d| d.get("content"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.chars().count())
+        .sum();
+    if content_chars > 0 {
+        Some((content_chars as f64 / 4.0).ceil() as u32)
+    } else if !accumulated_text.is_empty() {
+        Some((accumulated_text.len() as f64 / 4.0).ceil() as u32)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stream_output_estimate_uses_content_not_sse_envelope() {
+        // 3 chunks × 8 content chars = 24 chars ≈ 6 tokens, while the raw SSE
+        // text is far larger — the estimate must come from the content.
+        let chunks: Vec<Value> = (0..3)
+            .map(|i| {
+                json!({"id":"c","object":"chat.completion.chunk","model":"gpt-4o",
+                       "choices":[{"index":0,"delta":{"content":"12345678"},"finish_reason":null}],
+                       "padding": format!("irrelevant-envelope-bytes-{i}")})
+            })
+            .collect();
+        let raw: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+        let est = estimate_stream_output_tokens(&chunks, &raw).unwrap();
+        assert_eq!(est, 6, "estimate from content chars, not envelope bytes");
+        assert!(
+            (raw.len() as f64 / 4.0).ceil() as u32 > est * 5,
+            "envelope-based estimate would have been much larger"
+        );
+    }
+
+    #[test]
+    fn stream_output_estimate_falls_back_to_raw_text() {
+        // No parseable content chunks → raw-length fallback; nothing → None.
+        let est = estimate_stream_output_tokens(&[], "12345678");
+        assert_eq!(est, Some(2));
+        assert_eq!(estimate_stream_output_tokens(&[], ""), None);
+    }
 }

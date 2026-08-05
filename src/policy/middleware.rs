@@ -98,7 +98,7 @@ pub async fn guard_middleware(
 
     let mut forward_bytes = bytes.clone();
     let mut body_mutated = false;
-    // This request's pending-spend reservation; released again if it blocks.
+    // This request's pending-usage reservation; released again if it blocks.
     let mut reservation: Option<u64> = None;
 
     if let Some(mut body_json) = json.clone() {
@@ -116,22 +116,41 @@ pub async fn guard_middleware(
             max_output_tokens,
         )
         .unwrap_or(0.0);
+        let est_tokens = u64::from(est_input_tokens)
+            + max_output_tokens.unwrap_or(crate::policy::pricing::DEFAULT_ASSUMED_OUTPUT_TOKENS);
 
-        // Reserve this request's predicted cost and read the other in-flight
-        // reservations in ONE critical section — reserving *before* evaluating
-        // means two concurrent requests always see each other's reservation, so
-        // a burst near an almost-exhausted cap can't all pass on the same
-        // stale total. Blocked requests release the reservation below.
+        // Reserve this request's predicted usage (cost + one request + tokens)
+        // and read the other in-flight reservations in ONE critical section —
+        // reserving *before* evaluating means two concurrent requests always
+        // see each other's reservation, so a burst near an almost-exhausted
+        // cost cap OR rate limit can't all pass on the same stale counters.
+        // Blocked requests release the reservation below.
         if gs.usage.is_some() {
-            let (res, other_pending) = gs.pending.reserve(est_request_cost);
-            reservation = res;
-            if other_pending > 0.0 {
-                if let Some(ls) = live_state.as_mut() {
+            let (res, others) = gs.pending.reserve(est_request_cost, est_tokens);
+            reservation = Some(res);
+            if let Some(ls) = live_state.as_mut() {
+                if others.cost_usd > 0.0 {
                     for v in ls.cost_usd_by_window.values_mut() {
-                        *v += other_pending;
+                        *v += others.cost_usd;
                     }
                     for v in ls.org_cost_usd_by_window.values_mut() {
-                        *v += other_pending;
+                        *v += others.cost_usd;
+                    }
+                }
+                if others.requests > 0 {
+                    for v in ls.requests_by_window.values_mut() {
+                        *v += others.requests;
+                    }
+                    for v in ls.org_requests_by_window.values_mut() {
+                        *v += others.requests;
+                    }
+                }
+                if others.tokens > 0 {
+                    for v in ls.tokens_by_window.values_mut() {
+                        *v += others.tokens;
+                    }
+                    for v in ls.org_tokens_by_window.values_mut() {
+                        *v += others.tokens;
                     }
                 }
             }
@@ -201,22 +220,26 @@ pub async fn guard_middleware(
         // Without it a default stream carries no token counts, the ALLOWED event
         // posts $0, and cost caps silently never advance. The extra final chunk
         // is standard OpenAI shape (empty `choices` + `usage`) that SDKs handle.
+        // An existing `stream_options` object missing the key is augmented too;
+        // only an explicit `include_usage: false` is respected (the estimation
+        // fallback covers that stream instead).
         if gs.usage.is_some()
             && provider.eq_ignore_ascii_case("openai")
             && body_json.get("stream").and_then(|s| s.as_bool()) == Some(true)
-            && body_json.get("stream_options").is_none()
         {
-            body_json["stream_options"] = serde_json::json!({ "include_usage": true });
-            if let Ok(v) = serde_json::to_vec(&body_json) {
-                forward_bytes = v.into();
-                body_mutated = true;
+            let needs_flag = match body_json.get("stream_options") {
+                None => true,
+                Some(opts) => opts.is_object() && opts.get("include_usage").is_none(),
+            };
+            if needs_flag {
+                body_json["stream_options"]["include_usage"] = serde_json::json!(true);
+                if let Ok(v) = serde_json::to_vec(&body_json) {
+                    forward_bytes = v.into();
+                    body_mutated = true;
+                }
             }
         }
     }
-
-    // The reservation (if any) stays in the ledger for admitted requests and
-    // expires on its own once the real usage lands in the platform counters.
-    let _ = reservation;
 
     let mut parts = parts;
     if body_mutated {
@@ -228,7 +251,36 @@ pub async fn guard_middleware(
     let response = next.run(forwarded).await;
 
     // --- OUTPUT PHASE ---
-    enforce_output(&engine, &provider, &model, response, live_state.as_ref()).await
+    let response = enforce_output(&engine, &provider, &model, response, live_state.as_ref()).await;
+
+    // Keep the admitted request's reservation ACTIVE until the response body
+    // finishes (or the client disconnects): the guard rides the body stream, so
+    // a long-lived or streaming request never loses its cap protection mid-
+    // flight, and the post-completion TTL starts only once usage reporting can
+    // actually begin.
+    match reservation {
+        Some(id) => attach_reservation_guard(
+            response,
+            crate::policy::remote::ReservationGuard::new(gs.pending.clone(), id),
+        ),
+        None => response,
+    }
+}
+
+/// Wrap the response body so `guard` is dropped exactly when the body has been
+/// fully streamed to the client — or the connection is dropped — marking the
+/// reservation completed. The bytes pass through untouched.
+fn attach_reservation_guard(
+    response: Response,
+    guard: crate::policy::remote::ReservationGuard,
+) -> Response {
+    use futures_util::StreamExt;
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        let _keep_alive = &guard;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 /// Should this request be inspected? POST, JSON, on the `/v1/` proxy path.

@@ -364,30 +364,59 @@ impl RemoteLiveState {
     }
 }
 
-/// How long a locally admitted request's estimated cost stays in the pending
-/// ledger before it is assumed to have landed in the platform counters
-/// (usage-flush interval + `/state` cache TTLs, with margin).
+/// How long a COMPLETED request's reservation stays in the pending ledger
+/// before it is assumed to have landed in the platform counters (usage-flush
+/// interval + `/state` cache TTLs, with margin). The clock starts at request
+/// completion, not admission — an active request never loses its reservation.
 const PENDING_SPEND_TTL: Duration = Duration::from_secs(45);
 
-/// In-process ledger of spend the gateway has admitted but the platform's
+/// Backstop for reservations whose completion guard never fires (which should
+/// not happen — the guard is RAII on the response body — but a leak here must
+/// not poison admission forever). Far above any real request duration.
+const ACTIVE_RESERVATION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Aggregate of the *other* in-flight/pending reservations, folded into the
+/// live counters before policy evaluation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PendingTotals {
+    pub cost_usd: f64,
+    pub requests: u64,
+    pub tokens: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingEntry {
+    id: u64,
+    at: Instant,
+    cost_usd: f64,
+    tokens: u64,
+}
+
+/// In-process ledger of usage the gateway has admitted but the platform's
 /// counters cannot reflect yet (usage is posted asynchronously and `/state` is
-/// cached). Admitted requests' *estimated* costs are reserved here and counted
-/// on top of the platform spend when evaluating cost caps, closing the window
-/// in which a burst of requests all pass an almost-exhausted cap.
+/// cached). Each admitted request reserves its *estimated* cost, its request
+/// count, and its estimated tokens; the totals are counted on top of the
+/// platform counters when evaluating `cost_cap` AND `rate_limit`, closing the
+/// window in which a burst of requests all pass an almost-exhausted limit.
 ///
 /// Admission is race-free by construction: [`PendingSpend::reserve`] records
-/// this request's estimate and returns the other in-flight reservations in one
-/// critical section, *before* the policy evaluation reads them — so two
+/// this request's reservation and returns the other reservations' totals in
+/// one critical section, *before* the policy evaluation reads them — so two
 /// concurrent requests always see each other's reservation, whichever
 /// evaluates first. A request that ends up blocked releases its reservation.
 ///
-/// Entries expire after [`PENDING_SPEND_TTL`] (by then the real usage event has
-/// been reported and folded into `/state`). Briefly double-counting an entry
-/// that already landed only errs toward blocking *near the cap*, which is the
-/// correct direction for a hard cap. The running total is maintained
-/// incrementally so reads are O(1) amortized (pruning walks only the expired
-/// prefix). This is per-process: a true cross-instance guarantee needs an
-/// atomic reservation on the platform side.
+/// Reservation lifecycle: a reservation is **active** (never expires — a
+/// long-lived or streaming request keeps its cap protection for its whole
+/// duration) until [`PendingSpend::complete`] fires — via the RAII
+/// [`ReservationGuard`] attached to the response body, which also covers
+/// client-cancellation — and then ages out [`PENDING_SPEND_TTL`] after
+/// completion, by which time the real usage event has been reported and folded
+/// into `/state`. Briefly double-counting a completed entry that already
+/// landed only errs toward blocking *near the limit*, the correct direction
+/// for a hard cap. Totals are maintained incrementally (O(1) amortized reads;
+/// completed-entry pruning walks only the expired prefix, active entries are
+/// bounded by in-flight concurrency). This is per-process: a true
+/// cross-instance guarantee needs an atomic reservation on the platform side.
 #[derive(Default)]
 pub struct PendingSpend {
     inner: std::sync::Mutex<PendingInner>,
@@ -395,25 +424,49 @@ pub struct PendingSpend {
 
 #[derive(Default)]
 struct PendingInner {
-    /// `(reserved_at, reservation_id, cost)` in insertion (= time) order.
-    entries: std::collections::VecDeque<(Instant, u64, f64)>,
-    /// Running sum of `entries` costs.
-    total: f64,
+    /// Reservations for requests still in flight (`at` = admission time).
+    active: Vec<PendingEntry>,
+    /// Reservations for completed requests (`at` = completion time), in
+    /// completion order so pruning pops the expired prefix.
+    completed: std::collections::VecDeque<PendingEntry>,
+    /// Running totals over `active` + `completed`.
+    totals: PendingTotals,
     next_id: u64,
 }
 
 impl PendingInner {
+    fn subtract(totals: &mut PendingTotals, e: &PendingEntry) {
+        totals.cost_usd -= e.cost_usd;
+        totals.requests = totals.requests.saturating_sub(1);
+        totals.tokens = totals.tokens.saturating_sub(e.tokens);
+    }
+
     fn prune(&mut self) {
-        while let Some(&(at, _, cost)) = self.entries.front() {
-            if at.elapsed() >= PENDING_SPEND_TTL {
-                self.total -= cost;
-                self.entries.pop_front();
+        while let Some(front) = self.completed.front() {
+            if front.at.elapsed() >= PENDING_SPEND_TTL {
+                let e = self.completed.pop_front().expect("front just checked");
+                Self::subtract(&mut self.totals, &e);
             } else {
                 break;
             }
         }
-        if self.entries.is_empty() {
-            self.total = 0.0; // reset any accumulated float drift
+        // Backstop: reap active entries whose guard never fired. `active` is
+        // bounded by in-flight concurrency, so the scan is cheap.
+        let mut totals = self.totals;
+        self.active.retain(|e| {
+            let leaked = e.at.elapsed() >= ACTIVE_RESERVATION_MAX_AGE;
+            if leaked {
+                warn!(
+                    reservation = e.id,
+                    "Nova Guard: reaping leaked active reservation"
+                );
+                Self::subtract(&mut totals, e);
+            }
+            !leaked
+        });
+        self.totals = totals;
+        if self.active.is_empty() && self.completed.is_empty() {
+            self.totals = PendingTotals::default(); // reset any float drift
         }
     }
 }
@@ -423,46 +476,82 @@ impl PendingSpend {
         Self::default()
     }
 
-    /// Atomically reserve this request's estimated cost and return
-    /// `(reservation, other_pending_total)` — the total of every *other*
-    /// un-expired reservation, to be folded into the spend the policy engine
-    /// evaluates. `reservation` is `None` when the estimate is not positive.
-    pub fn reserve(&self, cost_usd: f64) -> (Option<u64>, f64) {
+    /// Atomically reserve this request's estimated usage (cost, one request,
+    /// estimated tokens) and return `(reservation_id, other_pending_totals)` —
+    /// the totals of every *other* un-expired reservation, to be folded into
+    /// the counters the policy engine evaluates.
+    pub fn reserve(&self, cost_usd: f64, tokens: u64) -> (u64, PendingTotals) {
         let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
         inner.prune();
-        let others = inner.total;
-        if cost_usd <= 0.0 {
-            return (None, others);
-        }
+        let others = inner.totals;
         let id = inner.next_id;
         inner.next_id += 1;
-        inner.entries.push_back((Instant::now(), id, cost_usd));
-        inner.total += cost_usd;
-        (Some(id), others)
+        inner.active.push(PendingEntry {
+            id,
+            at: Instant::now(),
+            cost_usd: cost_usd.max(0.0),
+            tokens,
+        });
+        inner.totals.cost_usd += cost_usd.max(0.0);
+        inner.totals.requests += 1;
+        inner.totals.tokens += tokens;
+        (id, others)
     }
 
-    /// Release a reservation whose request was NOT forwarded (blocked): it will
-    /// consume nothing, so it must stop counting against the cap immediately.
+    /// Release a reservation whose request was NOT forwarded (blocked): it
+    /// will consume nothing, so it must stop counting immediately.
     pub fn release(&self, reservation: u64) {
         let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
-        if let Some(idx) = inner
-            .entries
-            .iter()
-            .position(|&(_, id, _)| id == reservation)
-        {
-            let (_, _, cost) = inner.entries.remove(idx).expect("index just found");
-            inner.total -= cost;
-            if inner.entries.is_empty() {
-                inner.total = 0.0;
+        if let Some(idx) = inner.active.iter().position(|e| e.id == reservation) {
+            let e = inner.active.swap_remove(idx);
+            let mut t = inner.totals;
+            PendingInner::subtract(&mut t, &e);
+            inner.totals = t;
+            if inner.active.is_empty() && inner.completed.is_empty() {
+                inner.totals = PendingTotals::default();
             }
         }
     }
 
-    /// Total un-expired pending spend (prunes expired entries; O(1) amortized).
-    pub fn sum(&self) -> f64 {
+    /// Mark a forwarded request as completed: its reservation keeps counting
+    /// for [`PENDING_SPEND_TTL`] from NOW (covering the usage-report + state
+    /// ingestion lag), then expires.
+    pub fn complete(&self, reservation: u64) {
+        let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
+        if let Some(idx) = inner.active.iter().position(|e| e.id == reservation) {
+            let mut e = inner.active.swap_remove(idx);
+            e.at = Instant::now();
+            inner.completed.push_back(e);
+        }
+    }
+
+    /// Current un-expired pending totals (prunes expired entries).
+    pub fn sum(&self) -> PendingTotals {
         let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
         inner.prune();
-        inner.total
+        inner.totals
+    }
+}
+
+/// RAII completion guard for an admitted request's reservation. Attached to
+/// the outgoing response body: when the body finishes streaming — or is
+/// dropped because the client disconnected — the reservation transitions from
+/// *active* to *completed* and starts its post-completion TTL. This is what
+/// keeps a long-lived or streaming request protected for its entire duration.
+pub struct ReservationGuard {
+    ledger: Arc<PendingSpend>,
+    id: u64,
+}
+
+impl ReservationGuard {
+    pub fn new(ledger: Arc<PendingSpend>, id: u64) -> Self {
+        Self { ledger, id }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        self.ledger.complete(self.id);
     }
 }
 
@@ -527,34 +616,77 @@ mod tests {
     #[test]
     fn reserve_returns_only_other_reservations() {
         let p = PendingSpend::new();
-        let (r1, others1) = p.reserve(0.01);
-        assert!(r1.is_some());
-        assert_eq!(others1, 0.0, "first reservation sees no other spend");
-        let (r2, others2) = p.reserve(0.02);
-        assert!(r2.is_some());
-        assert!((others2 - 0.01).abs() < 1e-12, "second sees the first");
-        assert!((p.sum() - 0.03).abs() < 1e-12);
+        let (_r1, others1) = p.reserve(0.01, 100);
+        assert_eq!(others1, PendingTotals::default(), "first sees nothing");
+        let (_r2, others2) = p.reserve(0.02, 50);
+        assert!(
+            (others2.cost_usd - 0.01).abs() < 1e-12,
+            "second sees the first"
+        );
+        assert_eq!(others2.requests, 1);
+        assert_eq!(others2.tokens, 100);
+        let sum = p.sum();
+        assert!((sum.cost_usd - 0.03).abs() < 1e-12);
+        assert_eq!(sum.requests, 2);
+        assert_eq!(sum.tokens, 150);
+    }
+
+    #[test]
+    fn zero_cost_requests_still_reserve_request_and_token_capacity() {
+        // An unpriced model can't reserve cost, but its request count and
+        // tokens must still count toward rate limits.
+        let p = PendingSpend::new();
+        let (_r, _) = p.reserve(0.0, 42);
+        let sum = p.sum();
+        assert_eq!(sum.cost_usd, 0.0);
+        assert_eq!(sum.requests, 1);
+        assert_eq!(sum.tokens, 42);
     }
 
     #[test]
     fn release_removes_a_blocked_reservation() {
         let p = PendingSpend::new();
-        let (r1, _) = p.reserve(0.01);
-        let (_r2, _) = p.reserve(0.02);
-        p.release(r1.unwrap());
-        assert!((p.sum() - 0.02).abs() < 1e-12);
+        let (r1, _) = p.reserve(0.01, 10);
+        let (_r2, _) = p.reserve(0.02, 20);
+        p.release(r1);
+        let sum = p.sum();
+        assert!((sum.cost_usd - 0.02).abs() < 1e-12);
+        assert_eq!(sum.requests, 1);
+        assert_eq!(sum.tokens, 20);
         // Releasing twice (or an unknown id) is a no-op.
-        p.release(r1.unwrap());
+        p.release(r1);
         p.release(999);
-        assert!((p.sum() - 0.02).abs() < 1e-12);
+        assert_eq!(p.sum().requests, 1);
     }
 
     #[test]
-    fn non_positive_estimates_are_not_reserved() {
+    fn active_reservations_do_not_expire_and_complete_starts_the_ttl() {
         let p = PendingSpend::new();
-        let (r, others) = p.reserve(0.0);
-        assert!(r.is_none());
-        assert_eq!(others, 0.0);
-        assert_eq!(p.sum(), 0.0);
+        let (r, _) = p.reserve(0.01, 10);
+        // Active entries never age out via the completed-prefix pruning; the
+        // reservation is still counted regardless of admission age (the
+        // 15-minute leak backstop is not reachable in a unit test).
+        assert_eq!(p.sum().requests, 1);
+        // Completing moves it to the TTL'd set — still counted immediately
+        // after completion (the usage hasn't landed in /state yet).
+        p.complete(r);
+        assert_eq!(p.sum().requests, 1, "completed entries count until TTL");
+        // Completing or releasing again is a no-op.
+        p.complete(r);
+        p.release(r);
+        assert_eq!(p.sum().requests, 1);
+    }
+
+    #[test]
+    fn reservation_guard_completes_on_drop() {
+        let ledger = Arc::new(PendingSpend::new());
+        let (r, _) = ledger.reserve(0.01, 10);
+        {
+            let _guard = ReservationGuard::new(ledger.clone(), r);
+        } // dropped here → complete()
+          // Entry moved to completed (still counted within TTL) — and is no
+          // longer releasable, proving it left the active set.
+        ledger.release(r);
+        assert_eq!(ledger.sum().requests, 1);
     }
 }
