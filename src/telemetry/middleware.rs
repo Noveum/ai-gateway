@@ -299,72 +299,76 @@ async fn handle_streaming_response(
         let mut streamed_chunks = Vec::new();
 
         let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            if let Ok(bytes) = chunk {
-                response_size += bytes.len();
-                debug!("Streaming response chunk size: {} bytes", bytes.len());
+        // HTTP/TCP chunk boundaries are arbitrary and have nothing to do with
+        // SSE frame boundaries: a provider (or any hop) may flush `data: {...}`
+        // split in the middle of the JSON, or even in the middle of a UTF-8
+        // sequence. Parsing each transport chunk on its own silently dropped
+        // those events — a whole stream could deliver perfectly valid usage to
+        // the client while the gateway recorded nothing. Reassemble frames
+        // first, then parse.
+        let mut frames = SseFrameBuffer::default();
+        // Set once the accumulation cap is hit: we stop *inspecting* but keep
+        // forwarding bytes to the client (a metrics limit must never truncate
+        // the user's response).
+        let mut inspection_stopped = false;
 
-                if let Ok(chunk_str) = String::from_utf8(bytes.to_vec()) {
-                    if accumulated_text.len() + chunk_str.len() > MAX_ACCUMULATED_TEXT {
-                        error!(
-                            "Accumulated text exceeded maximum size of {} bytes",
-                            MAX_ACCUMULATED_TEXT
-                        );
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    response_size += bytes.len();
+                    debug!("Streaming response chunk size: {} bytes", bytes.len());
+
+                    if !inspection_stopped {
+                        for frame in frames.push(&bytes) {
+                            if accumulated_text.len() + frame.len() + 2 > MAX_ACCUMULATED_TEXT {
+                                error!(
+                                    "Accumulated text exceeded maximum size of {} bytes",
+                                    MAX_ACCUMULATED_TEXT
+                                );
+                                inspection_stopped = true;
+                                break;
+                            }
+                            accumulated_text.push_str(&frame);
+                            accumulated_text.push_str("\n\n");
+                            ingest_stream_payload(
+                                &frame,
+                                metrics_extractor.as_ref(),
+                                &mut streamed_chunks,
+                                &mut accumulated_metrics,
+                                &mut final_metrics_found,
+                            );
+                        }
+                    }
+
+                    // Always forward the bytes to the client
+                    if let Err(e) = tx.send(Ok(bytes)).await {
+                        error!("Failed to forward streaming chunk: {}", e);
                         break;
                     }
-                    accumulated_text.push_str(&chunk_str);
-
-                    // Try to parse the chunk as JSON and store it
-                    if let Ok(json_chunk) = serde_json::from_str::<Value>(&chunk_str) {
-                        // Only store non-empty chunks
-                        if !json_chunk.is_null()
-                            && !json_chunk.as_object().is_none_or(|o| o.is_empty())
-                        {
-                            streamed_chunks.push(json_chunk);
-                        }
-                    } else {
-                        // For streaming that sends chunks broken up, try to parse
-                        // different formats (like data: {...}\n\n for SSE)
-                        for line in chunk_str.lines() {
-                            if line.starts_with("data: ") {
-                                let data = line.trim_start_matches("data: ");
-                                if data == "[DONE]" {
-                                    debug!("Received [DONE] signal in streaming");
-                                    continue;
-                                }
-
-                                if let Ok(json_data) = serde_json::from_str::<Value>(data) {
-                                    streamed_chunks.push(json_data.clone());
-
-                                    // Try to extract metrics from this chunk
-                                    if let Some(chunk_metrics) =
-                                        metrics_extractor.extract_streaming_metrics(data)
-                                    {
-                                        debug!(
-                                            "Found metrics in streaming chunk: {:?}",
-                                            chunk_metrics
-                                        );
-                                        // Merge, don't overwrite: providers spread
-                                        // model/input/output across chunks.
-                                        accumulated_metrics.merge_streaming(chunk_metrics);
-                                        final_metrics_found = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
-
-                // Always forward the bytes to the client
-                if let Err(e) = tx.send(Ok(bytes)).await {
-                    error!("Failed to forward streaming chunk: {}", e);
+                Err(e) => {
+                    error!("Error in streaming response: {}", e);
+                    // For type compatibility, we'll just break the stream instead of trying to send the error
+                    // This avoids issues with error type conversions
                     break;
                 }
-            } else if let Err(e) = chunk {
-                error!("Error in streaming response: {}", e);
-                // For type compatibility, we'll just break the stream instead of trying to send the error
-                // This avoids issues with error type conversions
-                break;
+            }
+        }
+
+        // A stream may end without the trailing blank line; whatever is left in
+        // the buffer is the last frame.
+        if !inspection_stopped {
+            if let Some(tail) = frames.flush() {
+                if accumulated_text.len() + tail.len() <= MAX_ACCUMULATED_TEXT {
+                    accumulated_text.push_str(&tail);
+                }
+                ingest_stream_payload(
+                    &tail,
+                    metrics_extractor.as_ref(),
+                    &mut streamed_chunks,
+                    &mut accumulated_metrics,
+                    &mut final_metrics_found,
+                );
             }
         }
 
@@ -513,6 +517,103 @@ async fn handle_streaming_response(
     Response::from_parts(parts, Body::from_stream(ReceiverStream::new(rx)))
 }
 
+/// Incremental SSE frame reassembler.
+///
+/// Holds raw bytes that have not yet completed a frame and hands back only whole
+/// frames (terminated by a blank line — `\n\n` or `\r\n\r\n`). Buffering at the
+/// *byte* level is deliberate: a transport chunk can split a multi-byte UTF-8
+/// character, so decoding per chunk would corrupt or discard it. Frame
+/// terminators are ASCII, so a complete frame is always complete UTF-8.
+#[derive(Default)]
+struct SseFrameBuffer {
+    buf: Vec<u8>,
+}
+
+impl SseFrameBuffer {
+    /// Append transport bytes; return every frame they complete.
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        while let Some((end, sep_len)) = Self::find_frame_end(&self.buf) {
+            let frame = self.buf.drain(..end + sep_len).collect::<Vec<u8>>();
+            out.push(String::from_utf8_lossy(&frame[..end]).into_owned());
+        }
+        // A frame that never terminates must not grow without bound; emit what
+        // we have so the buffer stays capped.
+        if self.buf.len() > MAX_ACCUMULATED_TEXT {
+            let frame = std::mem::take(&mut self.buf);
+            out.push(String::from_utf8_lossy(&frame).into_owned());
+        }
+        out
+    }
+
+    /// The unterminated remainder at end of stream, if any.
+    fn flush(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let frame = std::mem::take(&mut self.buf);
+        let text = String::from_utf8_lossy(&frame).into_owned();
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Offset and length of the first frame terminator, if the buffer holds one.
+    fn find_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
+        let find = |pat: &[u8]| buf.windows(pat.len()).position(|w| w == pat);
+        match (find(b"\r\n\r\n"), find(b"\n\n")) {
+            (Some(a), Some(b)) if a <= b => Some((a, 4)),
+            (_, Some(b)) => Some((b, 2)),
+            (Some(a), None) => Some((a, 4)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Parse one reassembled SSE frame (or a bare JSON payload) and fold whatever it
+/// carries into the accumulating chunk list and metrics.
+fn ingest_stream_payload(
+    text: &str,
+    metrics_extractor: &dyn MetricsExtractor,
+    streamed_chunks: &mut Vec<Value>,
+    accumulated_metrics: &mut ProviderMetrics,
+    final_metrics_found: &mut bool,
+) {
+    // Some providers stream bare JSON objects rather than SSE `data:` lines.
+    if let Ok(json_chunk) = serde_json::from_str::<Value>(text) {
+        if !json_chunk.is_null() && !json_chunk.as_object().is_none_or(|o| o.is_empty()) {
+            streamed_chunks.push(json_chunk);
+        }
+        return;
+    }
+
+    for line in text.lines() {
+        // The space after `data:` is optional in the SSE spec.
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            debug!("Received [DONE] signal in streaming");
+            continue;
+        }
+        if let Ok(json_data) = serde_json::from_str::<Value>(data) {
+            streamed_chunks.push(json_data);
+
+            // Try to extract metrics from this chunk
+            if let Some(chunk_metrics) = metrics_extractor.extract_streaming_metrics(data) {
+                debug!("Found metrics in streaming chunk: {:?}", chunk_metrics);
+                // Merge, don't overwrite: providers spread model/input/output
+                // across chunks.
+                accumulated_metrics.merge_streaming(chunk_metrics);
+                *final_metrics_found = true;
+            }
+        }
+    }
+}
+
 /// Estimate output tokens for a stream that ended without provider usage data.
 /// Prefers the actual generated content — `choices[].delta.content` (and
 /// `message.content`) text pulled from the parsed chunks — because estimating
@@ -566,6 +667,140 @@ mod tests {
             (raw.len() as f64 / 4.0).ceil() as u32 > est * 5,
             "envelope-based estimate would have been much larger"
         );
+    }
+
+    /// Feed `raw` through the reassembler in slices of `step` bytes (the way an
+    /// adversarial provider or an unlucky TCP flush would), and return what the
+    /// gateway would have recorded.
+    fn collect_split(raw: &[u8], step: usize) -> (Vec<Value>, ProviderMetrics, bool) {
+        let extractor = get_metrics_extractor("openai");
+        let mut frames = SseFrameBuffer::default();
+        let mut chunks = Vec::new();
+        let mut metrics = ProviderMetrics::default();
+        let mut found = false;
+        for piece in raw.chunks(step.max(1)) {
+            for frame in frames.push(piece) {
+                ingest_stream_payload(
+                    &frame,
+                    extractor.as_ref(),
+                    &mut chunks,
+                    &mut metrics,
+                    &mut found,
+                );
+            }
+        }
+        if let Some(tail) = frames.flush() {
+            ingest_stream_payload(
+                &tail,
+                extractor.as_ref(),
+                &mut chunks,
+                &mut metrics,
+                &mut found,
+            );
+        }
+        (chunks, metrics, found)
+    }
+
+    fn sample_openai_stream() -> String {
+        // A real-shaped OpenAI stream: content deltas (one carrying multi-byte
+        // UTF-8), the final usage frame, then [DONE].
+        concat!(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-luna\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Héllo\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-luna\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" wörld 🌍\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-luna\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn sse_frames_are_reassembled_across_transport_chunks() {
+        let raw = sample_openai_stream();
+        let bytes = raw.as_bytes();
+        let (want_chunks, want_metrics, want_found) = collect_split(bytes, bytes.len());
+        assert!(want_found, "unsplit stream must yield usage");
+        assert_eq!(want_metrics.input_tokens, Some(11));
+        assert_eq!(want_metrics.output_tokens, Some(4));
+
+        // Every split size, including 1 byte at a time — which necessarily cuts
+        // through the middle of the multi-byte characters and the JSON — must
+        // produce byte-identical results to the unsplit stream.
+        for step in 1..=bytes.len() {
+            let (chunks, metrics, found) = collect_split(bytes, step);
+            assert!(found, "usage lost when split every {step} bytes");
+            assert_eq!(
+                metrics.input_tokens, want_metrics.input_tokens,
+                "input tokens differ at step {step}"
+            );
+            assert_eq!(
+                metrics.output_tokens, want_metrics.output_tokens,
+                "output tokens differ at step {step}"
+            );
+            assert_eq!(
+                metrics.model, want_metrics.model,
+                "model differs at step {step}"
+            );
+            assert_eq!(
+                metrics.cost, want_metrics.cost,
+                "cost differs at step {step}"
+            );
+            assert_eq!(chunks, want_chunks, "chunks differ at step {step}");
+        }
+    }
+
+    #[test]
+    fn sse_frames_split_at_every_single_byte_offset() {
+        // The reviewer's exact reproduction: each valid frame flushed in two
+        // halves. Sweep the cut point across the whole stream.
+        let raw = sample_openai_stream();
+        let bytes = raw.as_bytes();
+        let (want_chunks, want_metrics, _) = collect_split(bytes, bytes.len());
+        for cut in 1..bytes.len() {
+            let extractor = get_metrics_extractor("openai");
+            let mut frames = SseFrameBuffer::default();
+            let (mut chunks, mut metrics, mut found) =
+                (Vec::new(), ProviderMetrics::default(), false);
+            for piece in [&bytes[..cut], &bytes[cut..]] {
+                for frame in frames.push(piece) {
+                    ingest_stream_payload(
+                        &frame,
+                        extractor.as_ref(),
+                        &mut chunks,
+                        &mut metrics,
+                        &mut found,
+                    );
+                }
+            }
+            if let Some(tail) = frames.flush() {
+                ingest_stream_payload(
+                    &tail,
+                    extractor.as_ref(),
+                    &mut chunks,
+                    &mut metrics,
+                    &mut found,
+                );
+            }
+            assert!(found, "usage lost when cut at byte {cut}");
+            assert_eq!(chunks, want_chunks, "chunks differ when cut at byte {cut}");
+            assert_eq!(
+                (metrics.input_tokens, metrics.output_tokens),
+                (want_metrics.input_tokens, want_metrics.output_tokens),
+                "tokens differ when cut at byte {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_frames_handle_crlf_and_missing_trailing_blank_line() {
+        // CRLF-framed stream (permitted by the SSE spec) with no terminator on
+        // the final frame — the usage must still be recovered.
+        let raw = "data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n\
+                   data: {\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}";
+        let (chunks, metrics, found) = collect_split(raw.as_bytes(), 3);
+        assert!(found);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(metrics.input_tokens, Some(7));
+        assert_eq!(metrics.output_tokens, Some(2));
     }
 
     #[test]

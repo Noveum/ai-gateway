@@ -89,21 +89,34 @@ After deploy, the gateway answers at `https://noveum-ai-gateway.<account>.worker
 Non-JSON `/v1/*` request bodies (multipart, binary) are forwarded byte-for-byte
 and are not inspected; only `application/json` bodies run through Nova Guard.
 
-### Platform-managed Nova Guard is native-only
+### Nova Guard scope on the Worker: stateless policies only
 
-**Do not set `NOVEUM_API_KEY`/`NOVEUM_GUARD_PROJECT_ID` on the Worker.** The
-platform bridge (remote policy fetch, live cost/rate state, usage reporting) is
-not compiled for `wasm32`, so a Worker cannot enforce or meter platform
-policies. Rather than silently proxying traffic with zero enforcement, the
-Worker **refuses `/v1/*` requests with a 503 configuration error** when both
-vars are set. Use an inline `NOVEUM_GUARD_POLICIES` bundle on the Worker, or
-deploy the native gateway for platform-managed mode.
+The Worker supports **stateless, inline** Nova Guard — the text policies
+(`regex_match`, `pii_detection`, secrets, banned terms, model allowlist, JSON
+schema, token limits) that are decided entirely from the payload in front of the
+gateway. Those run at full parity with the native server.
 
-Relatedly, inline `cost_cap`/`rate_limit` policies on the Worker have no live
-spend/rate backend: they always evaluate as "state unavailable", and a
-`failClosed: true` flag on them is neutralized at compile time (with a warning)
-because honoring it would block 100% of traffic forever. Live cost/rate
-enforcement requires the native gateway with the platform bridge.
+**Anything that needs cross-request state is explicitly out of scope on this
+deployment target**, and the Worker refuses `/v1/*` with a **503
+`gateway_configuration_error`** rather than accepting the configuration and
+enforcing nothing:
+
+| Configuration | Worker behavior |
+|---|---|
+| `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` set | **503.** The platform bridge (remote policy fetch, live cost/rate state, usage reporting, admission ledger) is not compiled for `wasm32`. |
+| `NOVEUM_GUARD_POLICIES` containing `cost_cap` or `rate_limit` | **503.** There is no live spend/rate backend, so these can only ever evaluate to "allow" — and their `failClosed` flag is neutralized along with them. |
+| `NOVEUM_GUARD_POLICIES` with text policies only | Enforced, identical to native. |
+
+Both refusals are deliberate: the failure mode they replace is an operator
+believing a hard cap or a fail-closed policy is in force at the edge while every
+request passes. **Use the native gateway for platform-managed Nova Guard and for
+any cost/rate enforcement.**
+
+Supporting them here would require a Worker-native state plane — a Durable Object
+for atomic reservation/reconciliation, plus a `wasm32` HTTP path to the Noveum
+API for policy fetch, live state and usage reporting. That is tracked as future
+work below and is not part of the current release scope; a successful
+`worker-build`/Wrangler dry-run only proves the refusal path compiles.
 
 ## What runs on the edge today vs. next
 

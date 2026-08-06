@@ -16,6 +16,30 @@
 //! (`x-aws-session-token`). Streaming responses pass through without output‑phase
 //! enforcement (the documented v1 limitation, identical to native). Non‑JSON
 //! `/v1/*` bodies are forwarded byte‑for‑byte.
+//!
+//! # Nova Guard scope on this target
+//!
+//! The Worker supports **stateless, inline** Nova Guard only: the text rules
+//! (`regex_match`, `pii_detection`, …) from a `NOVEUM_GUARD_POLICIES` bundle,
+//! which are decided entirely from the request/response payload in front of us.
+//!
+//! Everything that needs cross-request state is **explicitly out of scope for
+//! this deployment target** and is refused with a 503 rather than silently
+//! ignored:
+//!
+//! - **Platform-managed Nova Guard** (`NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID`):
+//!   remote policy fetch, live cost/rate state, usage reporting and the
+//!   admission ledger are native-only — none of that machinery is compiled for
+//!   `wasm32`.
+//! - **Inline `cost_cap` / `rate_limit` policies**: without a live-state backend
+//!   they can only ever evaluate to "allow", which also neutralizes their
+//!   `failClosed` setting — an operator would believe a hard cap is in force
+//!   while every request passes.
+//!
+//! Supporting either here needs a Worker-native state plane (a Durable Object is
+//! the natural home for atomic reservation/reconciliation) plus a `wasm32` HTTP
+//! path to the Noveum API. That is deliberately not part of this change; use the
+//! native gateway for platform-managed Nova Guard.
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -243,6 +267,22 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     Ok(apply_cors(resp))
 }
 
+/// 503 for a Nova Guard configuration this deployment target cannot enforce.
+/// Failing loudly is the point: a silent no-op would leave the operator
+/// believing a cap or a fail-closed policy is in force.
+fn unsupported_guard_config(message: &str) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    Ok(Response::from_json(&json!({
+        "error": {
+            "message": message,
+            "type": "gateway_configuration_error"
+        }
+    }))?
+    .with_headers(headers)
+    .with_status(503))
+}
+
 async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
 
@@ -262,7 +302,8 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // usage reporting) is native-only: none of that machinery is compiled for
     // wasm32, so honoring these vars here would silently proxy traffic with ZERO
     // enforcement or metering while the operator believes the platform bridge is
-    // active. Refuse loudly instead of failing open.
+    // active. Refuse loudly instead of failing open — see the module docs for
+    // why this target is scoped to stateless inline policies.
     let remote_configured = ["NOVEUM_API_KEY", "NOVEUM_GUARD_PROJECT_ID"]
         .iter()
         .all(|k| {
@@ -272,16 +313,9 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or(false)
         });
     if remote_configured {
-        let headers = Headers::new();
-        headers.set("content-type", "application/json")?;
-        return Ok(Response::from_json(&json!({
-            "error": {
-                "message": "platform-managed Nova Guard (NOVEUM_API_KEY/NOVEUM_GUARD_PROJECT_ID) is not supported on the Cloudflare Worker deployment; unset these vars and use an inline NOVEUM_GUARD_POLICIES bundle, or deploy the native gateway",
-                "type": "gateway_configuration_error"
-            }
-        }))?
-        .with_headers(headers)
-        .with_status(503));
+        return unsupported_guard_config(
+            "platform-managed Nova Guard (NOVEUM_API_KEY/NOVEUM_GUARD_PROJECT_ID) is not supported on the Cloudflare Worker deployment: remote policy fetch, live cost/rate state, usage reporting and the admission ledger are native-only. Unset these vars and use an inline NOVEUM_GUARD_POLICIES bundle of stateless text policies, or deploy the native gateway.",
+        );
     }
 
     let provider = req
@@ -317,6 +351,16 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .unwrap_or(false);
 
     let engine = build_engine(&env);
+    // An inline bundle may still carry `cost_cap` / `rate_limit` policies. They
+    // need a live cross-request state backend, which this target does not have,
+    // so they would evaluate to "allow" on every request — and `failClosed`
+    // would be neutralized along with them. Refuse the request rather than let
+    // an operator believe a hard cap is being enforced at the edge.
+    if engine.is_enabled() && engine.stateful_policy_count() > 0 {
+        return unsupported_guard_config(
+            "NOVEUM_GUARD_POLICIES contains cost_cap/rate_limit policies, which are not supported on the Cloudflare Worker deployment: they require a live cross-request state backend (spend/rate counters and an admission ledger) that this target does not have, so they cannot be enforced and `failClosed` cannot be honored. Remove them from the inline bundle, or deploy the native gateway with platform-managed Nova Guard.",
+        );
+    }
     let guard_active = engine.is_enabled() && engine.active_policy_count() > 0;
     let block_mode = engine.block_mode();
 

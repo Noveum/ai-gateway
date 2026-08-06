@@ -153,6 +153,13 @@ PORT=8080 noveum-ai-gateway
 > in that window per gateway instance; a strict cross-instance guarantee needs a
 > platform-side atomic reservation, which the API does not offer yet.
 
+> **Deployment scope.** Platform-managed Nova Guard and *any* `cost_cap` /
+> `rate_limit` policy require the **native gateway**. The Cloudflare Worker
+> supports stateless inline text policies only, and returns a 503
+> `gateway_configuration_error` for either of those configurations rather than
+> accepting them and enforcing nothing — see
+> [docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md#nova-guard-scope-on-the-worker-stateless-policies-only).
+
 ## 📚 Usage Examples
 
 ### Making Requests

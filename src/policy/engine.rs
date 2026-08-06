@@ -343,6 +343,16 @@ impl PolicyEngine {
         self.state.load().active_count()
     }
 
+    /// Number of active policies that can only be evaluated against a live
+    /// cross-request state backend (`cost_cap` + `rate_limit`). Deployment
+    /// targets without such a backend — notably the Cloudflare Worker — use this
+    /// to refuse loudly instead of admitting traffic past a limit that is
+    /// silently a no-op.
+    pub fn stateful_policy_count(&self) -> usize {
+        let s = self.state.load();
+        s.cost_caps.len() + s.rate_limits.len()
+    }
+
     pub fn block_mode(&self) -> BlockResponseMode {
         self.block_mode
     }
@@ -881,6 +891,28 @@ mod tests {
         let r = e.evaluate(Phase::Input, "gpt-4o", "alpha", None, None, None);
         // higher priority (lower number) runs first and blocks
         assert_eq!(r.block.unwrap().policy_name, "high");
+    }
+
+    #[test]
+    fn stateful_policy_count_isolates_live_state_backed_policies() {
+        // Deployment targets with no live-state backend (the Cloudflare Worker)
+        // key off this to refuse rather than silently no-op a cap.
+        let text_only = engine(
+            r#"{"policies":[{"name":"r","type":"regex_match","mode":"enforce",
+            "config":{"phase":"input","patterns":[{"name":"x","regex":"x"}],"action":"block"}}]}"#,
+        );
+        assert_eq!(text_only.active_policy_count(), 1);
+        assert_eq!(text_only.stateful_policy_count(), 0);
+
+        let mixed = engine(
+            r#"{"policies":[
+            {"name":"r","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"x","regex":"x"}],"action":"block"}},
+            {"name":"budget","type":"cost_cap","mode":"enforce","config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}},
+            {"name":"rl","type":"rate_limit","mode":"enforce","config":{"windows":[{"period":"1m","maxRequests":5,"action":"block"}]}}
+            ]}"#,
+        );
+        assert_eq!(mixed.active_policy_count(), 3);
+        assert_eq!(mixed.stateful_policy_count(), 2);
     }
 
     #[test]

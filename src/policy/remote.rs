@@ -525,6 +525,16 @@ impl PendingSpend {
         }
     }
 
+    /// How many reservations are still ACTIVE (admitted, not yet completed or
+    /// released). Anything left here after a request has ended is a leak that
+    /// would keep counting against the cap until the 15-minute backstop, so
+    /// cancellation tests assert on this rather than on the totals (a
+    /// *completed* entry legitimately keeps counting for its short TTL).
+    pub fn active_count(&self) -> usize {
+        let inner = self.inner.lock().expect("pending-spend lock poisoned");
+        inner.active.len()
+    }
+
     /// Current un-expired pending totals (prunes expired entries).
     pub fn sum(&self) -> PendingTotals {
         let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
@@ -533,25 +543,59 @@ impl PendingSpend {
     }
 }
 
-/// RAII completion guard for an admitted request's reservation. Attached to
-/// the outgoing response body: when the body finishes streaming — or is
-/// dropped because the client disconnected — the reservation transitions from
-/// *active* to *completed* and starts its post-completion TTL. This is what
-/// keeps a long-lived or streaming request protected for its entire duration.
+/// RAII completion guard for an admitted request's reservation.
+///
+/// Created the instant [`PendingSpend::reserve`] returns — *not* once a
+/// response exists — and then moved along the request: held by the middleware
+/// future while it awaits upstream response headers, and finally transferred
+/// into the outgoing response body. Whenever and wherever it is dropped, the
+/// reservation transitions from *active* to *completed* and starts its
+/// post-completion TTL:
+///
+/// - normal completion: the response body finished streaming;
+/// - client disconnect mid-body: the wrapped body stream is dropped;
+/// - **cancellation before upstream headers**: the middleware future itself is
+///   dropped, taking the guard with it. This is the case a response-only guard
+///   missed — the entry stayed ACTIVE until the 15-minute leak backstop and
+///   kept blocking a `maxRequests: 1` policy long after the client had gone.
+///
+/// A request that never reaches the provider (blocked at the input phase) calls
+/// [`ReservationGuard::release`] instead, dropping the reservation outright.
 pub struct ReservationGuard {
     ledger: Arc<PendingSpend>,
     id: u64,
+    /// Cleared by [`release`](Self::release) so `Drop` becomes a no-op.
+    armed: bool,
 }
 
 impl ReservationGuard {
     pub fn new(ledger: Arc<PendingSpend>, id: u64) -> Self {
-        Self { ledger, id }
+        Self {
+            ledger,
+            id,
+            armed: true,
+        }
+    }
+
+    /// The guarded reservation id (diagnostics/tests).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Give the reservation back: the request was blocked before forwarding, so
+    /// it will consume nothing and must stop counting immediately rather than
+    /// linger for the post-completion TTL.
+    pub fn release(mut self) {
+        self.armed = false;
+        self.ledger.release(self.id);
     }
 }
 
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
-        self.ledger.complete(self.id);
+        if self.armed {
+            self.ledger.complete(self.id);
+        }
     }
 }
 

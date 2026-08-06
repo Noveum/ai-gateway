@@ -1,11 +1,13 @@
 //! Model pricing table and cost estimation.
 //!
 //! Prices are USD per 1,000,000 tokens, standard synchronous tier, current as of
-//! June 2026 (verified against official provider pricing pages). Cached-input,
-//! batch, and Gemini's >200K tier are NOT represented here — callers that need
-//! exact cached/batch billing must adjust separately. This table exists to
-//! support per-request cost annotation and the `cost_cap` policy, not to be the
-//! system of record for billing.
+//! June 2026 (verified against official provider pricing pages). Documented
+//! long-context tiers (OpenAI's >272K whole-request tier, Gemini's >200K tier)
+//! ARE modeled — see [`LONG_CONTEXT_PRICING`]. Cached input, 1.25x cache
+//! writes, batch rates, and per-request tool/search fees are NOT represented
+//! here — callers that need exact cached/batch billing must adjust separately.
+//! This table exists to support per-request cost annotation and the `cost_cap`
+//! policy, not to be the system of record for billing.
 
 /// `(model_id, input_usd_per_1m, output_usd_per_1m)`.
 pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
@@ -13,7 +15,8 @@ pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
     // confirmed against the official model pages 2026-08-04; the widely
     // reported 2026-07-30 "price cut" does not match what the model pages
     // bill, and overstating errs toward blocking early — the safe direction
-    // for cost caps). Long-context (>272K input) tiers are NOT modeled.
+    // for cost caps). The whole-request >272K tier for all three is in
+    // `LONG_CONTEXT_PRICING`; the bare `gpt-5.6` alias is in `MODEL_ALIASES`.
     ("gpt-5.6-luna", 1.00, 6.00),
     ("gpt-5.6-terra", 2.50, 15.00),
     ("gpt-5.6-sol", 5.00, 30.00),
@@ -41,7 +44,7 @@ pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
     ("claude-haiku-4-5", 1.00, 5.00),
     ("claude-fable-5", 10.00, 50.00),
     // Google Gemini — ai.google.dev/gemini-api/docs (3.6 Flash verified 2026-08;
-    // Pro: <=200K-token tier; doubles above)
+    // Pro: <=200K-token tier here, the >200K tier is in `LONG_CONTEXT_PRICING`)
     ("gemini-3.6-flash", 1.50, 7.50),
     ("gemini-2.5-pro", 1.25, 10.00),
     ("gemini-2.5-flash", 0.30, 2.50),
@@ -103,17 +106,45 @@ pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
     ("sonar-reasoning-pro", 2.00, 8.00),
 ];
 
+/// Bare model aliases that providers resolve to a concrete model server-side,
+/// `(alias, concrete_model_id)`. These MUST be resolved before family-prefix
+/// matching: `gpt-5.6` would otherwise be read as a version-boundary extension
+/// of the older, much cheaper `gpt-5` row, so predictive admission would
+/// under-reserve an alias request before the provider response reveals which
+/// concrete model actually ran.
+const MODEL_ALIASES: &[(&str, &str)] = &[
+    // developers.openai.com/api/docs/guides/latest-model — `gpt-5.6` routes to
+    // the flagship Sol.
+    ("gpt-5.6", "gpt-5.6-sol"),
+];
+
 /// Long-context pricing tiers: `(model_id, threshold_input_tokens,
 /// high_input_usd_per_1m, high_output_usd_per_1m)`. When a request's input
 /// exceeds the threshold, the whole request is estimated at the high-context
 /// rate (matching how providers bill qualifying requests). Only models with a
 /// documented tier are listed; others charge flat rates at any length.
 const LONG_CONTEXT_PRICING: &[(&str, u32, f64, f64)] = &[
-    // GPT-5.6 Luna: >272K input bills 2x input / 1.5x output.
+    // GPT-5.6 family: >272K input bills 2x input / 1.5x output for the whole
+    // request. Documented identically on the Luna, Terra and Sol model pages,
+    // so all three carry the tier (each derived from its own base row).
     ("gpt-5.6-luna", 272_000, 2.00, 9.00),
+    ("gpt-5.6-terra", 272_000, 5.00, 22.50),
+    ("gpt-5.6-sol", 272_000, 10.00, 45.00),
     // Gemini 2.5 Pro: >200K prompt tokens doubles both rates.
     ("gemini-2.5-pro", 200_000, 2.50, 15.00),
 ];
+
+/// Normalize a caller-supplied model id: lowercase, then resolve a bare
+/// provider alias (e.g. `gpt-5.6` → `gpt-5.6-sol`) to the concrete model it
+/// routes to. Used by every lookup so alias requests price and tier exactly
+/// like the model that will actually serve them.
+fn canonical(model: &str) -> String {
+    let m = model.to_lowercase();
+    match MODEL_ALIASES.iter().find(|(alias, _)| *alias == m) {
+        Some((_, target)) => (*target).to_string(),
+        None => m,
+    }
+}
 
 /// Pricing for one model: USD per 1M input/output tokens.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -131,8 +162,11 @@ pub struct ModelPrice {
 /// `gpt-4` cannot match `gpt-4o`. A short or garbage id that is merely a prefix
 /// of a table entry returns `None` (never the other direction). Returns `None`
 /// when no family matches.
+///
+/// Bare provider aliases ([`MODEL_ALIASES`]) resolve to their concrete target
+/// first, so `gpt-5.6` prices as Sol rather than as a snapshot of `gpt-5`.
 pub fn lookup(model: &str) -> Option<ModelPrice> {
-    let m = model.to_lowercase();
+    let m = canonical(model);
 
     // Exact match first.
     if let Some(&(_, i, o)) = MODEL_PRICING.iter().find(|(id, _, _)| *id == m) {
@@ -164,7 +198,7 @@ pub fn lookup(model: &str) -> Option<ModelPrice> {
 /// documented long-context tier when `input_tokens` exceeds its threshold.
 pub fn lookup_for_context(model: &str, input_tokens: u32) -> Option<ModelPrice> {
     let base = lookup(model)?;
-    let m = model.to_lowercase();
+    let m = canonical(model);
     for &(id, threshold, hi_in, hi_out) in LONG_CONTEXT_PRICING {
         // Same matching rule as `lookup`: exact id or a dated snapshot of it.
         let is_family = m == id
@@ -339,6 +373,74 @@ mod tests {
             lookup("claude-sonnet-5-20260601").unwrap().input_per_1m,
             2.00
         );
+    }
+
+    #[test]
+    fn bare_gpt_5_6_alias_resolves_to_sol() {
+        // The provider resolves `gpt-5.6` to `gpt-5.6-sol`. Without an alias
+        // row the `.` reads as a version boundary and the id degrades to the
+        // much cheaper `gpt-5` family, under-reserving predictive admission.
+        let alias = lookup("gpt-5.6").unwrap();
+        assert_eq!((alias.input_per_1m, alias.output_per_1m), (5.00, 30.00));
+        assert_eq!(alias, lookup("gpt-5.6-sol").unwrap());
+        assert_ne!(alias, lookup("gpt-5").unwrap());
+        // Case-insensitive, like every other lookup.
+        assert_eq!(lookup("GPT-5.6").unwrap(), alias);
+        // Predictive admission reserves Sol rates for the alias: 6 in / 8 out.
+        let r = estimate_request_cost("gpt-5.6", 6, Some(8)).unwrap();
+        let expected = (6.0 / 1e6) * 5.00 + (8.0 / 1e6) * 30.00;
+        assert!(
+            (r - expected).abs() < 1e-12,
+            "alias reserved {r} vs {expected}"
+        );
+        // ...which is far more than the stale `gpt-5` fallback would reserve.
+        let stale = estimate_request_cost("gpt-5", 6, Some(8)).unwrap();
+        assert!(r > stale * 2.0);
+        // The alias inherits Sol's long-context tier as well.
+        let hi = lookup_for_context("gpt-5.6", 300_000).unwrap();
+        assert_eq!((hi.input_per_1m, hi.output_per_1m), (10.00, 45.00));
+    }
+
+    #[test]
+    fn long_context_tier_applies_to_whole_gpt_5_6_family() {
+        // OpenAI documents the same >272K whole-request tier (2x in / 1.5x out)
+        // on the Luna, Terra and Sol pages — all three must carry it.
+        for (model, std_rates, hi_rates) in [
+            ("gpt-5.6-luna", (1.00, 6.00), (2.00, 9.00)),
+            ("gpt-5.6-terra", (2.50, 15.00), (5.00, 22.50)),
+            ("gpt-5.6-sol", (5.00, 30.00), (10.00, 45.00)),
+        ] {
+            // At the boundary: standard rates.
+            let at = lookup_for_context(model, 272_000).unwrap();
+            assert_eq!(
+                (at.input_per_1m, at.output_per_1m),
+                std_rates,
+                "{model} @272K"
+            );
+            // One token above it: the high-context rates.
+            let over = lookup_for_context(model, 272_001).unwrap();
+            assert_eq!(
+                (over.input_per_1m, over.output_per_1m),
+                hi_rates,
+                "{model} >272K"
+            );
+            // The tier multipliers are exactly 2x input / 1.5x output.
+            assert!((hi_rates.0 - std_rates.0 * 2.0).abs() < 1e-9);
+            assert!((hi_rates.1 - std_rates.1 * 1.5).abs() < 1e-9);
+            // Predictive admission at 300K in / 1K out uses the tier, not the
+            // standard rate (which would under-reserve by ~50%).
+            let reserved = estimate_request_cost(model, 300_000, Some(1_000)).unwrap();
+            let expected = (300_000.0 / 1e6) * hi_rates.0 + (1_000.0 / 1e6) * hi_rates.1;
+            assert!(
+                (reserved - expected).abs() < 1e-9,
+                "{model} reserved {reserved}"
+            );
+            let flat = (300_000.0 / 1e6) * std_rates.0 + (1_000.0 / 1e6) * std_rates.1;
+            assert!(
+                reserved > flat * 1.9,
+                "{model} tier must roughly double the flat estimate"
+            );
+        }
     }
 
     #[test]

@@ -546,3 +546,222 @@ async fn concurrent_burst_respects_max_requests_one() {
     );
     assert_eq!(blocked, 9);
 }
+
+/// A slow upstream: response headers only arrive after `delay`.
+async fn slow_handler(body: Bytes) -> Response {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+#[tokio::test]
+async fn cancellation_before_upstream_headers_does_not_leak_an_active_reservation() {
+    // Reviewer's reproduction: the client disconnects while the gateway is
+    // still awaiting the provider's response headers. The reservation guard is
+    // taken at `reserve()` time, so dropping the middleware future must move the
+    // entry out of ACTIVE (into the bounded post-completion TTL) instead of
+    // leaving it pinned until the 15-minute leak backstop — which used to keep a
+    // `maxRequests: 1` policy 403-blocked long after the client had gone.
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"cost":{"1d_rolling":0.0},"rate":{"requests_1m":0},"stale":false,"ttlSeconds":30}),
+        ))
+        .mount(&server)
+        .await;
+    mount_usage_ok(&server).await;
+
+    let c = cfg(&server.uri());
+    let platform = json!({"policies":[{
+        "policyId":"pol_rl","name":"one per minute","type":"RATE_LIMIT",
+        "enabled":true,"failClosed":true,
+        "config":{"windows":[{"period":"1m","maxRequests":1,"action":"BLOCK"}]}
+    }]});
+    let bundle = translate_bundle(&platform).unwrap();
+    let engine = Arc::new(PolicyEngine::from_bundle(&bundle, backed_opts()));
+    let pending = Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new());
+    let gs = GuardState {
+        engine,
+        live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
+        usage: Some(UsageReporter::spawn(c.clone())),
+        pending: pending.clone(),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(slow_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    // Client hangs up long before the 5s upstream responds: the in-flight
+    // middleware future is dropped.
+    let cancelled = tokio::time::timeout(Duration::from_millis(500), app.oneshot(req)).await;
+    assert!(cancelled.is_err(), "the request must still be in flight");
+
+    // The reservation must have been admitted...
+    assert!(
+        pending.sum().requests >= 1,
+        "the cancelled request should have reserved before forwarding"
+    );
+    // ...and must NOT still be ACTIVE.
+    assert_eq!(
+        pending.active_count(),
+        0,
+        "cancellation before upstream headers leaked an ACTIVE reservation"
+    );
+}
+
+#[tokio::test]
+async fn explicit_include_usage_false_is_overridden_while_metering() {
+    // A caller must not be able to select approximate accounting for their own
+    // spend: with platform metering active, `include_usage` is forced true even
+    // when the request explicitly asks for false.
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"cost":{"1d_rolling":0.0},"rate":{},"stale":false,"ttlSeconds":30}),
+        ))
+        .mount(&server)
+        .await;
+    mount_usage_ok(&server).await;
+
+    let c = cfg(&server.uri());
+    let bundle = translate_bundle(&cost_cap_payload(10.0)).unwrap();
+    let engine = Arc::new(PolicyEngine::from_bundle(&bundle, backed_opts()));
+    let gs = GuardState {
+        engine,
+        live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
+        usage: Some(UsageReporter::spawn(c.clone())),
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+    };
+    // `echo_handler` returns the FORWARDED body, so the response shows exactly
+    // what the provider would have received.
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    for stream_options in [
+        json!({"include_usage": false}),
+        json!({}),
+        json!({"include_usage": false, "other": 1}),
+        Value::Null,
+    ] {
+        let mut body = json!({
+            "model":"gpt-5.6-luna","stream":true,
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        if !stream_options.is_null() {
+            body["stream_options"] = stream_options.clone();
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-provider", "openai")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let forwarded: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            forwarded["stream_options"]["include_usage"],
+            json!(true),
+            "include_usage must be forced true (sent: {stream_options})"
+        );
+        // Unrelated keys in `stream_options` survive.
+        if stream_options.get("other").is_some() {
+            assert_eq!(forwarded["stream_options"]["other"], json!(1));
+        }
+    }
+}
+
+#[tokio::test]
+async fn overflow_sized_max_tokens_is_rejected_with_400() {
+    // `max_tokens` is untrusted request JSON: `u64::MAX` used to panic the
+    // request task in debug builds (client got an empty response) and wrap the
+    // token reservation in release builds. It must be a deterministic 400.
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"cost":{"1d_rolling":0.0},"rate":{},"stale":false,"ttlSeconds":30}),
+        ))
+        .mount(&server)
+        .await;
+    mount_usage_ok(&server).await;
+
+    let c = cfg(&server.uri());
+    let bundle = translate_bundle(&cost_cap_payload(10.0)).unwrap();
+    let engine = Arc::new(PolicyEngine::from_bundle(&bundle, backed_opts()));
+    let pending = Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new());
+    let gs = GuardState {
+        engine,
+        live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
+        usage: Some(UsageReporter::spawn(c.clone())),
+        pending: pending.clone(),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    for (field, value) in [
+        ("max_tokens", json!(u64::MAX)),
+        ("max_completion_tokens", json!(u64::MAX)),
+        ("max_output_tokens", json!(u64::MAX)),
+        ("max_tokens", json!(-1)),
+        ("max_tokens", json!(10_000_001u64)),
+    ] {
+        let mut body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+        body[field] = value.clone();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{field}={value} must be a deterministic client error"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let err: Value = serde_json::from_slice(&bytes).expect("structured JSON error");
+        assert_eq!(err["error"]["type"], "invalid_request_error");
+        assert_eq!(err["error"]["param"], field);
+    }
+
+    // A rejected request must not leave a reservation behind.
+    assert_eq!(pending.active_count(), 0);
+
+    // ...and a sane limit still passes through untouched.
+    let body =
+        json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

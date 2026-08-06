@@ -31,6 +31,56 @@ use super::synthetic::block_response;
 /// Max request/response body we will buffer for inspection (8 MiB).
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// Largest output limit we will accept in a request body. The biggest documented
+/// provider completion ceiling is ~128K tokens, so this leaves two orders of
+/// magnitude of headroom while keeping the admission arithmetic (input tokens +
+/// output limit, both `u64`) far away from overflow. `max_tokens` is untrusted
+/// client JSON: an out-of-range value used to panic the request task in debug
+/// builds and silently wrap the token reservation in release builds, so anything
+/// above this is rejected with a deterministic 400 instead.
+const MAX_OUTPUT_TOKEN_LIMIT: u64 = 10_000_000;
+
+/// Keys a request may use to bound its completion length, in precedence order.
+const OUTPUT_LIMIT_KEYS: [&str; 3] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+
+/// Read the request's output limit, rejecting values that are not usable token
+/// counts. `Ok(None)` means "unbounded" (no key present, or explicitly `null`);
+/// `Err(key)` names the offending field so the caller can return a 400.
+fn resolve_max_output_tokens(body_json: &Value) -> Result<Option<u64>, &'static str> {
+    for key in OUTPUT_LIMIT_KEYS {
+        let Some(v) = body_json.get(key) else {
+            continue;
+        };
+        if v.is_null() {
+            continue;
+        }
+        return match v.as_u64() {
+            Some(n) if n <= MAX_OUTPUT_TOKEN_LIMIT => Ok(Some(n)),
+            _ => Err(key),
+        };
+    }
+    Ok(None)
+}
+
+/// Provider-shaped 400 for an unusable output limit.
+fn invalid_output_limit_response(key: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "`{key}` must be a positive integer no greater than {MAX_OUTPUT_TOKEN_LIMIT}"
+            ),
+            "type": "invalid_request_error",
+            "param": key,
+            "code": "invalid_value",
+        }
+    });
+    Response::builder()
+        .status(axum::http::StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static error response is valid")
+}
+
 /// State threaded into [`guard_middleware`]: the engine plus an optional provider
 /// of platform live cost/rate state (for `cost_cap`/`rate_limit`). `live` is
 /// `None` when platform-managed Nova Guard isn't configured.
@@ -98,8 +148,11 @@ pub async fn guard_middleware(
 
     let mut forward_bytes = bytes.clone();
     let mut body_mutated = false;
-    // This request's pending-usage reservation; released again if it blocks.
-    let mut reservation: Option<u64> = None;
+    // This request's pending-usage reservation. Held as an RAII guard from the
+    // moment it is taken, so that a cancellation *anywhere* below — including
+    // while awaiting upstream response headers — still transitions the ledger
+    // entry out of ACTIVE instead of leaking it until the 15-minute backstop.
+    let mut reservation: Option<crate::policy::remote::ReservationGuard> = None;
 
     if let Some(mut body_json) = json.clone() {
         let input_text = flatten_input_text(&body_json);
@@ -107,17 +160,28 @@ pub async fn guard_middleware(
             crate::telemetry::provider_metrics::ProviderMetrics::estimate_tokens_from_text(
                 &input_text,
             );
-        let max_output_tokens = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
-            .iter()
-            .find_map(|k| body_json.get(*k).and_then(|v| v.as_u64()));
+        // Untrusted client JSON — reject an unusable limit before it reaches the
+        // admission arithmetic (or the provider).
+        let max_output_tokens = match resolve_max_output_tokens(&body_json) {
+            Ok(v) => v,
+            Err(key) => {
+                warn!(provider = %provider, model = %model, field = key,
+                      "Nova Guard: rejecting request with an out-of-range output limit");
+                return invalid_output_limit_response(key);
+            }
+        };
         let est_request_cost = crate::policy::pricing::estimate_request_cost(
             &model,
             est_input_tokens,
             max_output_tokens,
         )
         .unwrap_or(0.0);
-        let est_tokens = u64::from(est_input_tokens)
-            + max_output_tokens.unwrap_or_else(crate::policy::pricing::assumed_output_tokens);
+        // `max_output_tokens` is bounded by `MAX_OUTPUT_TOKEN_LIMIT` above, so
+        // this cannot overflow; `saturating_add` keeps that true if either
+        // bound ever changes.
+        let est_tokens = u64::from(est_input_tokens).saturating_add(
+            max_output_tokens.unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
+        );
 
         // Reserve this request's predicted usage (cost + one request + tokens)
         // and read the other in-flight reservations in ONE critical section —
@@ -127,7 +191,13 @@ pub async fn guard_middleware(
         // Blocked requests release the reservation below.
         if gs.usage.is_some() {
             let (res, others) = gs.pending.reserve(est_request_cost, est_tokens);
-            reservation = Some(res);
+            // Scope the guard to this future immediately: from here on, every
+            // exit path — block, panic, or the whole middleware future being
+            // dropped mid-flight — transitions the entry out of ACTIVE.
+            reservation = Some(crate::policy::remote::ReservationGuard::new(
+                gs.pending.clone(),
+                res,
+            ));
             if let Some(ls) = live_state.as_mut() {
                 if others.cost_usd > 0.0 {
                     for v in ls.cost_usd_by_window.values_mut() {
@@ -168,10 +238,12 @@ pub async fn guard_middleware(
         log_decisions("input", &provider, &model, &result.decisions);
 
         if let Some(block) = &result.block {
-            // A blocked request never reaches the provider — its reservation
-            // must stop counting against the cap immediately.
-            if let Some(res) = reservation.take() {
-                gs.pending.release(res);
+            // A blocked request never reaches the provider — disarm the guard
+            // and drop the reservation entirely so it stops counting against
+            // the cap immediately (rather than lingering for the post-
+            // completion TTL, which is for calls that really were forwarded).
+            if let Some(guard) = reservation.take() {
+                guard.release();
             }
             info!(
                 provider = %provider, model = %model, policy = %block.policy_id,
@@ -220,23 +292,43 @@ pub async fn guard_middleware(
         // Without it a default stream carries no token counts, the ALLOWED event
         // posts $0, and cost caps silently never advance. The extra final chunk
         // is standard OpenAI shape (empty `choices` + `usage`) that SDKs handle.
-        // An existing `stream_options` object missing the key is augmented too;
-        // only an explicit `include_usage: false` is respected (the estimation
-        // fallback covers that stream instead).
+        //
+        // The flag is FORCED, not merely defaulted: an explicit
+        // `include_usage: false` is overridden while platform metering is
+        // active. Honoring it would let any caller select approximate
+        // accounting for their own spend — a real Luna stream that reports
+        // 11 in / 4 out ($0.000035) falls back to 6 in / 1 out ($0.000012),
+        // a 65.7% undercount, and reasoning tokens are not recoverable from
+        // visible deltas at all. The delta-based estimator stays what it was
+        // meant to be: an outage fallback for streams that arrive without
+        // usage, not a client-selectable accounting mode.
         if gs.usage.is_some()
             && provider.eq_ignore_ascii_case("openai")
             && body_json.get("stream").and_then(|s| s.as_bool()) == Some(true)
+            && body_json
+                .pointer("/stream_options/include_usage")
+                .and_then(|v| v.as_bool())
+                != Some(true)
         {
-            let needs_flag = match body_json.get("stream_options") {
-                None => true,
-                Some(opts) => opts.is_object() && opts.get("include_usage").is_none(),
-            };
-            if needs_flag {
-                body_json["stream_options"]["include_usage"] = serde_json::json!(true);
-                if let Ok(v) = serde_json::to_vec(&body_json) {
-                    forward_bytes = v.into();
-                    body_mutated = true;
-                }
+            debug!(
+                model = %model,
+                overridden = body_json
+                    .pointer("/stream_options/include_usage")
+                    .is_some(),
+                "Nova Guard: forcing stream_options.include_usage for platform metering"
+            );
+            // Replace a missing OR malformed `stream_options` wholesale —
+            // indexing into a non-object would panic.
+            match body_json
+                .get_mut("stream_options")
+                .filter(|v| v.is_object())
+            {
+                Some(opts) => opts["include_usage"] = serde_json::json!(true),
+                None => body_json["stream_options"] = serde_json::json!({"include_usage": true}),
+            }
+            if let Ok(v) = serde_json::to_vec(&body_json) {
+                forward_bytes = v.into();
+                body_mutated = true;
             }
         }
     }
@@ -253,16 +345,16 @@ pub async fn guard_middleware(
     // --- OUTPUT PHASE ---
     let response = enforce_output(&engine, &provider, &model, response, live_state.as_ref()).await;
 
-    // Keep the admitted request's reservation ACTIVE until the response body
-    // finishes (or the client disconnects): the guard rides the body stream, so
-    // a long-lived or streaming request never loses its cap protection mid-
-    // flight, and the post-completion TTL starts only once usage reporting can
-    // actually begin.
+    // Transfer the guard we have held since `reserve()` into the response body,
+    // so the reservation stays ACTIVE until the body finishes (or the client
+    // disconnects): a long-lived or streaming request never loses its cap
+    // protection mid-flight, and the post-completion TTL starts only once usage
+    // reporting can actually begin. Note this is a *move*, not a new guard —
+    // had the future been dropped before reaching here (client gone while we
+    // awaited upstream headers), the same guard would already have completed
+    // the reservation on the way out.
     match reservation {
-        Some(id) => attach_reservation_guard(
-            response,
-            crate::policy::remote::ReservationGuard::new(gs.pending.clone(), id),
-        ),
+        Some(guard) => attach_reservation_guard(response, guard),
         None => response,
     }
 }
