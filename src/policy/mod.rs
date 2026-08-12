@@ -49,6 +49,12 @@ pub mod source;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod remote;
 
+/// The `/admit` + reservation-settlement WIRE CONTRACT: request/settlement
+/// bodies, response classification and URL shaping. Pure and wasm-safe, so the
+/// native client and the Worker client share one definition instead of two that
+/// can drift.
+pub mod admission_wire;
+
 // Cross-replica atomic admission (POST .../policies/admit + reservation
 // settlement). Strict-mode `cost_cap` enforcement calls this instead of the
 // per-process `remote::PendingSpend` ledger. Native-only (reqwest).

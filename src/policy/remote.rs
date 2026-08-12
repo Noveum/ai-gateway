@@ -1035,20 +1035,7 @@ pub async fn fetch_bundle_conditional(
     Ok(PolicyFetch::Modified { bundle, etag })
 }
 
-/// Trim an error body for logging (WAF/CDN error pages can be large HTML).
-pub(crate) fn truncate_body(body: &str) -> String {
-    const MAX: usize = 512;
-    let trimmed = body.trim();
-    if trimmed.len() <= MAX {
-        trimmed.to_string()
-    } else {
-        let mut end = MAX;
-        while end > 0 && !trimmed.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}… ({} bytes)", &trimmed[..end], trimmed.len())
-    }
-}
+pub(crate) use crate::policy::admission_wire::truncate_body;
 
 /// Fetch + translate the platform's effective policies, returning the `ETag` too
 /// so the caller can seed the background poller.

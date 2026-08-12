@@ -31,18 +31,23 @@
 //! run, which is exactly the part that must not be trusted to a build that
 //! cannot be executed here.
 //!
-//! # Deliberate duplication
+//! # What is shared with the native client
 //!
-//! [`classify_admit`], the settlement bodies and the credential matrix mirror
-//! [`crate::policy::admission`] / [`crate::policy::remote`] almost line for
-//! line. They are duplicated rather than shared because those modules are
-//! `reqwest`-bound at the *module* level; hoisting their pure halves into a
-//! shared wasm-safe module is the right follow-up, and the tests here assert the
-//! same contract points so the two copies cannot silently diverge.
+//! `classify_admit`, the request and settlement bodies and their URL shaping are
+//! **not** defined here. They live in [`crate::policy::admission_wire`] and are
+//! re-exported below, so the edge and the native server cannot disagree about
+//! the wire contract. They were duplicated once, on the theory that tests on
+//! both sides would catch a divergence; that only catches a divergence someone
+//! wrote a test for, and never catches one copy being updated without the other.
+//!
+//! What remains here is genuinely Worker-specific: the credential matrix
+//! ([`WorkerRemoteConfig::from_values`], which deliberately mirrors the native
+//! `RemoteConfig::from_values` because the two must agree on what a half-applied
+//! secret set *means*, not because they share code), the tenancy refusal, the
+//! request-path heuristics, and the `worker::Fetch` I/O.
 
 use serde_json::{json, Value};
 
-use crate::policy::decision::{PolicyAction, PolicyDecision, PolicyMode, Severity};
 use crate::policy::metering::ActualUsage;
 
 pub use crate::policy::platform::{API_KEY_VAR, PROJECT_ID_VAR, TENANCY_VAR};
@@ -233,307 +238,13 @@ pub fn tenancy_refusal(tenancy: Option<&str>) -> Option<String> {
     ))
 }
 
-/// Percent-encode the few characters that could break out of a path segment.
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(c),
-            _ => {
-                let mut buf = [0u8; 4];
-                for b in c.encode_utf8(&mut buf).as_bytes() {
-                    out.push_str(&format!("%{b:02X}"));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Trim an error body for logging (a CDN/WAF error page can be large HTML).
-pub fn truncate_body(body: &str) -> String {
-    const MAX: usize = 512;
-    let trimmed = body.trim();
-    if trimmed.len() <= MAX {
-        return trimmed.to_string();
-    }
-    let mut end = MAX;
-    while end > 0 && !trimmed.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… ({} bytes)", &trimmed[..end], trimmed.len())
-}
-
-// ---------------------------------------------------------------------------
-// Admission wire types
-// ---------------------------------------------------------------------------
-
-/// An accepted reservation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reservation {
-    pub id: String,
-    pub expires_at: Option<String>,
-    pub policy_version: Option<String>,
-    /// `true` when this call replayed an existing reservation for the same
-    /// `requestId` (a retry) rather than creating a new one.
-    pub replayed: bool,
-}
-
-/// The platform's rejection, as returned in a `200 {allowed:false}` body.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BlockedDecision {
-    pub policy_id: String,
-    pub policy_name: String,
-    /// Gateway-side policy type (`cost_cap` / `rate_limit`), already mapped from
-    /// the platform's `COST_CAP` / `RATE_LIMIT`.
-    pub policy_type: String,
-    pub scope: Option<String>,
-    pub dimension: Option<String>,
-    pub limit: Option<f64>,
-    pub observed: Option<f64>,
-    pub projected: Option<f64>,
-    pub reason: String,
-}
-
-impl BlockedDecision {
-    /// Render as the gateway's uniform [`PolicyDecision`] so a platform block
-    /// flows through the same synthetic-response builders as a locally
-    /// evaluated one — byte-identical block shapes at the edge and natively.
-    pub fn to_policy_decision(&self) -> PolicyDecision {
-        let mut d = PolicyDecision::allow(
-            &self.policy_id,
-            &self.policy_name,
-            &self.policy_type,
-            PolicyMode::Enforce,
-        );
-        d.flagged = true;
-        d.score = 1.0;
-        d.severity = Severity::Critical;
-        d.action = PolicyAction::Block;
-        d.reason = self.reason.clone();
-        d
-    }
-}
-
-/// The outcome of one admission call.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Admission {
-    Allowed(Reservation),
-    Blocked(Box<BlockedDecision>),
-    /// Admission could not be evaluated (503, transport failure, budget
-    /// exceeded, malformed answer). The caller applies `failClosed`: this is
-    /// never an allow by itself.
-    Unavailable(String),
-}
-
-/// This request's estimated usage, as sent to `/admit`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AdmitRequest {
-    /// Idempotency key. One per logical request; reused on retry, which is what
-    /// makes a retry replay the same reservation instead of reserving twice.
-    pub request_id: String,
-    pub provider: Option<String>,
-    pub model: String,
-    pub estimated_input_tokens: u64,
-    pub maximum_output_tokens: u64,
-    pub estimated_cost_usd: f64,
-}
-
-impl AdmitRequest {
-    pub fn to_json(&self) -> Value {
-        let mut v = json!({
-            "requestId": self.request_id,
-            "model": self.model,
-            "estimatedInputTokens": self.estimated_input_tokens,
-            "maximumOutputTokens": self.maximum_output_tokens,
-            // NaN/negative would serialize as `null` / be rejected by the
-            // schema (`number >= 0`); clamp to a value the platform accepts.
-            "estimatedCostUsd": sanitize_cost(self.estimated_cost_usd),
-        });
-        if let Some(p) = &self.provider {
-            v["provider"] = Value::from(p.as_str());
-        }
-        v
-    }
-}
-
-/// Coerce an estimated cost into the platform's accepted range (`number >= 0`),
-/// mapping NaN to 0 rather than emitting a `null` the schema rejects.
-fn sanitize_cost(v: f64) -> f64 {
-    if v.is_finite() && v > 0.0 {
-        v.min(100_000.0)
-    } else {
-        0.0
-    }
-}
-
-/// Authoritative usage for a completed request.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SettlementUsage {
-    pub model: Option<String>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cost_usd: f64,
-    pub request_count: u64,
-    pub event_id: Option<String>,
-}
-
-/// How a held reservation is closed out.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Settlement {
-    /// Real usage recovered: apply it in place of the estimate.
-    Complete(Box<SettlementUsage>),
-    /// The call may have reached the provider but no authoritative usage was
-    /// recovered. The conservative estimate STAYS applied.
-    Abandon(String),
-    /// The call provably never reached the provider. Releases the hold.
-    Cancel(String),
-}
-
-impl Settlement {
-    /// URL segment under `/reservations/{id}/`.
-    pub fn endpoint(&self) -> &'static str {
-        match self {
-            Settlement::Complete(_) => "complete",
-            Settlement::Abandon(_) => "abandon",
-            Settlement::Cancel(_) => "cancel",
-        }
-    }
-
-    /// The POST body. `timestamp` is injected rather than read from a clock so
-    /// this stays pure (and so the wasm build can use `Date.now()` without a
-    /// `chrono` clock dependency in the hot path).
-    pub fn to_json(&self, timestamp: Option<&str>) -> Value {
-        match self {
-            Settlement::Complete(u) => {
-                let mut v = json!({
-                    "inputTokens": u.input_tokens,
-                    "outputTokens": u.output_tokens,
-                    "costUsd": sanitize_cost(u.cost_usd),
-                    "requestCount": u.request_count,
-                });
-                if let Some(m) = &u.model {
-                    v["model"] = Value::from(m.as_str());
-                }
-                if let Some(e) = &u.event_id {
-                    v["eventId"] = Value::from(e.as_str());
-                }
-                if let Some(t) = timestamp {
-                    v["timestamp"] = Value::from(t);
-                }
-                v
-            }
-            Settlement::Abandon(reason) | Settlement::Cancel(reason) => json!({ "reason": reason }),
-        }
-    }
-}
-
-/// Classify an `/admit` HTTP response. Pure, so the whole contract — including
-/// the counter-intuitive "**blocked is HTTP 200**" — is unit-testable without a
-/// platform, which matters double here because the wasm integration path cannot
-/// be executed in this environment.
-///
-/// Anything that is not an unambiguous allow or an unambiguous block is
-/// [`Admission::Unavailable`], and the caller then applies `failClosed`. There
-/// is deliberately no path from a malformed or unexpected response to "allowed".
-pub fn classify_admit(status: u16, body: &[u8]) -> Admission {
-    let text = String::from_utf8_lossy(body);
-    let json: Option<Value> = serde_json::from_slice(body).ok();
-
-    if status == 503 {
-        return Admission::Unavailable(format!(
-            "admission unavailable (503): {}",
-            json.as_ref()
-                .and_then(message_of)
-                .unwrap_or_else(|| truncate_body(&text))
-        ));
-    }
-    if !(200..300).contains(&status) {
-        return Admission::Unavailable(format!(
-            "admit returned {status}: {}",
-            truncate_body(&text)
-        ));
-    }
-    let Some(json) = json else {
-        return Admission::Unavailable(format!(
-            "admit returned invalid JSON: {}",
-            truncate_body(&text)
-        ));
-    };
-    match json.get("allowed").and_then(|v| v.as_bool()) {
-        Some(true) => {
-            // An "allowed" with no reservation id cannot be settled, so the
-            // platform's hold would linger for its whole TTL. Treat it as
-            // unavailable rather than admitting a call we can never close out.
-            let Some(id) = json
-                .get("reservationId")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-            else {
-                return Admission::Unavailable(
-                    "admit returned allowed with no reservationId".to_string(),
-                );
-            };
-            Admission::Allowed(Reservation {
-                id: id.to_string(),
-                expires_at: str_field(&json, "expiresAt"),
-                policy_version: str_field(&json, "policyVersion"),
-                replayed: json
-                    .get("replayed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-            })
-        }
-        Some(false) => Admission::Blocked(Box::new(parse_decision(&json))),
-        None => Admission::Unavailable(format!(
-            "admit response has no `allowed` field: {}",
-            truncate_body(&text)
-        )),
-    }
-}
-
-fn str_field(v: &Value, key: &str) -> Option<String> {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-}
-
-/// Best-effort error message out of a platform error envelope.
-fn message_of(v: &Value) -> Option<String> {
-    for key in ["message", "error", "code"] {
-        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-            return Some(s.to_string());
-        }
-    }
-    v.pointer("/error/message")
-        .and_then(|x| x.as_str())
-        .map(String::from)
-}
-
-/// Parse the `decision` object of a `200 {allowed:false}` body. A block with a
-/// missing or malformed decision is still a block (the platform said no) — it
-/// just gets generic labels.
-fn parse_decision(body: &Value) -> BlockedDecision {
-    let d = body.get("decision").unwrap_or(&Value::Null);
-    let policy_type = match d.get("policyType").and_then(|v| v.as_str()) {
-        Some(t) if t.eq_ignore_ascii_case("RATE_LIMIT") => "rate_limit",
-        _ => "cost_cap",
-    };
-    let num = |k: &str| d.get(k).and_then(|v| v.as_f64());
-    BlockedDecision {
-        policy_id: str_field(d, "policyId").unwrap_or_else(|| "platform_admission".to_string()),
-        policy_name: str_field(d, "policyName").unwrap_or_else(|| "platform admission".to_string()),
-        policy_type: policy_type.to_string(),
-        scope: str_field(d, "scope"),
-        dimension: str_field(d, "dimension"),
-        limit: num("limit"),
-        observed: num("observed"),
-        projected: num("projected"),
-        reason: str_field(d, "reason")
-            .unwrap_or_else(|| "blocked by platform admission control".to_string()),
-    }
-}
+// The admission wire contract -- request/settlement bodies, `/admit`
+// classification, `sanitize_cost` -- is shared with the native client in
+// `admission_wire`. Only the `worker::Fetch` transport below is wasm-specific.
+pub use crate::policy::admission_wire::{
+    classify_admit, truncate_body, urlencode, Admission, AdmitRequest, BlockedDecision,
+    Reservation, Settlement, SettlementUsage,
+};
 
 // ---------------------------------------------------------------------------
 // Pure request-path decisions
