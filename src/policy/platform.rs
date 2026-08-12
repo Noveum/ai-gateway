@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use crate::policy::config::PolicyBundle;
+use crate::policy::config::{PolicyBundle, PolicyType};
 use crate::policy::rules::LiveState;
 
 /// The env vars/secrets that configure the platform bridge. Declared in this
@@ -76,10 +76,20 @@ pub fn translate_policies(platform: &Value) -> Value {
             if p.get("enabled").and_then(|e| e.as_bool()) == Some(false) {
                 continue;
             }
-            let policy_type = match p.get("type").and_then(|t| t.as_str()) {
-                Some(t) if t.eq_ignore_ascii_case("COST_CAP") => "cost_cap",
-                Some(t) if t.eq_ignore_ascii_case("RATE_LIMIT") => "rate_limit",
-                _ => continue, // not a Phase-0 type the gateway enforces
+            // Every type in `schema/novaguard-policy.v1.json` is translated,
+            // not just the two the platform originally shipped. Dropping the
+            // rest here was a silent third definition of "what a policy is":
+            // an operator could create a policy in the UI that this bridge
+            // deleted on the way in, with nothing anywhere saying so. Types the
+            // engine cannot enforce are now carried through and rejected
+            // loudly by `PolicyEngine::compile` instead.
+            let raw_type = p.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+            let kind = PolicyType::from_platform_enum(raw_type);
+            let policy_type = if kind == PolicyType::Unknown {
+                // Keep the raw string so the engine's rejection can name it.
+                raw_type
+            } else {
+                kind.as_str()
             };
             let name = p
                 .get("name")
@@ -229,7 +239,12 @@ mod tests {
         ]});
         let out = translate_policies(&platform);
         let pols = out["policies"].as_array().unwrap();
-        assert_eq!(pols.len(), 2, "disabled + non-phase-0 types are skipped");
+        // Disabled policies are still skipped, but a type the gateway cannot
+        // enforce is NO LONGER dropped here: it is carried through so the engine
+        // can reject it by name. Dropping it made an operator's policy vanish
+        // with nothing anywhere reporting it.
+        assert_eq!(pols.len(), 3, "only the disabled policy is skipped");
+        assert_eq!(pols[2]["type"], "prompt_injection");
         assert_eq!(pols[0]["type"], "cost_cap");
         assert_eq!(pols[0]["mode"], "enforce");
         assert_eq!(pols[0]["policyId"], "p1", "policyId carried through");
@@ -241,10 +256,47 @@ mod tests {
         assert_eq!(pols[1]["type"], "rate_limit");
         assert_eq!(pols[1]["mode"], "shadow");
         assert_eq!(pols[1]["config"]["windows"][0]["action"], "block");
-        // The translated bundle must parse + compile in the real engine.
+        // The translated bundle must parse + compile in the real engine. The
+        // two enforceable policies compile; the reserved classifier type is
+        // reported as a rejection rather than silently disappearing.
         let bundle = translate_bundle(&platform).expect("bundle parses");
         let engine = PolicyEngine::from_bundle(&bundle, EngineOptions::default());
         assert_eq!(engine.active_policy_count(), 2);
+        let rejected = engine.rejected_policies();
+        assert_eq!(rejected.len(), 1, "{rejected:?}");
+        assert!(rejected[0].contains("prompt_injection"), "{rejected:?}");
+    }
+
+    #[test]
+    fn every_contract_type_survives_translation() {
+        // Before NOV-107 this bridge hard-coded COST_CAP + RATE_LIMIT, so the
+        // other twelve types were unreachable from the product no matter what
+        // the platform stored. Each one must now arrive at the engine.
+        for ty in PolicyType::ALL {
+            let platform = json!({"policies": [{
+                "policyId": "p", "name": "p", "type": ty.platform_enum(), "enabled": true,
+                "config": {}
+            }]});
+            let out = translate_policies(&platform);
+            let pols = out["policies"].as_array().unwrap();
+            assert_eq!(pols.len(), 1, "{} was dropped in translation", ty.as_str());
+            assert_eq!(pols[0]["type"], ty.as_str());
+        }
+    }
+
+    #[test]
+    fn unrecognized_platform_type_keeps_its_raw_name() {
+        // A type the platform invents that this build has never heard of must
+        // reach the engine verbatim, so the rejection can quote it.
+        let platform = json!({"policies": [
+            {"policyId":"p","name":"n","type":"VIBE_CHECK","enabled":true,"config":{}}
+        ]});
+        let out = translate_policies(&platform);
+        assert_eq!(out["policies"][0]["type"], "VIBE_CHECK");
+        let bundle = translate_bundle(&platform).unwrap();
+        let engine = PolicyEngine::from_bundle(&bundle, EngineOptions::default());
+        assert_eq!(engine.active_policy_count(), 0);
+        assert!(engine.rejected_policies()[0].contains("VIBE_CHECK"));
     }
 
     #[test]

@@ -148,7 +148,7 @@ pub trait PolicyRule: Send + Sync {
 /// family, which the engine routes to the NovaEval scoring service separately).
 pub fn compile_rule(policy: &Policy) -> Option<Box<dyn PolicyRule>> {
     let cfg = policy.config.clone();
-    let result: Result<Box<dyn PolicyRule>, String> = match policy.policy_type {
+    let result: Result<Box<dyn PolicyRule>, String> = match policy.kind() {
         PolicyType::RegexMatch => {
             regex_match::RegexMatchRule::parse(cfg).map(|r| Box::new(r) as Box<dyn PolicyRule>)
         }
@@ -184,7 +184,7 @@ pub fn compile_rule(policy: &Policy) -> Option<Box<dyn PolicyRule>> {
         Err(e) => {
             warn!(
                 policy = %policy.id(),
-                policy_type = policy.policy_type.as_str(),
+                policy_type = policy.kind().as_str(),
                 error = %e,
                 "failed to compile policy config; skipping this policy"
             );

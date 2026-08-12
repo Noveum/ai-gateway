@@ -18,12 +18,13 @@ use arc_swap::ArcSwap;
 use tracing::{info, warn};
 
 use super::config::{
-    CostCapConfig, CostEnforcementMode, CostWindow, Policy, PolicyBundle, PolicyType,
-    RateLimitConfig,
+    validate_policy, CostCapConfig, CostEnforcementMode, CostWindow, Policy, PolicyBundle,
+    PolicyRejection, PolicyType, RateLimitConfig,
 };
 use super::decision::{Phase, PolicyAction, PolicyDecision, PolicyMode, Severity};
 use super::rules::{compile_rule, EvalContext, LiveState, PolicyRule, RuleOutcome};
 use super::synthetic::BlockResponseMode;
+use tracing::error;
 
 /// Per-policy metadata carried alongside the compiled rule.
 struct PolicyMeta {
@@ -45,11 +46,48 @@ impl PolicyMeta {
         Self {
             id: p.id().to_string(),
             name: p.name.clone(),
-            policy_type: p.policy_type,
+            policy_type: p.kind(),
             mode: p.mode,
             fail_closed: p.fail_closed,
             org_scoped,
         }
+    }
+}
+
+/// An active policy the engine could not compile.
+///
+/// Recorded rather than dropped. A policy an operator created in the UI that
+/// does nothing is the failure mode this exists to prevent: every rejection is
+/// logged at `error!`, counted, and readable via
+/// [`PolicyEngine::rejected_policies`]. When the policy is `failClosed` it also
+/// blocks traffic — the operator asked for "block when this cannot be
+/// evaluated", and a policy that will never compile can never be evaluated.
+struct RejectedPolicy {
+    id: String,
+    name: String,
+    /// The raw wire `type`, which for an unknown type is the whole point.
+    type_name: String,
+    mode: PolicyMode,
+    fail_closed: bool,
+    rejection: PolicyRejection,
+}
+
+impl RejectedPolicy {
+    /// The operator-facing one-liner, reused by the log line, the accessor and
+    /// the block reason so they can never describe the same fault differently.
+    fn message(&self) -> String {
+        format!(
+            "policy '{}' (type '{}') was rejected: {}",
+            self.name, self.type_name, self.rejection
+        )
+    }
+
+    /// Does this rejection block traffic? Only when the operator marked the
+    /// policy `failClosed` **and** did not put it in shadow mode. Shadow means
+    /// "record, never apply", and that has to hold for a compile failure too or
+    /// a shadow rollout could take production down.
+    fn blocks(&self) -> bool {
+        self.fail_closed && self.mode == PolicyMode::Enforce
     }
 }
 
@@ -109,11 +147,20 @@ pub struct EngineState {
     text_policies: Vec<CompiledPolicy>,
     cost_caps: Vec<CostCapPolicy>,
     rate_limits: Vec<RateLimitPolicy>,
+    rejected: Vec<RejectedPolicy>,
 }
 
 impl EngineState {
     fn active_count(&self) -> usize {
-        self.text_policies.len() + self.cost_caps.len() + self.rate_limits.len()
+        // A fail-closed rejection blocks every request, so it counts as active.
+        // Callers gate the entire guard path on this being non-zero
+        // (`middleware.rs`, `worker_rt.rs`); leaving it out would mean a policy
+        // whose whole purpose is to block traffic gets skipped by the very check
+        // that decides whether to run the guard at all.
+        self.text_policies.len()
+            + self.cost_caps.len()
+            + self.rate_limits.len()
+            + self.rejected.iter().filter(|r| r.blocks()).count()
     }
 }
 
@@ -245,14 +292,30 @@ impl PolicyEngine {
         // bundle when no source is configured, and an error only when one is
         // configured and cannot be loaded.
         let bundle = super::source::load_from_env().await?;
+        bundle.schema_version_supported()?;
 
-        Ok(Self::from_bundle(&bundle, opts))
+        let engine = Self::from_bundle(&bundle, opts);
+        // A locally configured bundle is authored by the operator running this
+        // process, so an unenforceable policy in it is a deploy-time mistake we
+        // can still refuse. Starting anyway would ship a gateway whose policy
+        // file says one thing and whose behavior says another.
+        let rejected = engine.rejected_policies();
+        if !rejected.is_empty() {
+            return Err(format!(
+                "Nova Guard policy bundle contains {} policy/policies this build cannot enforce:\n  - {}",
+                rejected.len(),
+                rejected.join("\n  - ")
+            ));
+        }
+
+        Ok(engine)
     }
 
     fn compile(bundle: &PolicyBundle, enabled: bool, live_state_backed: bool) -> EngineState {
         let mut text_policies = Vec::new();
         let mut cost_caps = Vec::new();
         let mut rate_limits = Vec::new();
+        let mut rejected: Vec<RejectedPolicy> = Vec::new();
 
         // Only neutralize `failClosed` when there's no state backend to enforce
         // against; with the platform bridge wired, `failClosed` is honored.
@@ -275,17 +338,52 @@ impl PolicyEngine {
         let mut policies: Vec<&Policy> = bundle.policies.iter().filter(|p| p.is_active()).collect();
         policies.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.name.cmp(&b.name)));
 
+        // A policy that cannot be compiled is recorded, never dropped. Silently
+        // skipping one leaves the operator believing a guardrail they created in
+        // the UI is protecting them when it is inert.
+        let mut reject = |p: &Policy, rejection: PolicyRejection| {
+            let r = RejectedPolicy {
+                id: p.id().to_string(),
+                name: p.name.clone(),
+                type_name: p.type_name().to_string(),
+                mode: p.mode,
+                fail_closed: p.fail_closed,
+                rejection,
+            };
+            if r.blocks() {
+                error!(policy = %r.id, "{} — failClosed, so it blocks all traffic until fixed", r.message());
+            } else {
+                error!(policy = %r.id, "{} — this policy is NOT in force", r.message());
+            }
+            rejected.push(r);
+        };
+
         for p in policies {
-            match p.policy_type {
+            // Schema first: the contract decides whether a type exists and
+            // whether its config is well formed, so every deployment target and
+            // every language agrees on the answer.
+            if let Err(rejection) = validate_policy(p) {
+                reject(p, rejection);
+                continue;
+            }
+            match p.kind() {
                 PolicyType::CostCap => {
                     match serde_json::from_value::<CostCapConfig>(p.config.clone()) {
                         Ok(config) => cost_caps.push(CostCapPolicy {
                             meta: stateful_meta(p),
                             config,
                         }),
-                        Err(e) => {
-                            warn!(policy = %p.id(), error = %e, "invalid cost_cap config; skipping")
-                        }
+                        // The schema accepted this config, so a parse failure
+                        // here means the Rust struct and the schema disagree —
+                        // a codegen/contract bug, not bad operator input.
+                        Err(e) => reject(
+                            p,
+                            PolicyRejection::InvalidConfig {
+                                errors: vec![format!(
+                                    "config satisfies the schema but not CostCapConfig: {e}"
+                                )],
+                            },
+                        ),
                     }
                 }
                 PolicyType::RateLimit => {
@@ -294,34 +392,58 @@ impl PolicyEngine {
                             meta: stateful_meta(p),
                             config,
                         }),
-                        Err(e) => {
-                            warn!(policy = %p.id(), error = %e, "invalid rate_limit config; skipping")
-                        }
+                        Err(e) => reject(
+                            p,
+                            PolicyRejection::InvalidConfig {
+                                errors: vec![format!(
+                                    "config satisfies the schema but not RateLimitConfig: {e}"
+                                )],
+                            },
+                        ),
                     }
                 }
-                _ => {
-                    if let Some(rule) = compile_rule(p) {
-                        text_policies.push(CompiledPolicy {
-                            meta: PolicyMeta::from_policy(p),
-                            rule,
-                        });
-                    }
-                }
+                _ => match compile_rule(p) {
+                    Some(rule) => text_policies.push(CompiledPolicy {
+                        meta: PolicyMeta::from_policy(p),
+                        rule,
+                    }),
+                    None => reject(
+                        p,
+                        PolicyRejection::InvalidConfig {
+                            errors: vec![
+                                "the rule layer refused this config (see the preceding log line)"
+                                    .to_string(),
+                            ],
+                        },
+                    ),
+                },
             }
         }
 
-        info!(
-            text_policies = text_policies.len(),
-            cost_caps = cost_caps.len(),
-            rate_limits = rate_limits.len(),
-            "compiled Nova Guard policy set"
-        );
+        if rejected.is_empty() {
+            info!(
+                text_policies = text_policies.len(),
+                cost_caps = cost_caps.len(),
+                rate_limits = rate_limits.len(),
+                "compiled Nova Guard policy set"
+            );
+        } else {
+            error!(
+                text_policies = text_policies.len(),
+                cost_caps = cost_caps.len(),
+                rate_limits = rate_limits.len(),
+                rejected = rejected.len(),
+                blocking = rejected.iter().filter(|r| r.blocks()).count(),
+                "compiled Nova Guard policy set WITH REJECTIONS; the rejected policies are not enforcing anything"
+            );
+        }
 
         EngineState {
             enabled,
             text_policies,
             cost_caps,
             rate_limits,
+            rejected,
         }
     }
 
@@ -343,6 +465,26 @@ impl PolicyEngine {
 
     pub fn active_policy_count(&self) -> usize {
         self.state.load().active_count()
+    }
+
+    /// Active policies the engine refused to compile (unknown type, config that
+    /// violates the schema, or a type this build cannot enforce).
+    ///
+    /// Non-empty means an operator authored a guardrail that is doing nothing.
+    /// The bootstrap path turns this into a startup failure; the hot-reload path
+    /// cannot refuse to start, so it surfaces here and in the `error!` log.
+    pub fn rejected_policies(&self) -> Vec<String> {
+        self.state
+            .load()
+            .rejected
+            .iter()
+            .map(|r| r.message())
+            .collect()
+    }
+
+    /// How many active policies were rejected.
+    pub fn rejected_policy_count(&self) -> usize {
+        self.state.load().rejected.len()
     }
 
     /// Number of active policies that can only be evaluated against a live
@@ -480,6 +622,32 @@ impl PolicyEngine {
                 .iter()
                 .find_map(|k| j.get(*k).and_then(|v| v.as_u64()))
         });
+
+        // 0) A `failClosed` policy the engine could not compile blocks, at the
+        //    input phase, before anything else. `failClosed` means "block when
+        //    this policy cannot be evaluated", and a policy that will never
+        //    compile can never be evaluated. Failing open here would deliver the
+        //    exact outcome the operator wrote `failClosed` to prevent.
+        if phase.applies_to(Phase::Input) {
+            // The first blocking rejection is terminal, exactly like the first
+            // enforced block from a compiled policy.
+            if let Some(r) = state.rejected.iter().find(|r| r.blocks()) {
+                let mut d = PolicyDecision::allow(
+                    &r.id,
+                    &r.name,
+                    r.type_name.as_str(),
+                    PolicyMode::Enforce,
+                );
+                d.flagged = true;
+                d.score = 1.0;
+                d.severity = Severity::Critical;
+                d.action = PolicyAction::Block;
+                d.reason = format!("{}; failing closed", r.message());
+                result.block = Some(d.clone());
+                result.decisions.push(d);
+                return result;
+            }
+        }
 
         // 1) Cost-cap + rate-limit policies run first (input phase only); they can
         //    block before any text scanning.
@@ -1389,6 +1557,127 @@ mod tests {
         assert!(r.is_blocked());
         // only the first decision recorded; second not evaluated
         assert_eq!(r.decisions.len(), 1);
+    }
+
+    #[test]
+    fn unknown_policy_type_is_a_visible_rejection_not_a_silent_skip() {
+        let e = engine(
+            r#"{"policies":[{"name":"typo","type":"promt_injection","mode":"enforce","config":{}}]}"#,
+        );
+        assert_eq!(e.active_policy_count(), 0);
+        assert_eq!(e.rejected_policy_count(), 1);
+        let msgs = e.rejected_policies();
+        assert!(msgs[0].contains("promt_injection"), "{msgs:?}");
+        assert!(msgs[0].contains("unknown policy type"), "{msgs:?}");
+        // Fail-open by default: a typo must not take production down.
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, None);
+        assert!(!r.is_blocked());
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_rather_than_skipped_with_a_warning() {
+        // A regex_match with no patterns used to compile to nothing and be
+        // dropped with a `warn!`, so the operator's guardrail silently did
+        // nothing. It is now a counted, named rejection.
+        let e = engine(
+            r#"{"policies":[{"name":"empty","type":"regex_match","mode":"enforce","config":{}}]}"#,
+        );
+        assert_eq!(e.active_policy_count(), 0);
+        assert_eq!(e.rejected_policy_count(), 1);
+        assert!(e.rejected_policies()[0].contains("patterns"));
+    }
+
+    #[test]
+    fn reserved_classifier_type_is_rejected_with_a_reason() {
+        let e = engine(
+            r#"{"policies":[{"name":"inj","type":"prompt_injection","mode":"enforce",
+            "config":{"threshold":0.9,"action":"block"}}]}"#,
+        );
+        assert_eq!(e.active_policy_count(), 0);
+        let msgs = e.rejected_policies();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].contains("prompt_injection"), "{msgs:?}");
+        assert!(msgs[0].contains("external scoring service"), "{msgs:?}");
+    }
+
+    #[test]
+    fn fail_closed_rejection_blocks_every_request() {
+        // `failClosed` means "block when this policy cannot be evaluated". A
+        // policy that will never compile can never be evaluated, so failing open
+        // would deliver exactly what the operator wrote failClosed to prevent.
+        let e = engine(
+            r#"{"policies":[{"name":"critical","type":"content_moderation","mode":"enforce",
+            "failClosed":true,"config":{"categories":["hate"]}}]}"#,
+        );
+        assert_eq!(e.rejected_policy_count(), 1);
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hello", None, None, None);
+        assert!(r.is_blocked(), "fail-closed rejection must block");
+        let b = r.block.unwrap();
+        assert_eq!(b.policy_type, "content_moderation");
+        assert!(b.reason.contains("failing closed"), "{}", b.reason);
+        assert_eq!(b.action, PolicyAction::Block);
+    }
+
+    #[test]
+    fn fail_closed_rejection_counts_as_active_so_the_guard_still_runs() {
+        // `middleware.rs` and `worker_rt.rs` skip the whole guard path when
+        // `active_policy_count() == 0`. A rejection that blocks every request has
+        // to be visible to that gate, or the block would never be applied.
+        let blocking = engine(
+            r#"{"policies":[{"name":"m","type":"content_moderation","mode":"enforce",
+            "failClosed":true,"config":{"categories":["hate"]}}]}"#,
+        );
+        assert_eq!(blocking.active_policy_count(), 1);
+        // A fail-open rejection changes nothing about request handling, so it
+        // must NOT switch the guard on for a deployment that has no policies.
+        let inert = engine(
+            r#"{"policies":[{"name":"m","type":"content_moderation","mode":"enforce",
+            "config":{"categories":["hate"]}}]}"#,
+        );
+        assert_eq!(inert.active_policy_count(), 0);
+        assert_eq!(inert.rejected_policy_count(), 1);
+    }
+
+    #[test]
+    fn shadow_mode_rejection_never_blocks() {
+        // Shadow means "record, never apply". That has to hold for a compile
+        // failure too, or a shadow rollout could take production down.
+        let e = engine(
+            r#"{"policies":[{"name":"critical","type":"content_moderation","mode":"shadow",
+            "failClosed":true,"config":{"categories":["hate"]}}]}"#,
+        );
+        assert_eq!(e.rejected_policy_count(), 1);
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hello", None, None, None);
+        assert!(!r.is_blocked());
+    }
+
+    #[test]
+    fn rejections_do_not_stop_valid_policies_from_compiling() {
+        let e = engine(
+            r#"{"policies":[
+              {"name":"bad","type":"quantum_check","mode":"enforce","config":{}},
+              {"name":"good","type":"regex_match","mode":"enforce",
+               "config":{"phase":"input","patterns":[{"name":"a","regex":"boom"}],"action":"block"}}
+            ]}"#,
+        );
+        assert_eq!(e.active_policy_count(), 1);
+        assert_eq!(e.rejected_policy_count(), 1);
+        assert!(e
+            .evaluate(Phase::Input, "gpt-4o", "boom", None, None, None)
+            .is_blocked());
+    }
+
+    #[test]
+    fn swap_bundle_clears_stale_rejections() {
+        let e = engine(r#"{"policies":[{"name":"bad","type":"nope","config":{}}]}"#);
+        assert_eq!(e.rejected_policy_count(), 1);
+        let fixed = PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"good","type":"model_allowlist","mode":"enforce","config":{"allowed":["gpt-4o"]}}]}"#,
+        )
+        .unwrap();
+        e.swap_bundle(&fixed);
+        assert_eq!(e.rejected_policy_count(), 0);
+        assert_eq!(e.active_policy_count(), 1);
     }
 
     #[test]
