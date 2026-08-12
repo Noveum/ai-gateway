@@ -126,15 +126,35 @@ had a third copy in `remote.rs`; that one re-exports too.
 native `RemoteConfig::from_values` because the two must agree on what a
 half-applied secret set *means*, not because they are the same code.
 
-### 5. Prisma `PolicyType` migration — written, not applied
+### 5. Prisma `PolicyType` migration — applied (`a0fe38491`)
 
-`packages/database/prisma/POLICY_TYPE_MIGRATION.md`. The enum holds only
-`COST_CAP` and `RATE_LIMIT`; the other 12 contract types need an additive
-`ALTER TYPE ... ADD VALUE` affecting `ProjectPolicy.type` and
-`GuardrailUsageEvent.blockedBy`, not reversible in place. Until then the API
-returns a clean 400 naming the migration, and `PERSISTABLE_POLICY_TYPES` is
-asserted equal to the Prisma enum in both directions so the gate cannot rot.
-**`prisma db push` was deliberately not run against the prod-synced local DB.**
+All 14 contract types now persist. `PENDING_MIGRATION_POLICY_TYPES` emptied
+itself, and the API no longer 400s on the other twelve.
+
+Applied **without** `prisma db push`, which re-diffs the whole schema and can do
+more than what you reviewed: `pg_dump` backup first (113M, `/tmp`), then
+`prisma migrate diff --script` to produce the exact SQL, then a check that it was
+nothing but `ALTER TYPE ... ADD VALUE`, then `psql`. 12 statements, no other
+drift, and `project_policies` (10 rows) / `guardrail_usage_events` (100 rows)
+byte-identical afterwards.
+
+Two things the migration doc did not anticipate:
+
+- One drift test was obsolete by construction — it asserted `SECRETS_DETECTION`
+  gets a 400 naming the migration, which is the gap being closed. Replaced with
+  its inverse.
+- **Widening the enum broke `tsc`**; left alone the API package would not
+  compile. Two call sites passed the 14-member union into code typed
+  `"COST_CAP" | "RATE_LIMIT"`. Narrowed at both boundaries
+  (`isAdmissionPolicyType`) rather than by widening admission, which the doc
+  calls separate work. Not just a type fix: `buildAdmissionChecks` does
+  `type === "COST_CAP" ? … : rateLimitChecks`, so an unfiltered `PII_DETECTION`
+  policy would have fallen into the rate-limit arm, produced zero checks, and
+  been reported to the caller as *unparseable*.
+
+**NOV-105 is now unblocked** — it is one `PolicyTypeDescriptor` + form-schema
+member + fields component + i18n per rule, plus the three shape mismatches in
+§6 that still need a decision.
 
 ### 6. Phase 5 UI — items 1 to 5 done, the rest blocked
 
@@ -164,12 +184,23 @@ check-building as admission and reserves nothing.
 
 ### 7. Open product decisions
 
-- **Assumed price for an unknown model** is the catalog maximum, $15/$60 per
-  1M (o1), derived not invented. Groq streaming placeholders (`unknown`,
-  `llama`) now meter at that rate, far above the real llama rate. The better
-  fix is making those placeholders resolvable rather than weakening the
-  assumption. Orbit marks this `blocked_by` NOV-135.
-- **Reject vs price-high** for unknown models. Today: allowed and priced high.
+- ~~**Assumed price for an unknown model**~~ **DECIDED (`cb083ae`).** The rate
+  stays the derived catalog maximum: it rises with the catalog and errs in the
+  only safe direction. The Groq over-metering it was blamed for was a different
+  bug — those streams carried a *placeholder* id (`llama`, `claude`) that no
+  event ever populated, so a call whose model was never learned was priced as an
+  unknown *model*. `resolve_model_for_metering` now resolves it from the request
+  body, which is the same value admission already reserves against.
+- ~~**Reject vs price-high**~~ **DECIDED (`cb083ae`): priced high, never
+  rejected.** A pass-through proxy refusing an unrecognized model id turns every
+  provider launch into an outage. Operators wanting an unmeterable call refused
+  have a better per-policy lever: `failClosed: true` on a `cost_cap`.
+
+  Deciding it surfaced a real hole, now closed: admission returned `None` for an
+  unknown model and both call sites read that as $0, while billing charged the
+  catalog maximum. A cost cap could be walked past by naming a model the gateway
+  had never heard of. `pricing::reserve_request_cost` always yields, so
+  reserving and billing rest on the same assumption.
 - **`pricingVersion` on reservation records** — gateway side done (`8b4f7e4`).
   `AdmitRequest` and `SettlementUsage` carry it, and both native and Worker
   construction sites stamp `pricing::CATALOG_VERSION`; verified on the wire
