@@ -99,6 +99,15 @@ pub struct AdmitRequest {
     pub estimated_input_tokens: u64,
     pub maximum_output_tokens: u64,
     pub estimated_cost_usd: f64,
+    /// Version of the pricing catalog `estimated_cost_usd` was computed with.
+    ///
+    /// Rates change, and they change on a schedule the gateway applies without a
+    /// deploy. Without this, a hold is an amount with no way to reproduce how it
+    /// was arrived at, and a reservation taken under last week's catalog is
+    /// indistinguishable from one taken under this week's. Usage records already
+    /// carry it (`usage.rs`), so a reservation omitting it was the one gap in
+    /// the audit trail between estimating a cost and settling it.
+    pub pricing_version: Option<String>,
 }
 
 impl AdmitRequest {
@@ -114,6 +123,9 @@ impl AdmitRequest {
         });
         if let Some(p) = &self.provider {
             v["provider"] = Value::from(p.as_str());
+        }
+        if let Some(pv) = &self.pricing_version {
+            v["pricingVersion"] = Value::from(pv.as_str());
         }
         v
     }
@@ -139,6 +151,11 @@ pub struct SettlementUsage {
     pub request_count: u64,
     /// Idempotency key for the underlying usage record (optional server-side).
     pub event_id: Option<String>,
+    /// Pricing catalog version behind `cost_usd`. See
+    /// [`AdmitRequest::pricing_version`]. A reservation and its settlement can
+    /// legitimately disagree here, when a scheduled rate change lands between
+    /// the two, which is precisely why both carry it rather than one.
+    pub pricing_version: Option<String>,
 }
 
 /// How a held reservation is closed out.
@@ -180,6 +197,9 @@ impl Settlement {
                 }
                 if let Some(e) = &u.event_id {
                     v["eventId"] = Value::from(e.as_str());
+                }
+                if let Some(pv) = &u.pricing_version {
+                    v["pricingVersion"] = Value::from(pv.as_str());
                 }
                 if let Some(t) = timestamp {
                     v["timestamp"] = Value::from(t);
@@ -462,6 +482,7 @@ mod tests {
             estimated_input_tokens: 1200,
             maximum_output_tokens: 4096,
             estimated_cost_usd: 0.0051552,
+            pricing_version: Some("2026.08.12".into()),
         }
         .to_json();
         assert_eq!(v["requestId"], "req-1");
@@ -470,6 +491,10 @@ mod tests {
         assert_eq!(v["estimatedInputTokens"], 1200);
         assert_eq!(v["maximumOutputTokens"], 4096);
         assert_eq!(v["estimatedCostUsd"], 0.0051552);
+        assert_eq!(
+            v["pricingVersion"], "2026.08.12",
+            "a hold must record the catalog its estimate was priced with"
+        );
 
         let v = AdmitRequest {
             request_id: "req-2".into(),
@@ -478,9 +503,14 @@ mod tests {
             estimated_input_tokens: 0,
             maximum_output_tokens: 0,
             estimated_cost_usd: f64::NAN,
+            pricing_version: None,
         }
         .to_json();
         assert!(v.get("provider").is_none(), "provider is optional");
+        assert!(
+            v.get("pricingVersion").is_none(),
+            "an absent pricing version is OMITTED, never serialized as null"
+        );
         assert_eq!(v["estimatedCostUsd"], 0.0, "NaN must not become null");
     }
 
@@ -502,6 +532,7 @@ mod tests {
             cost_usd: 0.0031,
             request_count: 1,
             event_id: Some("evt-1".into()),
+            pricing_version: Some("2026.08.12".into()),
         }));
         assert_eq!(c.endpoint(), "complete");
         let v = c.to_json(Some("2026-08-12T00:00:00Z"));
@@ -511,6 +542,7 @@ mod tests {
         assert_eq!(v["requestCount"], 1);
         assert_eq!(v["model"], "gpt-4o");
         assert_eq!(v["eventId"], "evt-1");
+        assert_eq!(v["pricingVersion"], "2026.08.12");
         assert_eq!(v["timestamp"], "2026-08-12T00:00:00Z");
         // The timestamp is optional server-side; omitting it is still valid.
         assert!(c.to_json(None).get("timestamp").is_none());

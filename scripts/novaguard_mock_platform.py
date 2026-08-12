@@ -353,9 +353,11 @@ class Handler(BaseHTTPRequestHandler):
             _reservations[rid] = {"requestId": request_id, "costUsd": est, "state": "ACTIVE"}
             _by_request[request_id] = rid
             _reserved_usd += est
-            log("POST /admit -> 200 ALLOWED reservation=%s model=%s in=%s maxOut=%s est=$%.6f (held total $%.6f)"
+            log("POST /admit -> 200 ALLOWED reservation=%s model=%s in=%s maxOut=%s est=$%.6f "
+                "pricingVersion=%s (held total $%.6f)"
                 % (rid, req.get("model"), req.get("estimatedInputTokens"),
-                   req.get("maximumOutputTokens"), est, _reserved_usd))
+                   req.get("maximumOutputTokens"), est,
+                   req.get("pricingVersion", "ABSENT"), _reserved_usd))
             return self._send(200, {
                 "allowed": True,
                 "reservationId": rid,
@@ -397,9 +399,10 @@ class Handler(BaseHTTPRequestHandler):
                 _apply_cost(actual)
                 res["state"] = "COMPLETED"
                 log("POST /reservations/%s/complete -> 202  in=%s out=%s model=%s cost=$%.8f "
-                    "(estimate was $%.8f, released; project total $%.8f)"
+                    "pricingVersion=%s (estimate was $%.8f, released; project total $%.8f)"
                     % (rid, body.get("inputTokens"), body.get("outputTokens"),
-                       body.get("model"), actual, held, _state["cost"][WINDOW]))
+                       body.get("model"), actual, body.get("pricingVersion", "ABSENT"),
+                       held, _state["cost"][WINDOW]))
             elif endpoint == "abandon":
                 # The call may have reached the provider and no usage came back,
                 # so the conservative estimate STAYS applied.

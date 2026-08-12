@@ -746,6 +746,7 @@ async fn proxy(
                 maximum_output_tokens: max_out
                     .unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
                 estimated_cost_usd: est_cost,
+                pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
             };
             match worker_remote::admit(cfg, &request).await {
                 Admission::Allowed(res) => {

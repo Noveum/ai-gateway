@@ -120,6 +120,10 @@ expect_log "$TMP/p1.log" "stream_options.include_usage=True" \
 expect_log "$TMP/p1.log" "/complete -> 202  in=11 out=4" \
   "ctx.wait_until settled the reservation at the stream's TRUE usage (11 in / 4 out)"
 refute_log "$TMP/p1.log" "abandon" "nothing was abandoned on the happy path"
+# A cost with no record of the catalog behind it cannot be reproduced once rates
+# roll, and SCHEDULED_PRICING rolls them with no deploy.
+refute_log "$TMP/p1.log" "pricingVersion=ABSENT" \
+  "both the reservation and its settlement carried a pricingVersion"
 
 # ---------------------------------------------------------------------------
 say "Phase 2 -- a stream with no usage frame must ABANDON, never complete at 0"

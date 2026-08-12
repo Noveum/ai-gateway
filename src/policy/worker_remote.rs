@@ -289,6 +289,7 @@ pub fn settlement_for(outcome: StreamOutcome, model: &str, event_id: Option<Stri
                 cost_usd: cost,
                 request_count: 1,
                 event_id,
+                pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
             }))
         }
         StreamOutcome::EndedWithoutUsage => {
@@ -1086,68 +1087,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn admit_request_serializes_to_the_platform_shape() {
-        let v = AdmitRequest {
-            request_id: "req-1".into(),
-            provider: Some("openai".into()),
-            model: "gpt-5.6-luna".into(),
-            estimated_input_tokens: 1200,
-            maximum_output_tokens: 4096,
-            estimated_cost_usd: 0.0051552,
-        }
-        .to_json();
-        assert_eq!(v["requestId"], "req-1");
-        assert_eq!(v["provider"], "openai");
-        assert_eq!(v["estimatedInputTokens"], 1200);
-        assert_eq!(v["maximumOutputTokens"], 4096);
-        assert_eq!(v["estimatedCostUsd"], 0.0051552);
-
-        let v = AdmitRequest {
-            request_id: "req-2".into(),
-            provider: None,
-            model: "m".into(),
-            estimated_input_tokens: 0,
-            maximum_output_tokens: 0,
-            estimated_cost_usd: f64::NAN,
-        }
-        .to_json();
-        assert!(v.get("provider").is_none(), "provider is optional");
-        assert_eq!(v["estimatedCostUsd"], 0.0, "NaN must not become null");
-    }
-
     // -- settlement -----------------------------------------------------------
-
-    #[test]
-    fn settlement_bodies_and_endpoints_match_the_contract() {
-        let c = Settlement::Complete(Box::new(SettlementUsage {
-            model: Some("gpt-4o".into()),
-            input_tokens: 123,
-            output_tokens: 45,
-            cost_usd: 0.0031,
-            request_count: 1,
-            event_id: Some("evt-1".into()),
-        }));
-        assert_eq!(c.endpoint(), "complete");
-        let v = c.to_json(Some("2026-08-12T00:00:00Z"));
-        assert_eq!(v["inputTokens"], 123);
-        assert_eq!(v["outputTokens"], 45);
-        assert_eq!(v["costUsd"], 0.0031);
-        assert_eq!(v["requestCount"], 1);
-        assert_eq!(v["model"], "gpt-4o");
-        assert_eq!(v["eventId"], "evt-1");
-        assert_eq!(v["timestamp"], "2026-08-12T00:00:00Z");
-        // The timestamp is optional server-side; omitting it is still valid.
-        assert!(c.to_json(None).get("timestamp").is_none());
-
-        let a = Settlement::Abandon("stream ended without usage".into());
-        assert_eq!(a.endpoint(), "abandon");
-        assert_eq!(a.to_json(None)["reason"], "stream ended without usage");
-
-        let x = Settlement::Cancel("blocked before dispatch".into());
-        assert_eq!(x.endpoint(), "cancel");
-        assert_eq!(x.to_json(None)["reason"], "blocked before dispatch");
-    }
 
     #[test]
     fn authoritative_usage_completes_and_reconciles_the_cost() {
@@ -1168,6 +1108,34 @@ mod tests {
         assert_eq!(u.request_count, 1);
         assert_eq!(u.model.as_deref(), Some("gpt-4o"));
         assert!(u.cost_usd > 0.0, "a priced model must yield a real cost");
+    }
+
+    /// A settled cost without the catalog behind it cannot be reproduced once
+    /// rates roll, and `SCHEDULED_PRICING` rolls them with no deploy. The edge
+    /// must stamp the same catalog the native path does.
+    #[test]
+    fn a_completed_settlement_records_the_pricing_catalog_it_priced_with() {
+        let s = settlement_for(
+            StreamOutcome::Usage(ActualUsage {
+                input_tokens: 11,
+                output_tokens: 4,
+            }),
+            "gpt-4o",
+            None,
+        );
+        let Settlement::Complete(u) = &s else {
+            panic!("expected Complete, got {s:?}");
+        };
+        assert_eq!(
+            u.pricing_version.as_deref(),
+            Some(crate::policy::pricing::CATALOG_VERSION),
+            "the edge must stamp the same catalog version as the native path"
+        );
+        assert_eq!(
+            s.to_json(None)["pricingVersion"],
+            crate::policy::pricing::CATALOG_VERSION,
+            "and it must reach the wire"
+        );
     }
 
     /// A provider that explicitly reported zero completion tokens made a real

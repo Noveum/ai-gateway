@@ -251,6 +251,10 @@ pub async fn guard_middleware(
                 maximum_output_tokens: max_output_tokens
                     .unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
                 estimated_cost_usd: est_request_cost,
+                // The catalog the estimate above came from. Rates change on a
+                // schedule the gateway applies with no deploy, so without this
+                // a hold cannot be reproduced after the fact.
+                pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
             };
             match client.admit(&admit).await {
                 crate::policy::admission::Admission::Allowed(res) => {
@@ -494,6 +498,7 @@ pub async fn guard_middleware(
                     cost_usd: cost,
                     request_count: 1,
                     event_id: Some(crate::policy::usage::new_event_id()),
+                    pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
                 });
                 response
             }
@@ -670,6 +675,7 @@ impl Drop for StreamSettler {
                     cost_usd: cost,
                     request_count: 1,
                     event_id: Some(crate::policy::usage::new_event_id()),
+                    pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
                 });
             }
             None => {
