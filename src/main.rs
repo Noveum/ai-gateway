@@ -169,6 +169,10 @@ async fn main() {
         }
     );
 
+    // Kept out of `AppState` so the shutdown path below can flush whatever is
+    // still queued once the server stops accepting requests.
+    let usage_at_shutdown = usage.clone();
+
     // Build the router with the full middleware stack.
     info!("Registering request handlers and API routes");
     let state = AppState::new(
@@ -227,6 +231,49 @@ async fn main() {
         error!("Server error: {}", e);
         std::process::exit(1);
     });
+
+    // In-flight requests have finished; nothing new can be enqueued. Push the
+    // remaining usage records to the platform before the process exits, so a
+    // rolling restart doesn't silently lose billable events. Bounded by
+    // `SHUTDOWN_FLUSH_BUDGET`: an unresponsive platform delays exit by at most
+    // that long, it can never hang the shutdown.
+    flush_usage_on_shutdown(usage_at_shutdown).await;
+}
+
+/// Drain the Nova Guard usage queue on graceful shutdown, under a fixed budget.
+async fn flush_usage_on_shutdown(
+    reporter: Option<noveum_ai_gateway::policy::usage::UsageReporter>,
+) {
+    use noveum_ai_gateway::policy::usage::SHUTDOWN_FLUSH_BUDGET;
+
+    let Some(reporter) = reporter else {
+        return; // no platform bridge configured → nothing to report
+    };
+    let queued = reporter.pending_events();
+    if queued > 0 {
+        info!(
+            queued,
+            timeout_secs = SHUTDOWN_FLUSH_BUDGET.as_secs(),
+            "Nova Guard: flushing queued usage events before exit"
+        );
+    }
+    let outcome = reporter.shutdown(SHUTDOWN_FLUSH_BUDGET).await;
+    if outcome.timed_out || outcome.pending > 0 || outcome.failed > 0 {
+        error!(
+            delivered = outcome.delivered,
+            failed = outcome.failed,
+            pending = outcome.pending,
+            timed_out = outcome.timed_out,
+            dropped_total = reporter.dropped_events(),
+            "Nova Guard: usage flush incomplete at shutdown; some events were not reported"
+        );
+    } else if outcome.delivered > 0 {
+        info!(
+            delivered = outcome.delivered,
+            dropped_total = reporter.dropped_events(),
+            "Nova Guard: usage flushed at shutdown"
+        );
+    }
 }
 
 async fn print_banner() {

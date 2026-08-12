@@ -207,6 +207,46 @@ async fn usage_reporter_posts_allowed_and_blocked_shapes() {
     assert_eq!(blocked["costUsd"], 0.0);
 }
 
+/// A rolling restart must not strand queued usage: `shutdown()` drains whatever
+/// the periodic flush never got to.
+///
+/// Deterministic without touching `NOVEUM_GUARD_USAGE_FLUSH_MS`: `#[tokio::test]`
+/// runs on a current-thread runtime and nothing between `spawn` and `shutdown`
+/// awaits, so the background flush task is not polled until after `shutdown()`
+/// has closed the queue — every event here is delivered by the shutdown drain.
+#[tokio::test]
+async fn shutdown_flushes_queued_usage_events() {
+    let server = MockServer::start().await;
+    mount_usage_ok(&server).await;
+
+    let reporter = UsageReporter::spawn(cfg(&server.uri()));
+    reporter.report(UsageEvent::allowed(new_event_id(), "gpt-4o", 0.01, 20, 8));
+    reporter.report(UsageEvent::blocked(
+        new_event_id(),
+        "gpt-4o",
+        "RATE_LIMIT",
+        None,
+        None,
+    ));
+    assert_eq!(reporter.pending_events(), 2, "queued, not yet flushed");
+
+    let outcome = reporter.shutdown(Duration::from_secs(5)).await;
+
+    assert!(!outcome.timed_out, "mock server answers immediately");
+    assert_eq!(outcome.delivered, 2, "shutdown drained both events");
+    assert_eq!(outcome.failed, 0);
+    assert_eq!(outcome.pending, 0);
+
+    let events = wait_for_usage(&server, &usage_path(), 2, Duration::from_secs(5)).await;
+    assert_eq!(events.len(), 2, "both events reached the platform");
+
+    // After shutdown the queue is closed: late events are rejected and counted
+    // rather than silently accepted into a queue nothing will drain.
+    reporter.report(UsageEvent::allowed(new_event_id(), "gpt-4o", 0.5, 1, 1));
+    assert_eq!(reporter.pending_events(), 0);
+    assert_eq!(reporter.dropped_events(), 1);
+}
+
 #[tokio::test]
 async fn allowed_exporter_reports_successful_call() {
     std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
