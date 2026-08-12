@@ -22,16 +22,20 @@ Gateway (`export PATH="$HOME/.cargo/bin:$PATH"`):
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --target wasm32-unknown-unknown --lib --all-features -- -D warnings
-cargo test --lib               # 392  (was 236)
+cargo test --lib               # 395  (was 236)
 cargo test --test novaguard_platform   # 51  (was 18)
 cargo test --test policy_integration   # 12  (was 10)
 python3 codegen/generate_policy_types.py --check
 python3 scripts/gen_pricing.py --platform-repo ../noveum-app-nextjs --check
 worker-build --release
 npx wrangler@4.120.0 deploy --dry-run          # needs Node >= 22
+
+# Live workerd, hermetic. NODE_BIN_DIR=... if node < 22 is first on PATH.
+scripts/novaguard_worker_e2e.sh                # 18 assertions, 4 phases
 ```
 
-455 gateway tests, up from 264.
+458 gateway tests, up from 264, plus 18 live-edge assertions that no amount of
+`cargo test` can replace.
 
 Platform (`export PATH="$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"`):
 
@@ -48,46 +52,79 @@ with real data** — additive test rows only, never mutate existing ones.
 
 ## What is NOT done
 
-### 1. NOV-132 unwrap audit — not started
+### 1. NOV-132 unwrap audit — catalogued; fixes on a stacked branch
 
-~175 `.unwrap()` in `src/`. The crate builds with `panic = "abort"`, so a
-failing unwrap on a request path kills the process and drops every in-flight
-request on that replica. Deliberately scheduled last because it touches every
-file and would have conflicted with all the parallel work; it is now unblocked
-because the tree is quiet.
+**Done:** `docs/NOV_132_UNWRAP_AUDIT.md` classifies every panicking call in
+`src/` by reachability. The raw grep finds 331; 313 are inside `#[cfg(test)]`
+modules, leaving **36 in production code** (9 `.unwrap()`, 26 `.expect()`, 1
+`panic!`). Two structural findings retire most of the list: `panic = "abort"`
+makes a `std::sync::Mutex` unpoisonable, and nearly every `Builder::body()` in
+the tree is fed constant statuses and `&'static str` headers.
 
-Catalogue the unwraps reachable from a request path, replace with explicit
-error handling or justify as unreachable, and add `clippy::unwrap_used` scoped
-to request-path modules so new ones cannot appear. Note `src/main.rs:207`
-(`.expect("Failed to bind address")`) is startup, not request path — that one
-is fine.
+Three sites can fire on a request path, one reachable today — `remote.rs:38`
+(`PLATFORM_CLIENT` is a `Lazy` that shared mode does not force at boot, so a
+TLS-init failure aborts the replica on its first request, after readiness
+passed), `proxy/client.rs:31`/`:49` (same shape), and `synthetic.rs:121` (the
+only builder fed a platform-controlled header value).
 
-### 2. Section 6.4 documentation — implementation landed, docs did not
+**Not done:** the code changes. They are held out of PR #30 at the reviewer's
+request and belong on `fix/nov-132-unwrap-audit`, which is stacked on this
+branch — they touch `remote.rs` and `middleware.rs`, so branching from `main`
+would conflict. The regression guard is
+`#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]` in
+`lib.rs`; denying `expect_used` too is the point, since 26 of the 36 are
+`.expect`. `src/main.rs` is a separate crate root and stays uncovered, which is
+correct — startup is where an abort is the right behaviour.
 
-`README.md`, `k8/ai-gateway.yaml` and `docs/NOVA_GUARD.md` still describe
-dedicated-project-only scope. They are accurate for dedicated mode and silent
-about shared mode. **Do not enable shared mode on `gateway.noveum.ai` on the
-strength of commit `9910c36` alone** — document the two modes, which one the
-shared public deployment requires, and the key permissions
-(`guardrails:read`, `guardrails:ingest`) first. The agent was terminated by a
-session limit before this pass.
+### 2. Section 6.4 documentation — done (`3f1041e`)
 
-### 3. Worker bridge is unproven against a live edge
+`README.md`, `docs/NOVA_GUARD.md`, `k8/ai-gateway.yaml` and
+`docs/CLOUDFLARE_WORKER.md` now document both modes side by side, which one the
+shared public deployment needs, and the key permissions as a table
+(`guardrails:read` + `guardrails:ingest` in both modes, `projects:read` in
+shared, where there is no process-wide key at all).
 
-`worker_remote.rs` has 21 native tests covering every decision, and
-`worker-build --release` plus `wrangler deploy --dry-run` both pass. There are
-**no** `wasm-bindgen-test` / `worker` integration tests. The `worker::Fetch`
-plumbing, `ctx.wait_until` behaviour and the stream tee under a real `workerd`
-are proven only by compilation. Before shipping: `wrangler dev`, drive a real
-streamed completion through it, and confirm a reservation actually settles.
+Two stale claims were corrected while verifying the rest against the source:
+both README and NOVA_GUARD.md still said a cross-replica guarantee "needs a
+platform-side atomic reservation, which the API does not offer yet" — it does,
+and strict mode uses it.
 
-### 4. Duplication to unify
+One real gap was found and fixed: `worker_rt.rs` never read
+`NOVEUM_GUARD_TENANCY`, so `shared` on a Worker was **silently ignored** and
+served a transparent proxy on a deployment its operator believed enforced
+per-tenant caps. It now answers 503 `gateway_configuration_error`.
 
-`classify_admit`, the settlement request bodies and the credential matrix are
-duplicated between `src/policy/admission.rs` (native, `reqwest`) and
-`src/policy/worker_remote.rs` (wasm, `worker::Fetch`), because both native
-modules are `reqwest`-bound at module level. Hoist the pure halves into a
-shared wasm-safe module alongside `src/policy/metering.rs`.
+### 3. Worker bridge — proven against a live edge (`0e4b8e3`)
+
+`scripts/novaguard_worker_e2e.sh` drives the Worker inside real `workerd` via
+`wrangler dev`, hermetically (no Cloudflare account, no backend, no provider
+key — the bundled mock plays both the control plane and the OpenAI upstream).
+18 assertions across four phases, each on a fresh isolate.
+
+Phase 1 is the one to read: a `gpt-4o` request with `max_tokens: 4096` reserves
+`$0.040965` and settles at `$0.0000675`, because the tee recovered 11 in / 4 out
+from the terminal usage frame — and the settlement lands *after* the body
+completes, which is `ctx.wait_until` working. Phases 2 to 4 cover abandon-on-no-
+usage, 503-is-never-an-allow, and the HTTP-200 block.
+
+Two things were needed to make it testable: `ProviderRoute.base_url` was a
+compile-time `&'static str`, so the Worker now honors `OPENAI_BASE_URL` like the
+native side (sharing one normalization rule); and the mock gained `/admit`,
+the three settlement endpoints and an SSE mode.
+
+**Remaining gap:** `StreamOutcome::Dropped` is still unproven. Cutting the client
+off mid-stream does not reach it, because `workerd` drains the upstream to EOF
+anyway, so the tee still recovers authoritative usage and correctly completes.
+
+### 4. Duplication — unified (`b2112fd`)
+
+`src/policy/admission_wire.rs` is now the single definition of the admission
+wire contract, re-exported by both clients. 791 lines deleted. `truncate_body`
+had a third copy in `remote.rs`; that one re-exports too.
+
+`WorkerRemoteConfig::from_values` deliberately did **not** move: it mirrors the
+native `RemoteConfig::from_values` because the two must agree on what a
+half-applied secret set *means*, not because they are the same code.
 
 ### 5. Prisma `PolicyType` migration — written, not applied
 
@@ -133,11 +170,20 @@ check-building as admission and reserves nothing.
   fix is making those placeholders resolvable rather than weakening the
   assumption. Orbit marks this `blocked_by` NOV-135.
 - **Reject vs price-high** for unknown models. Today: allowed and priced high.
-- **`pricingVersion` on reservation records** is half-done. Usage records carry
-  it; `AdmitRequest`/`SettlementUsage` do not. `pricing::CATALOG_VERSION` and
-  `reserve_request_breakdown(...)` are ready — it needs one field on
-  `AdmitRequest`, one line in its `to_json`, and one at the construction site
-  in `middleware.rs`.
+- **`pricingVersion` on reservation records** — gateway side done (`8b4f7e4`).
+  `AdmitRequest` and `SettlementUsage` carry it, and both native and Worker
+  construction sites stamp `pricing::CATALOG_VERSION`; verified on the wire
+  through `wrangler dev`, not just in tests.
+
+  **It is inert until the platform accepts it**, and this is the same shape as
+  the `enforcementMode` bug above. The platform's `admitRequestSchema` and
+  `completeReservationSchema` are plain `z.object(...)`, so Zod **strips** the
+  key at ingress, and there is no column for it — `GuardrailUsageEvent` has no
+  `pricingVersion` field in `schema.prisma`. That also corrects an earlier note
+  here: "usage records carry it" was true of the gateway's outbound payload
+  only; `/usage` has been sending a field the platform discards. Landing this
+  end to end needs a platform schema change plus an additive migration, and the
+  migration is blocked on the same decision as `POLICY_TYPE_MIGRATION.md`.
 
 ### 8. Deployment order is mandatory
 
