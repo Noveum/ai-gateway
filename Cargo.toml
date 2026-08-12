@@ -37,7 +37,25 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+# MUST stay "debuginfo" — do NOT change back to `true`/"symbols".
+#
+# `strip = true` means `strip = "symbols"`, which on wasm32 tells wasm-ld to drop
+# *every* custom section, including `target_features`. That section is not debug
+# info: it is the record of which WebAssembly proposals the module was compiled
+# with. wasm-bindgen reads it (`Bindgen::update_config`) and only enables its
+# externref transform when it sees `reference-types` there. With the section
+# stripped, wasm-bindgen silently leaves externref off, never creates the
+# externref table, and then `worker-build --release` — which passes
+# `--force-enable-abort-handler` so Rust panics surface as JS errors instead of
+# killing the isolate — dies with:
+#     error: failed to generate catch wrappers
+#     Caused by: externref table required for catch wrappers
+#
+# "debuginfo" strips DWARF only, so `target_features` survives and the Worker
+# build keeps panic recovery. The native side loses nothing that ships: `debug`
+# is already false, and the Dockerfile runs `strip` on the binary itself, so the
+# released image is byte-for-byte as small as before.
+strip = "debuginfo"
 debug = false
 
 # One package, three deployment shapes:

@@ -35,6 +35,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # NOV-107: `schema/novaguard-policy.v1.json` is the single source of truth
+      # for the NovaGuard policy contract. Everything derived from it is
+      # generated, and this step fails if a checked-in artifact does not match
+      # what the generator produces — including the case where someone adds a
+      # policy type to `src/policy/policy_types.generated.rs` by hand instead of
+      # to the schema. It runs BEFORE the build so the failure names the real
+      # cause rather than surfacing as a confusing compile error.
+      #
+      # The platform repo is not checked out here, so only the Rust artifact is
+      # verified; the TypeScript side is verified by the platform's own
+      # `schemas.drift.test.ts`, which re-checks the vendored schema's sha256
+      # against the one embedded in its generated module.
+      - name: Policy schema codegen is up to date
+        run: python3 codegen/generate_policy_types.py --check
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -131,8 +146,42 @@ jobs:
       # Compiles the crate for wasm32 and generates the JS shim. This is what
       # catches a change that builds natively but breaks the edge target (a
       # `tokio`/`reqwest` import leaking into shared code, say).
+      #
+      # Plain `--release`, deliberately: worker-build passes
+      # `--force-enable-abort-handler` on this path so a Rust panic comes back
+      # as a JS error instead of killing the isolate. Do NOT "fix" a failure
+      # here by adding `--no-panic-recovery` — that makes the build go green by
+      # throwing panic recovery away. The usual cause is [profile.release]
+      # `strip` being set back to `true`, which drops the `target_features`
+      # custom section that wasm-bindgen needs to enable externref. See the
+      # comment on `strip` in Cargo.toml.
       - name: worker-build --release
         run: worker-build --release
+
+      # The failure above is loud, but the *regression* this guards against is
+      # silent: if panic recovery is ever quietly disabled, the Worker still
+      # builds and still deploys — it just starts tearing down the isolate on
+      # any panic instead of returning an error. Assert the machinery is really
+      # in the artifact rather than trusting that the build command is intact.
+      - name: Assert the Worker bundle kept panic recovery
+        run: |
+          set -euo pipefail
+          fail=0
+          # Custom section wasm-bindgen reads to decide whether externref is on.
+          for sym in target_features __externref_table_alloc __wbindgen_exn_store; do
+            if ! grep -qa "$sym" build/index_bg.wasm; then
+              echo "::error::missing '$sym' in build/index_bg.wasm — panic recovery is not wired up"
+              fail=1
+            fi
+          done
+          # JS glue side of the catch wrappers.
+          for sym in JSTag abort_handler; do
+            if ! grep -qa "$sym" build/index.js; then
+              echo "::error::missing '$sym' in build/index.js — panic recovery is not wired up"
+              fail=1
+            fi
+          done
+          exit "$fail"
 
       # Validates wrangler.toml and the generated bundle without publishing.
       - name: wrangler deploy --dry-run

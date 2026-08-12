@@ -7,11 +7,29 @@
 # The native binary / Docker image (the published `noveum-ai-gateway` crate) is
 # unaffected by this file — it is a separate deployment shape of the same package.
 name = "noveum-ai-gateway"
-main = "build/worker/shim.mjs"
-compatibility_date = "2024-11-01"
+# `build/index.js` is the canonical entry point emitted by worker-build. The
+# older `build/worker/shim.mjs` still exists but is only a re-export alias that
+# worker-build keeps for backwards compatibility, so point at the real thing.
+main = "build/index.js"
+# Bumped from "2024-11-01". Pinned to the compatibility date of the workerd
+# bundled with the wrangler version CI pins (wrangler 4.120.0 → workerd
+# 1.20260801.1); a later date would out-run the local runtime and make
+# `wrangler dev` disagree with production. Raise this and the pinned wrangler
+# version together, never one alone.
+compatibility_date = "2026-08-01"
 
 [build]
+# Requires `strip = "debuginfo"` (NOT `true`) in [profile.release] — see the
+# comment there. With `strip = true` this command fails in wasm-bindgen with
+# "externref table required for catch wrappers".
 command = "worker-build --release"
+
+# Workers Logs. Without this, a panic or a 5xx at the edge leaves no trace you
+# can query after the fact. head_sampling_rate = 1 keeps every request; lower it
+# if log volume becomes a cost problem.
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 # Nova Guard configuration. The checked-in default is a TRANSPARENT proxy:
 # no policies are loaded, so `wrangler dev`/`wrangler deploy` will not mutate or
@@ -28,5 +46,39 @@ command = "worker-build --release"
 #     {"name":"redact-input-phone","type":"regex_match","mode":"enforce","config":{"phase":"input","patterns":[{"name":"phone","regex":"\\d{3}-\\d{3}-\\d{4}"}],"action":"redact","redactWith":"[PHONE]"}},
 #     {"name":"redact-output-email","type":"regex_match","mode":"enforce","config":{"phase":"output","patterns":[{"name":"email","regex":"[\\w.+-]+@[\\w-]+\\.[\\w.-]+"}],"action":"redact","redactWith":"[EMAIL]"}}
 #   ]}'
+
+# ---------------------------------------------------------------------------
+# Bindings and secrets
+# ---------------------------------------------------------------------------
+# This Worker needs NO Cloudflare resource bindings — no KV, no D1, no R2, no
+# Durable Objects, no queues. `wrangler deploy --dry-run` printing "No bindings
+# found." is the expected, correct output, not a misconfiguration.
+#
+# Provider credentials are NOT stored here. The gateway is a pass-through proxy:
+# the caller's own provider key rides in on the request (`Authorization` /
+# `x-api-key`) and is forwarded upstream. Do not add provider keys as secrets —
+# that would turn a per-caller proxy into a shared, unmetered credential.
+#
+# Recognised environment variables (all optional, all plain `[vars]` except
+# where noted). The runtime reads each via `env.secret(k)` first and falls back
+# to `env.var(k)`, so any of them may instead be set with `wrangler secret put`:
+#
+#   NOVEUM_GUARD_ENABLED            "true"/"false". Master switch.
+#   NOVEUM_GUARD_POLICIES           Inline policy JSON (same schema as the
+#                                   native `nova-guard.json`). Prefer
+#                                   `wrangler secret put NOVEUM_GUARD_POLICIES`
+#                                   when the patterns themselves are sensitive.
+#   NOVEUM_GUARD_BLOCK_RESPONSE_MODE  `guard_error` | `provider_error`.
+#
+# NOT supported on this target — the Worker returns an explicit error instead of
+# proxying unenforced traffic if either is set:
+#
+#   NOVEUM_API_KEY
+#   NOVEUM_GUARD_PROJECT_ID
+#
+# Platform-managed Nova Guard (remote policy fetch, live cost/rate state, usage
+# reporting, admission ledger) is native-only and is not compiled for wasm32.
+# Use an inline `NOVEUM_GUARD_POLICIES` bundle of stateless text policies here,
+# or deploy the native gateway.
 [vars]
 # (no NOVEUM_GUARD_POLICIES → transparent proxy; set it to enable Nova Guard)
