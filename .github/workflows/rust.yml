@@ -18,6 +18,8 @@ env:
   # Pinned so a new upstream release can't change what the gate builds.
   WORKER_BUILD_VERSION: "0.8.5"
   WRANGLER_VERSION: "4.120.0"
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
   native:
@@ -56,6 +58,53 @@ jobs:
 
       - name: Reject whitespace errors in the diff
         run: git diff --check
+
+  supply-chain:
+    name: Supply chain (advisories, licences, bans)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: supply-chain
+
+      # NOV-102: the Dockerfile does `COPY Cargo.toml Cargo.lock ./`, so an
+      # untracked lockfile makes `docker build` fail on a fresh clone. Both
+      # tools below also read Cargo.lock, so if it ever stops being committed
+      # they would be auditing a tree resolved on the fly rather than the one
+      # we ship. `--locked` additionally fails if the lockfile is stale
+      # relative to Cargo.toml.
+      - name: Cargo.lock is committed and current
+        run: |
+          git ls-files --error-unmatch Cargo.lock
+          cargo metadata --locked --format-version 1 > /dev/null
+
+      # Versions are pinned (see env above) so a new release of either tool
+      # cannot turn the gate red — or, worse, quietly green — on its own.
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked
+          cargo install cargo-deny --version "${CARGO_DENY_VERSION}" --locked
+
+      # `--deny warnings` is what stops this from silently passing: cargo-audit
+      # exits 0 on unmaintained/unsound findings by default. The two `--ignore`
+      # IDs are the waivers documented in deny.toml — deny.toml is the source of
+      # truth for *why* they are waived, and the two lists must stay in sync.
+      # Any advisory that is not one of those two fails the job.
+      - name: cargo audit
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2021-0141 \
+            --ignore RUSTSEC-2023-0086
+
+      # All four checks run explicitly rather than relying on defaults, so
+      # dropping one has to be a visible edit to this file.
+      - name: cargo deny
+        run: cargo deny check advisories licenses bans sources
 
   worker:
     name: Build and dry-run the Cloudflare Worker

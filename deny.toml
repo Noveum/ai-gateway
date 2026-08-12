@@ -1,0 +1,110 @@
+# cargo-deny policy for noveum-ai-gateway.
+#
+# This is the supply-chain half of the PR gate (see .github/workflows/rust.yml).
+# `cargo deny check advisories licenses bans sources` has to pass, so every
+# entry below is deliberate — an allowance added here should come with the
+# reason it is safe, otherwise the gate quietly stops meaning anything.
+#
+# Regenerate the licence facts behind this file with:
+#   cargo deny list
+
+[graph]
+# Evaluate every feature: the crate ships both a native binary and a
+# wasm32 Cloudflare Worker, and features gate real dependencies. Checking the
+# default feature set only would leave part of the shipped tree unaudited.
+all-features = true
+
+# `targets` is deliberately left unset. Restricting it would drop
+# platform-specific crates from the graph, and this crate is built for
+# x86_64-unknown-linux-gnu (Docker), wasm32-unknown-unknown (Worker) and
+# macOS (local dev). Unset means cargo-deny considers all of them.
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Security vulnerabilities are always denied and cannot be downgraded here —
+# that is the point of the gate.
+# `unmaintained` and `unsound` both default to "workspace", which only looks at
+# our own direct dependencies. Both are widened to "all" so a problem that
+# arrives deep in the transitive tree still fails the build: that is exactly
+# where this kind of rot goes unnoticed. (Without this, RUSTSEC-2023-0086 below
+# is silently skipped.)
+unmaintained = "all"
+unsound = "all"
+# A yanked dependency means the lockfile pins something the publisher pulled.
+yanked = "deny"
+
+# Waivers. Every entry needs a reason and a way out — an unexplained ID here
+# turns the gate into decoration. Neither of the two below has a fix that is
+# available today; both are tracked as follow-up work (NOV-102 follow-ups).
+ignore = [
+    { id = "RUSTSEC-2021-0141", reason = "dotenv 0.15.0 is unmaintained. It is a direct dependency (Cargo.toml, cfg(not(wasm32))) used only to load a .env file at startup; it parses a local, operator-supplied file, not untrusted input, and the advisory reports no vulnerability. The fix is to migrate to the maintained `dotenvy` fork, which is a near drop-in rename and touches src/ — deliberately out of scope for the lockfile/supply-chain change. FOLLOW-UP: migrate to dotenvy and delete this waiver." },
+    { id = "RUSTSEC-2023-0086", reason = "lexical-core 0.7.6 has multiple soundness issues, patched in >= 1.0.0. We do not depend on it directly: it arrives transitively via aws_event_stream_parser 0.1.2 -> nom 5.1.3, and nom only moved off lexical-core in 7.x. No upgrade of our own dependencies resolves it, so the real fix is replacing or forking aws_event_stream_parser (it is used for AWS Bedrock event-stream decoding). FOLLOW-UP: re-check when aws_event_stream_parser publishes a nom 7+ release, then delete this waiver." },
+]
+
+[licenses]
+# Explicit allow-list derived from the actual dependency tree, not a template.
+# Anything outside this list fails the build and needs a human decision.
+allow = [
+    # The overwhelming majority of the tree is dual MIT/Apache-2.0.
+    "MIT",
+    "Apache-2.0",
+    # BSD-3-Clause: alloc-no-stdlib, alloc-stdlib, subtle, and the
+    # `BSD-3-Clause AND MIT` half of brotli (pulled in by reqwest's brotli).
+    "BSD-3-Clause",
+    # ISC: rustls-webpki, untrusted, and the `Apache-2.0 AND ISC` half of ring.
+    # The whole TLS stack needs this one.
+    "ISC",
+    # Unicode-3.0: the ICU/zerovec stack behind idna/url, plus unicode-ident.
+    # Permissive, and the successor to the old Unicode-DFS-2016 licence.
+    "Unicode-3.0",
+    # Zlib: foldhash (hashbrown's default hasher). Permissive, no notice
+    # requirement beyond not misrepresenting the origin.
+    "Zlib",
+    # MIT-0: borrow-or-share. MIT without the attribution clause.
+    "MIT-0",
+]
+
+# Refuse to guess when a licence is only detected by scanning a LICENSE file.
+confidence-threshold = 0.93
+
+# Per-crate exceptions. These licences are acceptable *for these crates only* —
+# a new dependency arriving under the same licence still fails the gate and
+# gets reviewed on its own merits.
+
+# webpki-roots is the Mozilla CA root store, redistributed under
+# CDLA-Permissive-2.0. It is data, not code: permissive, no copyleft, no
+# reciprocal obligation on our binary. Allowing it tree-wide would be too
+# broad, so it is scoped here.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+# colored is MPL-2.0, the only weak-copyleft crate in the tree, and it *is*
+# linked into the shipped native binary (Cargo.toml, cfg(not(wasm32))
+# dependencies), not just tests. MPL-2.0 copyleft is per-file: it obliges us to
+# publish modifications to colored's own source files, and we vendor no patches
+# to it. It places no obligation on our sources. Acceptable as-is; if we ever
+# need to fork or patch colored, that fork must be published.
+[[licenses.exceptions]]
+crate = "colored"
+allow = ["MPL-2.0"]
+
+[bans]
+# Duplicate versions are a warning, not an error: with a tree this size a
+# transitive bump routinely lands two majors of the same crate, and failing on
+# it would train people to ignore the gate. Warnings still show in the log.
+multiple-versions = "warn"
+# A wildcard version is an unpinned supply-chain hole. The tree has none today
+# (verified against Cargo.toml), so hold that line.
+wildcards = "deny"
+# Prefer the highest version when the same crate appears twice, so the warning
+# above points at the laggard.
+highlight = "all"
+
+[sources]
+# Every dependency currently resolves to crates.io (verified against
+# Cargo.lock). Anything else — a git dependency or a private registry — is a
+# supply-chain change that should be argued for in review, not slipped in.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
