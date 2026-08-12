@@ -142,44 +142,134 @@ PORT=8080 noveum-ai-gateway
 | `NOVEUM_GUARD_POLICIES_FILE` | — | Path to a local `nova-guard.json` policy bundle |
 | `NOVEUM_GUARD_POLICIES` | — | Inline JSON policy bundle (alternative to the file) |
 | `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` or `provider_error` |
-| `NOVEUM_API_KEY` | — | Noveum platform API key: with `NOVEUM_GUARD_PROJECT_ID`, activates platform-managed Nova Guard (policies + live cost/rate state fetched from the platform, usage reported back). Native gateway only — the Cloudflare Worker rejects this configuration |
-| `NOVEUM_GUARD_PROJECT_ID` | — | Noveum project whose Nova Guard policies to enforce |
-| `NOVEUM_API_URL` | `https://api.noveum.ai` | Platform API base URL |
+| `NOVEUM_GUARD_TENANCY` | _(unset)_ | Deployment mode of the platform bridge: `dedicated` (one process-wide project) or `shared` (project + organization derived per request from the caller's credential). Unset keeps the historical inference — the `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` pair means dedicated. **Shared is never inferred**; it is only ever entered by asking for it |
+| `NOVEUM_API_KEY` | — | Noveum platform API key. **Dedicated mode only** — with `NOVEUM_GUARD_PROJECT_ID` it activates platform-managed Nova Guard (policies + live cost/rate state fetched from the platform, usage reported back). Setting it alongside `NOVEUM_GUARD_TENANCY=shared` is a startup error. Native gateway only — the Cloudflare Worker rejects the shared configuration |
+| `NOVEUM_GUARD_PROJECT_ID` | — | Noveum project whose Nova Guard policies to enforce. **Dedicated mode only**; mutually exclusive with `NOVEUM_GUARD_TENANCY=shared` |
+| `NOVEUM_API_URL` | `https://api.noveum.ai` | Platform API base URL (both modes) |
+| `NOVEUM_GUARD_TENANT_TTL_SECS` | `300` | Shared mode: how long one credential→tenant resolution is reused. Matches the platform's own API-key cache, so the gateway is never *more* stale than the control plane it mirrors |
+| `NOVEUM_GUARD_TENANT_CACHE_MAX` | `1024` | Shared mode: how many distinct tenants one process keeps warm (compiled policies, counters, reservations). A tenant idle for 10 minutes is dropped, which is also what makes a revoked credential self-heal |
 | `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Assumed completion size for cost/rate admission when a request sets no `max_tokens`. Raise it for stricter (earlier-blocking) hard-cap admission of unbounded requests |
 | `NOVEUM_GUARD_ALLOW_UNGUARDED_START` | `false` | **Emergency use only.** Lets the gateway start when the first platform policy fetch fails, serving traffic with *no* enforcement until a later poll succeeds. Without it, that failure aborts startup |
 
-### Platform-managed Nova Guard: supported deployment scope
+### Platform-managed Nova Guard: the two deployment modes
 
-Platform-managed Nova Guard is currently a **beta for a native, dedicated
-single-project gateway**. Read this before enabling it anywhere.
+Platform-managed Nova Guard runs in one of **two mutually exclusive modes**,
+selected by `NOVEUM_GUARD_TENANCY`. Which one you need is decided by a single
+question: *does this deployment serve more than one tenant?*
 
-- **One deployment enforces exactly one project.** `NOVEUM_GUARD_PROJECT_ID` is
-  process-wide, so every request a replica handles is metered and capped against
-  that one project — regardless of who sent it.
-- **Do not enable it on a shared/multi-tenant gateway.** Setting a single project
-  ID on a deployment that serves several tenants (such as the public
-  `gateway.noveum.ai`) would bill and cap all of their traffic against one
-  project. Tenant identity derived server-side from the caller's credentials is
-  planned for a follow-up change; until then, run a dedicated deployment per
-  project.
-- **Caller-supplied routing headers are not identity.** `x-project-id` /
-  `x-organization-id` from a client are never trusted as tenant identity.
-- **Use a scoped Noveum service key** with `guardrails:read` (policies + state)
-  and `guardrails:ingest` (usage reporting) — not a personal or full-access key.
-- **Native only.** The Cloudflare Worker returns a 503
-  `gateway_configuration_error` for platform-managed Nova Guard and for *any*
-  inline `cost_cap` / `rate_limit` policy, rather than accepting the
-  configuration and enforcing nothing — see
-  [docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md#nova-guard-scope-on-the-worker-stateless-policies-only).
+| | **Dedicated** | **Shared** |
+|---|---|---|
+| `NOVEUM_GUARD_TENANCY` | `dedicated`, or unset | `shared` |
+| Tenant identity | fixed by the environment | derived per request from the caller's credential |
+| `NOVEUM_API_KEY` | **required** (one process-wide service key) | **must be unset** |
+| `NOVEUM_GUARD_PROJECT_ID` | **required** | **must be unset** |
+| Caller must authenticate to the gateway | no | **yes**, `x-noveum-api-key` on every `/v1/*` request |
+| Local policy bundle alongside it | allowed | **refused at startup** |
+| Use it for | one team's own gateway | a gateway serving several tenants, e.g. `gateway.noveum.ai` |
 
-> **Cost and rate caps are per-process, estimate-based admission — not a strict
-> cross-replica hard cap.** Each instance reserves against reported spend plus
-> its own in-flight estimate. Usage is reported asynchronously and `/state` is
-> cached, so a cap can be briefly overshot by roughly the cost of the requests
-> admitted in that window *per replica*, and a request with no `max_tokens` is
-> admitted against the `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` heuristic rather than
-> its true output size. A strict guarantee across replicas needs a platform-side
-> atomic reservation, which the API does not offer yet.
+Setting both modes' variables at once is a startup error rather than a
+precedence rule — which mode wins is exactly the kind of question that must
+never be answered silently.
+
+#### Dedicated mode
+
+`NOVEUM_GUARD_PROJECT_ID` is process-wide, so **every request a replica handles
+is metered and capped against that one project, regardless of who sent it.**
+That is correct for a gateway fronting a single team, and wrong for anything
+else. Policies are fetched once at startup (a failed first fetch aborts
+startup) and refreshed by a background poller.
+
+#### Shared mode
+
+Every `/v1/*` caller authenticates to the gateway with its own Noveum API key,
+and the project + organization to enforce against are derived **server-side**
+from that credential. Each derived tenant gets its own isolated runtime:
+compiled policies, live counters, reservations, usage reporting and cache
+entries are all keyed by the derived tenant, never by anything the client sent.
+
+- **The credential goes in `x-noveum-api-key`**, not `Authorization` — on this
+  gateway `Authorization` already carries the caller's *provider* key and is
+  forwarded upstream. The tenancy layer **removes** `x-noveum-api-key` from the
+  request before proxying, so a tenant's Noveum credential never reaches
+  OpenAI, Anthropic or any other provider. A `Bearer ` prefix is tolerated.
+- **Routing headers are filters, never identity.** `x-project-id` may only
+  *select among* the projects the credential is already entitled to; naming any
+  other project is **rejected**, not silently overridden. `x-organization-id`
+  (either spelling) is checked against the derived organization and must match.
+  With no `x-project-id` and exactly one entitled project, that project is
+  used; with several, the request is refused rather than metered against a
+  guess.
+- **Every resolution failure fails closed.** An unusable, unverifiable or
+  unentitled credential never falls through to a default project, and a tenant
+  whose policies cannot be fetched is refused rather than served unguarded.
+  Refusals are `401` (no or rejected credential), `403` (authenticated but not
+  entitled — answered identically for "another organization's project" and "no
+  such project", so it discloses nothing), `400` (entitled to several projects
+  and the request named none) and `503` (no verdict reachable).
+- **Nothing is fetched at startup** — there is no tenant yet. A misconfiguration
+  still aborts at boot, but policy fetches happen on each tenant's first
+  request.
+- **`/health` needs no credential**, so liveness and readiness probes work
+  unchanged. Only `/v1/*` requires a tenant.
+- **A local policy bundle is refused.** `NOVEUM_GUARD_POLICIES` /
+  `NOVEUM_GUARD_POLICIES_FILE` alongside `NOVEUM_GUARD_TENANCY=shared` aborts
+  startup: a process-wide bundle would be loaded and never consulted, and a
+  process-wide `cost_cap` / `rate_limit` would be one counter shared by every
+  tenant.
+
+#### Key permissions
+
+Use a **scoped Noveum service key**, not a personal or full-access one:
+
+| Permission | Needed for | Mode |
+|---|---|---|
+| `guardrails:read` | fetching `/policies/effective` and live `/policies/state` | both |
+| `guardrails:ingest` | reporting usage to `/policies/usage` and settling reservations | both |
+| `projects:read` | deriving the caller's project + organization from the credential | shared only |
+
+In dedicated mode that key is the deployment's own, supplied once via
+`NOVEUM_API_KEY`. In shared mode there is **no process-wide key at all** —
+every platform call is made with the calling tenant's own credential, so each
+caller's key needs these permissions and no single secret is ever applied to
+another tenant's traffic.
+
+#### Shared mode is native-only
+
+The Cloudflare Worker supports **dedicated** platform-managed Nova Guard
+(policies, live state, atomic admission and settlement all work at the edge).
+It has no tenancy layer, so it cannot serve shared mode, and it answers
+`NOVEUM_GUARD_TENANCY=shared` with a 503 `gateway_configuration_error` rather
+than ignoring the variable and proxying every caller unguarded. It likewise
+refuses *any* inline `cost_cap` / `rate_limit` policy, which has no live-state
+backend — see
+[docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md#platform-managed-nova-guard-on-the-worker).
+
+#### Deployment order
+
+The platform's composite `/state` (the nested `org` block) must be deployed
+**before** a gateway that enforces organization-scoped policies. Reversed,
+org-scoped counters read as unavailable and expected fail-closed policies block
+during the rollout.
+
+> **Whether a cap holds across replicas depends on its enforcement mode.**
+>
+> * **Strict** (`enforcementMode: strict` on a `cost_cap`, or
+>   `NOVEUM_GUARD_COST_ENFORCEMENT=strict` deployment-wide) — each request is
+>   reserved against the platform's atomic admission API before it is dispatched,
+>   so one counter is shared by every replica and the cap is a real hard cap. The
+>   reservation is settled with the response's true token counts on the way out;
+>   a request the platform cannot evaluate is *unavailable*, never an implicit
+>   allow.
+> * **Advisory** (the default) — each instance reserves only in its own
+>   in-process ledger, against reported spend plus its own in-flight estimate.
+>   Usage is reported asynchronously and `/state` is cached, so a cap can be
+>   overshot by roughly the cost of the requests admitted in that window *per
+>   replica*. With an HPA that multiplies by replica count.
+>
+> Both modes admit a request with no `max_tokens` against the
+> `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` heuristic rather than its true output
+> size. `rate_limit` follows the same reservation as the cost cap on the strict
+> path and is otherwise per-process.
 
 > **Costs are estimates, not billing.** The pricing table
 > (`src/policy/pricing.rs`) models standard per-token rates and documented

@@ -79,7 +79,7 @@ impl std::error::Error for RemoteConfigError {}
 // The env var names the platform bridge is configured with. Defined in the
 // shared `platform` module (the Worker validates the same pair) and re-exported
 // here so native callers can keep reaching for them via `remote::`.
-pub use crate::policy::platform::{API_KEY_VAR, PROJECT_ID_VAR};
+pub use crate::policy::platform::{API_KEY_VAR, PROJECT_ID_VAR, TENANCY_VAR};
 
 impl RemoteConfig {
     /// Build from env. See [`RemoteConfig::from_values`] for the semantics;
@@ -208,8 +208,6 @@ impl RemoteConfig {
 // Shared-gateway tenancy (§6.4 / NOV-117)
 // ===========================================================================
 
-/// Selects the deployment mode of the platform bridge. See [`GuardTenancy`].
-pub const TENANCY_VAR: &str = "NOVEUM_GUARD_TENANCY";
 /// How long one credential→tenant resolution is reused, in seconds.
 pub const TENANT_TTL_VAR: &str = "NOVEUM_GUARD_TENANT_TTL_SECS";
 /// How many distinct tenants one process keeps warm (policies + counters).

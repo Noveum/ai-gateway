@@ -7,8 +7,13 @@ the deterministic policy types entirely in-process (no network dependency), from
 a **local policy bundle** (file or inline env) — the gateway enforces guardrails
 standalone (BYOK mode) with no external service.
 
-> Hosted policy distribution and budget reservation via the Noveum control plane
-> are planned future work; today the gateway loads policies locally.
+Policies can come from either of two places:
+
+* a **local bundle** (file or inline env), enforced entirely in-process; or
+* the **Noveum control plane** ("platform-managed Nova Guard"), which also
+  supplies the live cost/rate counters that `cost_cap` and `rate_limit` need,
+  and accepts usage reports back. See
+  [Deployment modes](#deployment-modes-dedicated-and-shared).
 
 ## Quick start
 
@@ -153,13 +158,79 @@ counters) to evaluate. There are two cases:
   those two types is neutralized at load time with a warning so a stale bundle
   can't block 100% of traffic. The Worker refuses such a bundle outright with a
   503 rather than accepting it and enforcing nothing.
-* **Platform-managed Nova Guard** (native, `NOVEUM_API_KEY` +
-  `NOVEUM_GUARD_PROJECT_ID`) — live counters come from the Noveum platform, so
-  both types evaluate for real and `failClosed` is honored: a `/state` outage,
-  or a counter the policy needs that the response does not carry, blocks.
+* **Platform-managed Nova Guard** — live counters come from the Noveum platform,
+  so both types evaluate for real and `failClosed` is honored: a `/state`
+  outage, or a counter the policy needs that the response does not carry,
+  blocks.
 
 (The stateless policy types — regex, PII, secrets, banned substrings, model
 allowlist, JSON schema, token caps — enforce fully with no backend.)
+
+## Deployment modes: dedicated and shared
+
+Platform-managed Nova Guard runs in one of two mutually exclusive modes,
+selected by `NOVEUM_GUARD_TENANCY`. The question that decides it is whether the
+deployment serves more than one tenant.
+
+| Env var | Dedicated | Shared |
+|---|---|---|
+| `NOVEUM_GUARD_TENANCY` | `dedicated`, or unset | `shared` |
+| `NOVEUM_API_KEY` | required | **must be unset** |
+| `NOVEUM_GUARD_PROJECT_ID` | required | **must be unset** |
+| `NOVEUM_API_URL` | optional | optional |
+| `NOVEUM_GUARD_TENANT_TTL_SECS` | n/a | optional, default `300` |
+| `NOVEUM_GUARD_TENANT_CACHE_MAX` | n/a | optional, default `1024` |
+| `NOVEUM_GUARD_POLICIES[_FILE]` | allowed | **refused at startup** |
+
+Configuring both modes at once aborts startup rather than resolving by
+precedence, and shared mode is never inferred — it is only entered by asking
+for it, so an existing dedicated deployment cannot drift into it.
+
+**Dedicated** pins the whole process to one project. Every request a replica
+handles is metered and capped against it regardless of who sent it, which is
+correct for a gateway fronting one team and wrong for anything else. The policy
+set is fetched at startup (a failed first fetch aborts) and refreshed by a
+background poller.
+
+**Shared** authenticates each caller and derives its tenant server-side:
+
+* The caller presents its own Noveum key in **`x-noveum-api-key`** — not
+  `Authorization`, which on this gateway carries the caller's *provider* key and
+  is forwarded upstream. The tenancy layer strips `x-noveum-api-key` from the
+  request before proxying, so a tenant's Noveum credential never reaches a model
+  provider. A `Bearer ` prefix is accepted.
+* `x-project-id` and `x-organization-id` are **routing filters, not identity**.
+  A project header may only select among the projects the credential is already
+  entitled to; naming another project is rejected rather than silently
+  overridden. An organization header must match the derived organization. With
+  no project header and exactly one entitlement, that project is used; with
+  several, the request is refused rather than metered against a guess.
+* Policies, live counters, reservations, usage records and every cache entry are
+  keyed by the **derived** tenant. A cache keyed on client input would be a
+  cross-tenant leak by construction.
+* Every failure is a refusal, never a fallback to a default project: `401` for a
+  missing or rejected credential, `403` for authenticated-but-not-entitled
+  (answered identically whether the project belongs to another organization or
+  does not exist, so it leaks nothing), `400` when the credential is entitled to
+  several projects and the request named none, `503` when no verdict could be
+  reached.
+* Nothing is fetched at startup — there is no tenant yet. Each tenant's policy
+  set is fetched on its first request, and a tenant idle for 10 minutes is
+  dropped, which is also what lets a revoked credential self-heal.
+* `/health` requires no credential, so probes are unaffected. Only `/v1/*`
+  requires a tenant.
+
+### Key permissions
+
+| Permission | Needed for | Mode |
+|---|---|---|
+| `guardrails:read` | `/policies/effective` + `/policies/state` | both |
+| `guardrails:ingest` | `/policies/usage` + reservation settlement | both |
+| `projects:read` | deriving the caller's project + organization | shared only |
+
+In dedicated mode this is the deployment's own scoped service key, set once via
+`NOVEUM_API_KEY`. In shared mode there is no process-wide key at all: each
+platform call is made with the calling tenant's own credential.
 
 ### Scope of enforcement under the platform bridge
 
@@ -169,9 +240,15 @@ allowlist, JSON schema, token caps — enforce fully with no backend.)
   fail-open allows with an explicit reason) — project counters are never
   substituted, because that would let every project consume the whole
   organization allowance separately.
-* Admission is **per-process and estimate-based**: each replica reserves against
-  reported spend plus its own in-flight estimate. It is not an atomic
-  cross-replica hard cap. See the README's deployment-scope section.
+* Admission is **estimate-based in both modes**, but only one of them holds
+  across replicas. A `cost_cap` with `enforcementMode: strict` (or a deployment
+  with `NOVEUM_GUARD_COST_ENFORCEMENT=strict`) reserves against the platform's
+  atomic admission API, so every replica shares one counter. An **advisory** cap
+  reserves only in the replica's own ledger, so the effective overshoot is
+  multiplied by replica count. See the README for the full comparison.
+* In **shared** mode this is per derived tenant: each tenant gets its own
+  engine, counters, ledger and reservations, so one tenant's traffic can neither
+  consume nor observe another's headroom.
 
 ## Streaming
 

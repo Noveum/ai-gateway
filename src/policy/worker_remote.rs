@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 use crate::policy::decision::{PolicyAction, PolicyDecision, PolicyMode, Severity};
 use crate::policy::metering::ActualUsage;
 
-pub use crate::policy::platform::{API_KEY_VAR, PROJECT_ID_VAR};
+pub use crate::policy::platform::{API_KEY_VAR, PROJECT_ID_VAR, TENANCY_VAR};
 
 /// Platform base URL override.
 pub const API_URL_VAR: &str = "NOVEUM_API_URL";
@@ -186,6 +186,51 @@ impl WorkerRemoteConfig {
     pub fn cache_key(&self) -> String {
         format!("{}|{}", self.base_url, self.project_id)
     }
+}
+
+/// Whether this Worker is configured for a deployment mode it cannot serve.
+///
+/// Shared tenancy is native-only. The Worker has no tenancy layer: it cannot
+/// authenticate a caller against the platform, resolve a credential to the
+/// projects it is entitled to, or hold a per-tenant runtime per isolate.
+/// [`TENANCY_VAR`] is therefore not a variable it can honor.
+///
+/// It must not be a variable the Worker *ignores*, either. Every other
+/// configuration path in this module refuses rather than degrading, for one
+/// reason: an operator who asked for enforcement and silently got a transparent
+/// proxy is strictly worse off than one who got an error. Left unread,
+/// `NOVEUM_GUARD_TENANCY=shared` on a Worker means every caller's traffic is
+/// proxied unguarded while the deployment looks configured.
+///
+/// Returns the refusal message, or `None` for a configuration the Worker can
+/// serve (unset, or an explicit `dedicated`). Pure, so the whole matrix is
+/// testable on the native `cargo test` path.
+pub fn tenancy_refusal(tenancy: Option<&str>) -> Option<String> {
+    // Unset is the historical inference: the credential pair alone decides, and
+    // that is dedicated mode, which the Worker does serve.
+    let mode = tenancy?.trim();
+    if mode.is_empty() {
+        return Some(format!(
+            "{TENANCY_VAR} is set but empty; an unresolved template or a stripped CI variable is \
+             not a deployment mode. Set it to `dedicated`, or unset it."
+        ));
+    }
+    if mode.eq_ignore_ascii_case("dedicated") {
+        return None;
+    }
+    if mode.eq_ignore_ascii_case("shared") {
+        return Some(format!(
+            "{TENANCY_VAR}=shared is not supported on the Cloudflare Worker. Shared tenancy \
+             derives each caller's project and organization from its own Noveum credential, which \
+             needs the native gateway's tenancy layer; the Worker can only enforce for one project \
+             fixed by {PROJECT_ID_VAR}. Deploy the native gateway for a shared gateway, or set \
+             {TENANCY_VAR}=dedicated with {API_KEY_VAR} + {PROJECT_ID_VAR}."
+        ));
+    }
+    Some(format!(
+        "{TENANCY_VAR}={mode:?} is not a deployment mode. The Worker supports `dedicated` (one \
+         project fixed by {PROJECT_ID_VAR}); `shared` is native-only."
+    ))
 }
 
 /// Percent-encode the few characters that could break out of a path segment.
@@ -1145,6 +1190,40 @@ mod tests {
                 .expect_err("a half-applied bridge must not be treated as 'disabled'");
             assert!(e.contains(needle), "unhelpful message: {e}");
         }
+    }
+
+    /// The Worker cannot serve shared tenancy, so it must REFUSE it rather than
+    /// read past it. Ignoring the variable is the one outcome that leaves an
+    /// operator believing per-tenant caps are live on an unguarded proxy.
+    #[test]
+    fn shared_tenancy_is_refused_on_the_worker_not_ignored() {
+        // Serveable: unset (the historical credential-pair inference) and an
+        // explicit dedicated, in any casing or padding.
+        assert_eq!(tenancy_refusal(None), None);
+        for ok in ["dedicated", "DEDICATED", "  Dedicated  "] {
+            assert_eq!(tenancy_refusal(Some(ok)), None, "{ok:?} must be serveable");
+        }
+
+        // Shared: refused, naming the mode, the reason and the way out.
+        let m = tenancy_refusal(Some("shared")).expect("shared must be refused on the Worker");
+        assert!(m.contains("not supported on the Cloudflare Worker"), "{m}");
+        assert!(m.contains(PROJECT_ID_VAR), "the way out must be named: {m}");
+        assert!(
+            tenancy_refusal(Some(" SHARED ")).is_some(),
+            "casing and padding must not smuggle shared mode past the check"
+        );
+
+        // A blank value is an unresolved template, not "unset" — the same class
+        // of failure `from_values` refuses for the credential pair.
+        for blank in ["", "   "] {
+            let m = tenancy_refusal(Some(blank))
+                .unwrap_or_else(|| panic!("{blank:?} must not be read as unset"));
+            assert!(m.contains("set but empty"), "{m}");
+        }
+
+        // A typo must not silently fall through to dedicated.
+        let m = tenancy_refusal(Some("dedicted")).expect("a typo must be refused");
+        assert!(m.contains("not a deployment mode"), "{m}");
     }
 
     fn cfg() -> WorkerRemoteConfig {

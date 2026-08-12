@@ -69,7 +69,7 @@ use crate::policy::worker_remote::{
     self, admit_request_body, estimate_input_tokens, force_include_usage,
     resolve_max_output_tokens, Admission, AdmitRequest, BodyAdmission, Settlement, StreamOutcome,
     WorkerRemoteConfig, ALLOW_UNGUARDED_START_VAR, API_KEY_VAR, API_URL_VAR,
-    MAX_OUTPUT_TOKEN_LIMIT, PROJECT_ID_VAR,
+    MAX_OUTPUT_TOKEN_LIMIT, PROJECT_ID_VAR, TENANCY_VAR,
 };
 use crate::policy::PolicyEngine;
 use crate::routing::{
@@ -541,6 +541,16 @@ async fn proxy(
 
     if req.method() != Method::Post || !path.starts_with("/v1/") {
         return Response::error("Not Found", 404);
+    }
+
+    // --- Deployment mode -----------------------------------------------------
+    //
+    // Shared tenancy is native-only. Reading the variable and refusing is the
+    // point: unread, `NOVEUM_GUARD_TENANCY=shared` would proxy every caller
+    // unguarded on a deployment its operator believes enforces per-tenant caps.
+    if let Some(message) = worker_remote::tenancy_refusal(env_value(&env, TENANCY_VAR).as_deref()) {
+        console_error!("Nova Guard configuration error: {message}");
+        return unsupported_guard_config(&message);
     }
 
     // --- Platform bridge configuration -------------------------------------

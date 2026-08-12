@@ -25,6 +25,11 @@ use crate::policy::rules::LiveState;
 /// refusal path validate the same pair, and their messages must agree.
 pub const API_KEY_VAR: &str = "NOVEUM_API_KEY";
 pub const PROJECT_ID_VAR: &str = "NOVEUM_GUARD_PROJECT_ID";
+/// Selects the deployment mode (`dedicated` / `shared`). Declared here for the
+/// same reason as the pair above: the native bootstrap *implements* both modes
+/// and the Worker *refuses* the shared one, and neither may drift from the
+/// other's spelling of the variable.
+pub const TENANCY_VAR: &str = "NOVEUM_GUARD_TENANCY";
 
 fn map_action(_action: &str) -> &'static str {
     // Platform Phase 0 only defines BLOCK; map everything to the gateway's `block`.

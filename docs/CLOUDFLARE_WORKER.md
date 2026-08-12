@@ -140,7 +140,9 @@ every streamed request would settle at ~100x its real cost.
 
 | Configuration | Worker behavior |
 |---|---|
-| `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` set | **Platform-managed Nova Guard.** Policies, live state and admission come from the control plane; any inline `NOVEUM_GUARD_POLICIES` is ignored (with a warning) — the platform is the source of truth. |
+| `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` set | **Platform-managed Nova Guard**, in dedicated mode. Policies, live state and admission come from the control plane; any inline `NOVEUM_GUARD_POLICIES` is ignored (with a warning) — the platform is the source of truth. |
+| `NOVEUM_GUARD_TENANCY=shared` | **503 `gateway_configuration_error`.** Shared tenancy derives each caller's project and organization from its own Noveum credential, which needs the native gateway's tenancy layer. The Worker refuses rather than ignoring the variable: unread, it would proxy every caller unguarded on a deployment its operator believes enforces per-tenant caps. Use the native gateway, or `NOVEUM_GUARD_TENANCY=dedicated`. |
+| `NOVEUM_GUARD_TENANCY` set to anything but `dedicated`/`shared`, or to `""` | **503.** A typo or an unresolved template must not fall through to dedicated. |
 | Only *one* of the pair set, or either set to `""` | **503 `gateway_configuration_error`.** A half-applied bridge is still an attempt to enable enforcement; falling through to an unguarded proxy would reward the mistake with a 200. Same matrix as the native `RemoteConfig::from_values`. |
 | Bridge set, but the **first** policy fetch fails | **503.** No policy set is known, so every request would be forwarded unguarded. Override with `NOVEUM_GUARD_ALLOW_UNGUARDED_START=true` (emergency only). |
 | Bridge set, admission returns **503**/times out | `failClosed` decides: a fail-closed strict cap **blocks**; otherwise the request proceeds and the outage is logged. Never an implicit allow. |
