@@ -1,6 +1,8 @@
 use super::metrics::MetricsRegistry;
 use super::provider_metrics::{get_metrics_extractor, MetricsExtractor, ProviderMetrics};
 use super::RequestMetrics;
+use crate::policy::metering::SseFrameBuffer;
+use crate::policy::pricing::CostBreakdown;
 use axum::body::to_bytes;
 use axum::{
     body::{Body, Bytes},
@@ -216,9 +218,11 @@ async fn handle_regular_response(
 
     debug!("Extracted provider metrics: {:?}", provider_metrics);
 
-    let cost = backfill_cost(
+    let (cost, cost_breakdown) = meter(
         provider_metrics.cost,
         &provider_metrics.model,
+        &provider,
+        resp_body.as_ref(),
         provider_metrics.input_tokens,
         provider_metrics.output_tokens,
     );
@@ -238,6 +242,7 @@ async fn handle_regular_response(
         total_tokens: provider_metrics.total_tokens,
         status_code: parts.status.as_u16(),
         cost,
+        cost_breakdown,
         project_id: project_id.or(provider_metrics.project_id),
         org_id: org_id.or(provider_metrics.organization_id),
         user_id: user_id.or(provider_metrics.user_id),
@@ -304,6 +309,7 @@ async fn handle_streaming_response(
         let mut final_metrics_found = false;
         let mut resp_body = None;
         let mut streamed_chunks = Vec::new();
+        let mut cost_breakdown = None;
 
         let mut stream = body.into_data_stream();
         // HTTP/TCP chunk boundaries are arbitrary and have nothing to do with
@@ -312,7 +318,9 @@ async fn handle_streaming_response(
         // sequence. Parsing each transport chunk on its own silently dropped
         // those events — a whole stream could deliver perfectly valid usage to
         // the client while the gateway recorded nothing. Reassemble frames
-        // first, then parse.
+        // first, then parse. The reassembler lives in `policy::metering` so the
+        // guard's streaming settlement, the Anthropic translator and this path
+        // all share one proven implementation (and the Worker can too).
         let mut frames = SseFrameBuffer::default();
         // Set once the accumulation cap is hit: we stop *inspecting* but keep
         // forwarding bytes to the client (a metrics limit must never truncate
@@ -464,12 +472,25 @@ async fn handle_streaming_response(
             // counts in another, so cost may not have been computable per-chunk
             // (e.g. Anthropic priced its `message_delta` under the placeholder
             // model "claude" → no cost). Recompute from the merged view.
-            accumulated_metrics.cost = backfill_cost(
+            //
+            // The billable dimensions live in whichever chunk carried `usage`
+            // (the terminal one, by convention) — the accumulated SSE text is
+            // not itself JSON, so the parsed chunks are the only place to find
+            // cached and cache-written token counts in a stream.
+            let usage_chunk = streamed_chunks
+                .iter()
+                .rev()
+                .find(|c| c.get("usage").map(|u| u.is_object()).unwrap_or(false));
+            let (cost, breakdown) = meter(
                 accumulated_metrics.cost,
                 &accumulated_metrics.model,
+                &provider,
+                usage_chunk,
                 accumulated_metrics.input_tokens,
                 accumulated_metrics.output_tokens,
             );
+            accumulated_metrics.cost = cost;
+            cost_breakdown = breakdown;
         }
 
         // Record final metrics if we found them
@@ -489,6 +510,7 @@ async fn handle_streaming_response(
                 total_tokens: accumulated_metrics.total_tokens,
                 status_code: parts.status.as_u16(),
                 cost: accumulated_metrics.cost,
+                cost_breakdown,
                 project_id: project_id.or(accumulated_metrics.project_id),
                 org_id: org_id.or(accumulated_metrics.organization_id),
                 user_id: user_id.or(accumulated_metrics.user_id),
@@ -515,62 +537,6 @@ async fn handle_streaming_response(
     });
 
     Response::from_parts(parts, Body::from_stream(ReceiverStream::new(rx)))
-}
-
-/// Incremental SSE frame reassembler.
-///
-/// Holds raw bytes that have not yet completed a frame and hands back only whole
-/// frames (terminated by a blank line — `\n\n` or `\r\n\r\n`). Buffering at the
-/// *byte* level is deliberate: a transport chunk can split a multi-byte UTF-8
-/// character, so decoding per chunk would corrupt or discard it. Frame
-/// terminators are ASCII, so a complete frame is always complete UTF-8.
-#[derive(Default)]
-struct SseFrameBuffer {
-    buf: Vec<u8>,
-}
-
-impl SseFrameBuffer {
-    /// Append transport bytes; return every frame they complete.
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buf.extend_from_slice(bytes);
-        let mut out = Vec::new();
-        while let Some((end, sep_len)) = Self::find_frame_end(&self.buf) {
-            let frame = self.buf.drain(..end + sep_len).collect::<Vec<u8>>();
-            out.push(String::from_utf8_lossy(&frame[..end]).into_owned());
-        }
-        // A frame that never terminates must not grow without bound; emit what
-        // we have so the buffer stays capped.
-        if self.buf.len() > MAX_ACCUMULATED_TEXT {
-            let frame = std::mem::take(&mut self.buf);
-            out.push(String::from_utf8_lossy(&frame).into_owned());
-        }
-        out
-    }
-
-    /// The unterminated remainder at end of stream, if any.
-    fn flush(&mut self) -> Option<String> {
-        if self.buf.is_empty() {
-            return None;
-        }
-        let frame = std::mem::take(&mut self.buf);
-        let text = String::from_utf8_lossy(&frame).into_owned();
-        if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    }
-
-    /// Offset and length of the first frame terminator, if the buffer holds one.
-    fn find_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
-        let find = |pat: &[u8]| buf.windows(pat.len()).position(|w| w == pat);
-        match (find(b"\r\n\r\n"), find(b"\n\n")) {
-            (Some(a), Some(b)) if a <= b => Some((a, 4)),
-            (_, Some(b)) => Some((b, 2)),
-            (Some(a), None) => Some((a, 4)),
-            (None, None) => None,
-        }
-    }
 }
 
 /// Parse one reassembled SSE frame (or a bare JSON payload) and fold whatever it
@@ -626,6 +592,62 @@ fn ingest_stream_payload(
 /// falls back to the assumed maximum catalog rate for an unknown model and logs
 /// an alertable event. Only a call whose token counts are entirely unknown is
 /// still recorded without a cost — there is nothing to price it from.
+/// The itemized cost to record for a call, and the total to meter from it.
+///
+/// This supersedes [`backfill_cost`] wherever a response body is available,
+/// because the body carries dimensions a token pair cannot express: a cached
+/// prompt read bills at 0.02x-0.5x of input, a cache write at 1.25x-2x, and a
+/// server-side search carries a per-request fee. Pricing those from
+/// `(input_tokens, output_tokens)` alone charges every one of them at the plain
+/// input rate or at nothing at all.
+///
+/// Falls back to the token pair when the body has no usage object, and to the
+/// extractor's own figure when there are no token counts either. Returns
+/// `(cost, breakdown)`; the breakdown rides along on [`RequestMetrics`] so the
+/// usage exporter can post the components and the catalog version with it.
+fn meter(
+    reported: Option<f64>,
+    model: &str,
+    provider: &str,
+    body: Option<&Value>,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+) -> (Option<f64>, Option<CostBreakdown>) {
+    let parsed = body
+        .and_then(|b| crate::policy::pricing::parse_usage(model, provider, b))
+        .filter(|u| !u.is_empty());
+    let usage = match parsed {
+        Some(u) => Some(u),
+        None => match (input_tokens, output_tokens) {
+            (None, None) => None,
+            // One-sided counts still price the side we know, rather than nothing.
+            (i, o) => Some(crate::policy::pricing::BillableUsage::from_tokens(
+                i.unwrap_or(0),
+                o.unwrap_or(0),
+            )),
+        },
+    };
+    let Some(usage) = usage else {
+        return (
+            backfill_cost(reported, model, input_tokens, output_tokens),
+            None,
+        );
+    };
+    let breakdown = crate::policy::pricing::price_usage(model, &usage);
+    if !breakdown.is_complete {
+        // `pricing` already emits one deduped alert per (model, dimension);
+        // this records the concrete amount that alert is about.
+        debug!(
+            model = %model,
+            provider = %provider,
+            missing = ?breakdown.missing_dimension_names(),
+            conservative_cost_usd = breakdown.total_usd,
+            "Nova Guard: metering a conservative cost; a billable dimension could not be priced"
+        );
+    }
+    (Some(breakdown.total_usd), Some(breakdown))
+}
+
 fn backfill_cost(
     reported: Option<f64>,
     model: &str,
@@ -919,5 +941,162 @@ mod tests {
         let est = estimate_stream_output_tokens(&[], "12345678");
         assert_eq!(est, Some(2));
         assert_eq!(estimate_stream_output_tokens(&[], ""), None);
+    }
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+    use crate::policy::pricing::{BillableDimension, CostSource};
+    use serde_json::json;
+
+    /// The metering boundary reads the billable dimensions out of the response
+    /// body, so a cached prompt is billed at the cached rate rather than at the
+    /// input rate the token pair alone would imply.
+    #[test]
+    fn a_cached_openai_response_meters_below_the_token_pair_estimate() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 100_000,
+                "completion_tokens": 1_000,
+                "prompt_tokens_details": { "cached_tokens": 90_000 }
+            }
+        });
+        let (cost, breakdown) = meter(
+            None,
+            "gpt-4o",
+            "openai",
+            Some(&body),
+            Some(100_000),
+            Some(1_000),
+        );
+        let b = breakdown.expect("a body with usage always produces a breakdown");
+        assert!(b.is_complete);
+        assert_eq!(b.source, CostSource::Catalog);
+        // 10K uncached at $2.50/1M + 90K cached at $1.25/1M + 1K out at $10/1M.
+        let expected = (10_000.0 / 1e6) * 2.50 + (90_000.0 / 1e6) * 1.25 + (1_000.0 / 1e6) * 10.00;
+        assert!((cost.unwrap() - expected).abs() < 1e-12);
+        // The old token-pair path would have charged every prompt token at the
+        // full input rate.
+        let naive = backfill_cost(None, "gpt-4o", Some(100_000), Some(1_000)).unwrap();
+        assert!(cost.unwrap() < naive, "cached tokens must be discounted");
+    }
+
+    /// Anthropic's counters are exclusive, so the same body must ADD the cache
+    /// dimensions rather than subtract them.
+    #[test]
+    fn an_anthropic_response_adds_its_exclusive_cache_counters() {
+        let body = json!({
+            "usage": {
+                "input_tokens": 1_000,
+                "output_tokens": 500,
+                "cache_read_input_tokens": 50_000,
+                "cache_creation_input_tokens": 10_000
+            }
+        });
+        let (cost, breakdown) = meter(
+            None,
+            "claude-sonnet-4-5",
+            "anthropic",
+            Some(&body),
+            Some(1_000),
+            Some(500),
+        );
+        let b = breakdown.unwrap();
+        assert!(b.is_complete);
+        let expected = (1_000.0 / 1e6) * 3.00
+            + (50_000.0 / 1e6) * 0.30
+            + (10_000.0 / 1e6) * 3.75
+            + (500.0 / 1e6) * 15.00;
+        assert!((cost.unwrap() - expected).abs() < 1e-12);
+        assert!(b.cache_read_usd > 0.0 && b.cache_write_usd > 0.0);
+    }
+
+    /// A dimension the catalog cannot price is charged conservatively and
+    /// flagged, never dropped.
+    #[test]
+    fn an_unpriceable_dimension_meters_a_conservative_non_zero_cost() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 100_000,
+                "completion_tokens": 0,
+                "prompt_tokens_details": { "cached_tokens": 100_000 }
+            }
+        });
+        let (cost, breakdown) = meter(None, "o1", "openai", Some(&body), Some(100_000), Some(0));
+        let b = breakdown.unwrap();
+        assert!(!b.is_complete);
+        assert_eq!(b.missing_dimensions, vec![BillableDimension::CacheRead]);
+        assert!(cost.unwrap() > 0.0, "must never meter a silent $0");
+        assert!((cost.unwrap() - (100_000.0 / 1e6) * 15.00).abs() < 1e-12);
+    }
+
+    /// No usage object: fall back to the token pair, preserving the NOV-152
+    /// behavior that an unknown model still meters at the assumed rate.
+    #[test]
+    fn a_body_without_usage_falls_back_to_the_token_pair() {
+        let body = json!({ "choices": [] });
+        let (cost, breakdown) = meter(
+            None,
+            "gpt-4o",
+            "openai",
+            Some(&body),
+            Some(1_000),
+            Some(500),
+        );
+        assert!(
+            breakdown.is_some(),
+            "token counts still produce a breakdown"
+        );
+        assert!(
+            (cost.unwrap() - crate::policy::pricing::estimate_cost("gpt-4o", 1_000, 500)).abs()
+                < 1e-12
+        );
+
+        // Nothing at all to price: the extractor's own figure survives and no
+        // breakdown is invented.
+        let (cost, breakdown) = meter(Some(0.5), "gpt-4o", "openai", None, None, None);
+        assert_eq!(cost, Some(0.5));
+        assert!(breakdown.is_none());
+
+        // An unknown model with no body still meters defensively.
+        let (cost, breakdown) = meter(
+            None,
+            "brand-new-model",
+            "openai",
+            None,
+            Some(1_000),
+            Some(500),
+        );
+        assert!(cost.unwrap() > 0.0);
+        assert!(breakdown.unwrap().assumed_model_rate);
+    }
+
+    /// A per-request search fee has no token count at all, so only the body can
+    /// surface it.
+    #[test]
+    fn per_request_search_fees_reach_the_meter() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 100,
+                "num_search_queries": 5,
+                "search_context_size": "high"
+            }
+        });
+        let (cost, breakdown) = meter(
+            None,
+            "sonar-pro",
+            "perplexity",
+            Some(&body),
+            Some(100),
+            Some(100),
+        );
+        let b = breakdown.unwrap();
+        assert!((b.tool_usd - (5.0 / 1000.0) * 14.00).abs() < 1e-12);
+        assert!(cost.unwrap() > b.tool_usd);
+        // The token pair alone cannot see this fee at all.
+        let tokens_only = backfill_cost(None, "sonar-pro", Some(100), Some(100)).unwrap();
+        assert!(cost.unwrap() > tokens_only);
     }
 }

@@ -11,6 +11,9 @@
 //! * [`decision`] — uniform decision/severity/action types + telemetry mapping.
 //! * [`rules`] — the extensible [`rules::PolicyRule`] trait + one module per
 //!   deterministic policy type.
+//! * [`metering`] — SSE frame reassembly + response/stream usage parsing, shared
+//!   by the native telemetry path, the Anthropic stream translator, and the
+//!   Worker bridge (pure/sync, wasm-safe).
 //! * [`pricing`] — model cost table for per-request cost estimation.
 //! * [`engine`] — orchestration: ordering, mode semantics, transform composition.
 //!   (`cost_cap`/`rate_limit` accept an optional live-state injection seam; with
@@ -22,10 +25,17 @@
 pub mod config;
 pub mod decision;
 pub mod engine;
+/// Shared metering primitives: SSE frame reassembly + response/stream usage
+/// parsing. Pure + sync, so it compiles for BOTH the native server and the
+/// wasm32 Worker and is testable without a runtime.
+pub mod metering;
 // Translation layer for Noveum platform NovaGuard policies + live state. Pure +
 // shared; the native HTTP fetch is in `crate::policy::remote`.
 pub mod platform;
 pub mod pricing;
+/// Generated rate rows. Rendered from `pricing/catalog.json` by
+/// `scripts/gen_pricing.py`; never edited by hand (CI fails on drift).
+pub mod pricing_catalog;
 pub mod rules;
 pub mod synthetic;
 

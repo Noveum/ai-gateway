@@ -1161,6 +1161,18 @@ async fn no_usage_handler() -> Response {
         .into_response()
 }
 
+/// Upstream that answers with an SSE stream. The guard passes streams through
+/// without output enforcement, so no authoritative usage is recoverable in that
+/// layer and the reservation settles via `abandon`.
+async fn sse_handler() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\ndata: [DONE]\n\n",
+    )
+        .into_response()
+}
+
 #[tokio::test]
 async fn strict_admission_reserves_then_completes_with_real_usage() {
     let server = MockServer::start().await;
@@ -1518,6 +1530,336 @@ async fn client_cancellation_mid_request_still_settles_the_reservation() {
         .contains("/reservations/res-cancelled-client/"));
 }
 
+// ---------------------------------------------------------------------------
+// §6.2 — ONE request must produce exactly ONE metered record.
+//
+// Two independent paths report a strict-mode request to the platform:
+//   * the reservation lifecycle (`/reservations/{id}/complete|abandon`), and
+//   * the legacy telemetry exporter (`POST /policies/usage`).
+// Each mints its own `eventId`, so neither the Redis dedup marker nor the
+// `(organizationId, eventId)` unique index collapses them: metered spend
+// doubles and every cost cap effectively halves.
+// ---------------------------------------------------------------------------
+
+/// The production wiring, in one place: `main.rs` registers the ALLOWED usage
+/// exporter *alongside* the guard middleware, so for a proxied call BOTH run.
+/// These tests drive the exporter explicitly because the bare test router has no
+/// telemetry layer.
+fn usage_plugin(gs: &GuardState) -> NovaGuardUsagePlugin {
+    let reporter = gs.usage.clone().expect("platform bridge configured");
+    let plugin = NovaGuardUsagePlugin::new(reporter);
+    match &gs.admission {
+        Some(admission) => plugin.metered_by_admission(gs.engine.clone(), admission.clone()),
+        None => plugin,
+    }
+}
+
+/// What `telemetry::middleware` builds for a completed proxy call.
+///
+/// `model` is the **provider-resolved** id read back out of the response body
+/// (e.g. `claude-haiku-4-5-20251001`), which is why the duplicate rows differ in
+/// model spelling from the settlement's — that one carries the id the *caller*
+/// asked for (`claude-haiku-4-5`).
+fn telemetry_metrics(model: &str, input: u32, output: u32, cost: f64) -> RequestMetrics {
+    RequestMetrics {
+        provider: "openai".to_string(),
+        model: model.to_string(),
+        status_code: 200,
+        cost: Some(cost),
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        ..Default::default()
+    }
+}
+
+/// ALLOWED events that reached `POST /policies/usage` (i.e. legacy metering).
+async fn allowed_usage_events(server: &MockServer, timeout: Duration) -> Vec<Value> {
+    wait_for_usage(server, &usage_path(), 1, timeout)
+        .await
+        .into_iter()
+        .filter(|e| e.get("outcome").is_none())
+        .collect()
+}
+
+/// **The reproduction.** A strict-mode request that is admitted, served, and
+/// settled through `complete` must be metered exactly ONCE. The settled
+/// reservation is the authoritative record, so the legacy `/usage` report has to
+/// be suppressed — otherwise the platform records two ALLOWED events for one
+/// call and the cap is enforced at half its configured value.
+#[tokio::test]
+async fn a_settled_strict_request_is_metered_exactly_once() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-once").await;
+    mount_settlement_ok(&server).await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let gs = strict_guard_state(&server.uri(), &bundle);
+    let plugin = usage_plugin(&gs);
+    let app = Router::new()
+        .route("/v1/chat/completions", post(usage_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    let body =
+        json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
+    let resp = app.oneshot(chat_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Drain the body so the RAII guard settles.
+    let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+
+    // ...and the telemetry exporter fires for the very same call, with the
+    // provider-resolved model id and the provider's own token counts.
+    plugin
+        .export_metrics(telemetry_metrics("gpt-4o-2024-11-20", 123, 45, 0.000107))
+        .await
+        .expect("export ok");
+
+    // Record #1: the settlement. This one is authoritative and must happen.
+    let completes = wait_for_path_suffix(&server, "/complete", 1, Duration::from_secs(5)).await;
+    assert_eq!(completes.len(), 1, "the reservation must be settled");
+    assert!(completes[0].0.contains("/reservations/res-once/"));
+    assert_eq!(completes[0].1["inputTokens"], 123);
+
+    // Record #2 must NOT exist.
+    let duplicates = allowed_usage_events(&server, Duration::from_millis(600)).await;
+    assert!(
+        duplicates.is_empty(),
+        "a settled reservation is the authoritative record; the legacy /usage report \
+         double-meters this call, got {duplicates:?}"
+    );
+}
+
+/// Advisory mode has no reservation lifecycle at all, so the legacy exporter is
+/// the ONLY thing that advances the platform's counters. Suppressing it there
+/// would not fix double-metering, it would switch metering off.
+#[tokio::test]
+async fn an_advisory_request_still_meters_through_the_legacy_exporter() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_settlement_ok(&server).await;
+
+    // Same platform bridge, same admission client — only the enforcement mode
+    // differs (an advisory cap, i.e. the in-process pending ledger).
+    let bundle = translate_bundle(&cost_cap_payload(100.0)).unwrap();
+    let gs = strict_guard_state(&server.uri(), &bundle);
+    let plugin = usage_plugin(&gs);
+    let app = Router::new()
+        .route("/v1/chat/completions", post(usage_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let resp = app.oneshot(chat_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    plugin
+        .export_metrics(telemetry_metrics("gpt-4o-2024-11-20", 123, 45, 0.000107))
+        .await
+        .expect("export ok");
+
+    let events = allowed_usage_events(&server, Duration::from_secs(5)).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "advisory mode meters through /usage and nothing else, got {events:?}"
+    );
+    assert_eq!(events[0]["costUsd"], 0.000107);
+    assert_eq!(events[0]["inputTokens"], 123);
+    // Advisory never reserves, so nothing is ever admitted or settled.
+    assert!(
+        wait_for_path_suffix(&server, "/admit", 1, Duration::from_millis(50))
+            .await
+            .is_empty()
+    );
+}
+
+/// A gateway with no platform bridge at all keeps the exporter ungated.
+#[tokio::test]
+async fn a_gateway_without_an_admission_client_reports_unchanged() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    mount_usage_ok(&server).await;
+
+    let plugin = NovaGuardUsagePlugin::new(UsageReporter::spawn(cfg(&server.uri())));
+    plugin
+        .export_metrics(telemetry_metrics("gpt-4o", 30, 12, 0.02))
+        .await
+        .expect("export ok");
+
+    let events = allowed_usage_events(&server, Duration::from_secs(5)).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["costUsd"], 0.02);
+}
+
+/// Strict mode, admission unavailable, fail-*open* policy: the call is served
+/// with no reservation behind it. Nothing platform-side would ever hear about it
+/// — so the guard middleware meters it itself, exactly once, and the (silenced)
+/// exporter must not add a second record.
+#[tokio::test]
+async fn a_fail_open_request_that_was_never_reserved_is_still_metered_once() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_settlement_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(match_path(admit_path()))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_json(json!({"message":"GUARDRAIL_ADMISSION_UNAVAILABLE"})),
+        )
+        .mount(&server)
+        .await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, false)).unwrap();
+    let gs = strict_guard_state(&server.uri(), &bundle);
+    let plugin = usage_plugin(&gs);
+    let app = Router::new()
+        .route("/v1/chat/completions", post(usage_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let resp = app.oneshot(chat_request(&body)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a fail-open cap keeps serving when admission is unavailable"
+    );
+    let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    plugin
+        .export_metrics(telemetry_metrics("gpt-4o-2024-11-20", 123, 45, 0.000107))
+        .await
+        .expect("export ok");
+
+    let events = allowed_usage_events(&server, Duration::from_secs(5)).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "an unreserved call must be metered exactly once, got {events:?}"
+    );
+    // Metered with the PROVIDER's counts, not the estimate: the response body
+    // carried them.
+    assert_eq!(events[0]["inputTokens"], 123);
+    assert_eq!(events[0]["outputTokens"], 45);
+    assert!(events[0]["costUsd"].as_f64().unwrap() > 0.0);
+    // There was no reservation, so there is nothing to settle.
+    for endpoint in ["/complete", "/abandon", "/cancel"] {
+        assert!(
+            wait_for_path_suffix(&server, endpoint, 1, Duration::from_millis(50))
+                .await
+                .is_empty(),
+            "nothing was reserved, so {endpoint} must not be called"
+        );
+    }
+}
+
+/// A request the platform *blocked* must produce no usage record from either
+/// path: the platform already holds the block, and a second BLOCKED (or a stray
+/// ALLOWED) event would re-fire the owner "limit hit" email.
+#[tokio::test]
+async fn a_platform_block_reports_no_usage_from_either_path() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_settlement_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(match_path(admit_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "allowed": false,
+            "decision": {"policyId":"pol_strict","policyName":"Org cap","policyType":"COST_CAP",
+                         "reason":"org cap reached"}
+        })))
+        .mount(&server)
+        .await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let gs = strict_guard_state(&server.uri(), &bundle);
+    let plugin = usage_plugin(&gs);
+    let app = Router::new()
+        .route("/v1/chat/completions", post(usage_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let resp = app.oneshot(chat_request(&body)).await.unwrap();
+    assert!(resp.headers().contains_key("x-noveum-guard-blocked"));
+    // The telemetry layer fires for a synthetic block too — flagged as one.
+    plugin
+        .export_metrics(RequestMetrics {
+            guard_blocked: true,
+            ..telemetry_metrics("gpt-4o", 0, 0, 0.0)
+        })
+        .await
+        .expect("export ok");
+
+    let events = wait_for_usage(&server, &usage_path(), 1, Duration::from_millis(600)).await;
+    assert!(
+        events.is_empty(),
+        "the platform blocked this call and already holds the record, got {events:?}"
+    );
+}
+
+/// A stream whose provider reported no usage at all settles through `abandon`
+/// (the estimate stays applied), which is still a metered record — the exporter
+/// must not add a second one on top. (A stream that *does* report usage settles
+/// through `complete` instead; see
+/// `a_strict_openai_stream_completes_with_the_providers_real_usage`. Either way
+/// the reservation is the single metered record.)
+#[tokio::test]
+async fn a_strict_stream_is_metered_once_through_its_abandoned_reservation() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-stream").await;
+    mount_settlement_ok(&server).await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let gs = strict_guard_state(&server.uri(), &bundle);
+    let plugin = usage_plugin(&gs);
+    let app = Router::new()
+        .route("/v1/chat/completions", post(sse_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    let body = json!({"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]});
+    let resp = app.oneshot(chat_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+
+    // The telemetry layer reassembles the stream and reports its real usage.
+    plugin
+        .export_metrics(RequestMetrics {
+            is_streaming: true,
+            ..telemetry_metrics("gpt-4o-2024-11-20", 11, 4, 0.000035)
+        })
+        .await
+        .expect("export ok");
+
+    let abandons = wait_for_path_suffix(&server, "/abandon", 1, Duration::from_secs(5)).await;
+    assert_eq!(
+        abandons.len(),
+        1,
+        "a stream with no recoverable usage keeps its estimate applied"
+    );
+    assert!(abandons[0].0.contains("/reservations/res-stream/"));
+    let duplicates = allowed_usage_events(&server, Duration::from_millis(600)).await;
+    assert!(
+        duplicates.is_empty(),
+        "the abandoned reservation already meters this stream, got {duplicates:?}"
+    );
+}
+
 // --- THE HEADLINE: a 50-way burst must not exceed the platform's cap ---------
 
 /// A wiremock `/admit` responder that models the platform counter honestly: one
@@ -1746,4 +2088,529 @@ async fn fifty_way_burst_across_two_instances_never_exceeds_the_platform_cap() {
     );
     // Sanity: this really was two independent instances, both of which ran.
     assert!(results.iter().all(|r| r.len() == PER_INSTANCE));
+}
+
+// ---------------------------------------------------------------------------
+// §6.2 — STRICT-MODE STREAMS MUST SETTLE ON REAL USAGE, NOT THE RESERVATION.
+//
+// A strict request reserves `input_tokens + max_output_tokens`. `max_tokens` is
+// routinely 4096 while a real streamed reply is tens of tokens, so retaining the
+// estimate (which is what `abandon` does, by design) bills a stream ~100x its
+// true cost and eats the customer's cap accordingly. SSE usage IS recoverable —
+// the final frame carries it — so these tests pin down that the gateway tees the
+// body, reads it, and reconciles the reservation DOWN via `complete`, while the
+// client still receives the identical bytes.
+// ---------------------------------------------------------------------------
+
+/// A realistic OpenAI stream: content deltas (one carrying multi-byte UTF-8)
+/// then the `include_usage` frame the gateway forces on, then `[DONE]`.
+const OPENAI_STREAM: &str = concat!(
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Héllo\"}}]}\n\n",
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" wörld 🌍\"}}]}\n\n",
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4,\"total_tokens\":15}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// The raw Anthropic dialect: usage split across `message_start` (input) and
+/// `message_delta` (output).
+const ANTHROPIC_STREAM: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Héllo 🌍\"}}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// A stream that never reports usage and stops mid-answer (provider truncation).
+const TRUNCATED_STREAM: &str = concat!(
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half an ans\"}}]}\n\n",
+    "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"wer\"}}]}\n\n",
+);
+
+/// Cut `raw` into `step`-byte transport chunks — the way an unlucky TCP flush
+/// (or an adversarial provider) would, i.e. through the middle of the JSON and
+/// of multi-byte characters.
+fn split_every(raw: &str, step: usize) -> Vec<Bytes> {
+    raw.as_bytes()
+        .chunks(step.max(1))
+        .map(Bytes::copy_from_slice)
+        .collect()
+}
+
+/// An SSE response whose body yields exactly `chunks`, in order.
+fn sse_response(chunks: Vec<Bytes>) -> Response {
+    let stream = futures_util::stream::iter(chunks.into_iter().map(Ok::<Bytes, std::io::Error>));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream))
+        .expect("static SSE response is valid")
+}
+
+/// A router that serves `raw` as SSE (split into `step`-byte chunks) behind the
+/// strict guard middleware.
+fn streaming_app(
+    server_uri: &str,
+    bundle: &PolicyBundle,
+    raw: &'static str,
+    step: usize,
+) -> Router {
+    Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move || async move { sse_response(split_every(raw, step)) }),
+        )
+        .layer(from_fn_with_state(
+            strict_guard_state(server_uri, bundle),
+            guard_middleware,
+        ))
+}
+
+/// Every reservation settlement the gateway sent, as `(path, body)`.
+async fn settlements(server: &MockServer) -> Vec<(String, Value)> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            let p = r.url.path();
+            p.ends_with("/complete") || p.ends_with("/abandon") || p.ends_with("/cancel")
+        })
+        .map(|r| {
+            (
+                r.url.path().to_string(),
+                serde_json::from_slice(&r.body).unwrap_or(Value::Null),
+            )
+        })
+        .collect()
+}
+
+/// Drain a response body and return the exact chunk sequence the client saw.
+async fn drain_chunks(resp: Response) -> Vec<Bytes> {
+    use http_body_util::BodyExt;
+    let mut body = resp.into_body();
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Some(d) = frame.expect("stream must not error").data_ref() {
+            out.push(d.clone());
+        }
+    }
+    out
+}
+
+fn joined(chunks: &[Bytes]) -> Vec<u8> {
+    chunks.iter().flat_map(|c| c.to_vec()).collect()
+}
+
+/// A stream request with an explicit `max_tokens`, i.e. the shape whose
+/// reservation is wildly larger than the real answer.
+fn stream_request(model: &str, provider: &str, max_tokens: u64) -> Request<Body> {
+    let body = json!({
+        "model": model, "stream": true, "max_tokens": max_tokens,
+        "messages":[{"role":"user","content":"hi"}]
+    });
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-provider", provider)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+/// **The reproduction.** A strict-mode OpenAI stream reserves
+/// `input + max_tokens` and must settle on the PROVIDER's counts — a `complete`
+/// carrying 11/4, costing far less than the reservation — not an `abandon` that
+/// retains 4096 output tokens' worth of estimate.
+#[tokio::test]
+async fn a_strict_openai_stream_completes_with_the_providers_real_usage() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-openai-stream").await;
+    mount_settlement_ok(&server).await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    // Frames deliberately split at 7-byte boundaries: usage recovery must not
+    // depend on the provider's flush pattern.
+    let app = streaming_app(&server.uri(), &bundle, OPENAI_STREAM, 7);
+
+    let resp = app
+        .oneshot(stream_request("gpt-4o", "openai", 4096))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let client_bytes = joined(&drain_chunks(resp).await);
+    assert_eq!(
+        client_bytes,
+        OPENAI_STREAM.as_bytes(),
+        "metering must not alter a single byte the client receives"
+    );
+
+    let estimated = wait_for_path_suffix(&server, "/admit", 1, Duration::from_secs(5)).await[0].1
+        ["estimatedCostUsd"]
+        .as_f64()
+        .unwrap();
+
+    let completes = wait_for_path_suffix(&server, "/complete", 1, Duration::from_secs(5)).await;
+    assert_eq!(completes.len(), 1, "the stream's usage IS recoverable");
+    assert!(completes[0].0.contains("/reservations/res-openai-stream/"));
+    let c = &completes[0].1;
+    assert_eq!(
+        c["inputTokens"], 11,
+        "the provider's count, not the estimate"
+    );
+    assert_eq!(c["outputTokens"], 4, "NOT the 4096 that was reserved");
+    assert_eq!(c["model"], "gpt-4o");
+    assert_eq!(c["requestCount"], 1);
+
+    // The whole point: the settled cost reconciles the reservation DOWN.
+    let settled = c["costUsd"].as_f64().unwrap();
+    assert!(settled > 0.0, "a real call is never free");
+    assert!(
+        settled < estimated,
+        "settled ${settled} must be below the ${estimated} reservation"
+    );
+    assert!(
+        settled * 10.0 < estimated,
+        "a 4096-token reservation for a 4-token answer must shrink by orders of \
+         magnitude; settled ${settled} vs reserved ${estimated}"
+    );
+
+    // ...and it settled exactly once, through `complete` alone.
+    let all = settlements(&server).await;
+    assert_eq!(all.len(), 1, "no double settlement: {all:?}");
+}
+
+/// The same guarantee for Anthropic, whose usage arrives split across two events
+/// (`message_start` input, `message_delta` output) rather than in one frame.
+#[tokio::test]
+async fn a_strict_anthropic_stream_completes_with_the_providers_real_usage() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-anthropic-stream").await;
+    mount_settlement_ok(&server).await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = streaming_app(&server.uri(), &bundle, ANTHROPIC_STREAM, 13);
+
+    let resp = app
+        .oneshot(stream_request("claude-sonnet-4-5", "anthropic", 4096))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        joined(&drain_chunks(resp).await),
+        ANTHROPIC_STREAM.as_bytes(),
+        "the Anthropic dialect must reach the client verbatim"
+    );
+
+    let estimated = wait_for_path_suffix(&server, "/admit", 1, Duration::from_secs(5)).await[0].1
+        ["estimatedCostUsd"]
+        .as_f64()
+        .unwrap();
+
+    let completes = wait_for_path_suffix(&server, "/complete", 1, Duration::from_secs(5)).await;
+    assert_eq!(completes.len(), 1);
+    assert!(completes[0]
+        .0
+        .contains("/reservations/res-anthropic-stream/"));
+    let c = &completes[0].1;
+    assert_eq!(c["inputTokens"], 11, "from message_start");
+    assert_eq!(
+        c["outputTokens"], 4,
+        "from message_delta — NOT the placeholder 1 on message_start, \
+         and NOT the 4096 reserved"
+    );
+    let settled = c["costUsd"].as_f64().unwrap();
+    assert!(settled > 0.0 && settled * 10.0 < estimated);
+    assert_eq!(
+        settlements(&server).await.len(),
+        1,
+        "exactly one settlement"
+    );
+}
+
+/// The case where erring high is genuinely right: the provider truncated before
+/// reporting anything. There is nothing authoritative to reconcile with, so the
+/// conservative estimate must STAY applied — `abandon`, never a fabricated
+/// `complete` (which, at output = 0, would release the entire hold).
+#[tokio::test]
+async fn a_stream_that_dies_mid_flight_without_usage_retains_the_estimate() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-truncated").await;
+    mount_settlement_ok(&server).await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = streaming_app(&server.uri(), &bundle, TRUNCATED_STREAM, 5);
+
+    let resp = app
+        .oneshot(stream_request("gpt-4o", "openai", 4096))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        joined(&drain_chunks(resp).await),
+        TRUNCATED_STREAM.as_bytes(),
+        "a truncated stream still reaches the client exactly as sent"
+    );
+
+    let abandons = wait_for_path_suffix(&server, "/abandon", 1, Duration::from_secs(5)).await;
+    assert_eq!(abandons.len(), 1, "no usage → the estimate stays applied");
+    assert!(abandons[0].0.contains("/reservations/res-truncated/"));
+    assert!(abandons[0].1["reason"]
+        .as_str()
+        .is_some_and(|r| !r.is_empty()));
+    let all = settlements(&server).await;
+    assert_eq!(
+        all.len(),
+        1,
+        "abandon and complete must never both fire: {all:?}"
+    );
+    assert!(
+        !all[0].0.ends_with("/complete"),
+        "the gateway must not invent token counts it never saw"
+    );
+}
+
+/// The same, for an Anthropic stream cut after `message_start`: input tokens are
+/// known but output tokens are not, which is exactly the half that decides the
+/// bill. Completing at output = 0 would release the whole reservation.
+#[tokio::test]
+async fn an_input_only_report_is_not_enough_to_complete() {
+    const HALF: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":900}}}\n\n";
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-halfusage").await;
+    mount_settlement_ok(&server).await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = streaming_app(&server.uri(), &bundle, HALF, 9);
+    let resp = app
+        .oneshot(stream_request("claude-sonnet-4-5", "anthropic", 4096))
+        .await
+        .unwrap();
+    let _ = drain_chunks(resp).await;
+
+    let all = settlements(&server).await;
+    let abandons = wait_for_path_suffix(&server, "/abandon", 1, Duration::from_secs(5)).await;
+    assert_eq!(abandons.len(), 1, "settled: {all:?}");
+    assert_eq!(settlements(&server).await.len(), 1);
+}
+
+/// A client that walks away mid-stream: the usage frame never arrives, so the
+/// estimate is retained — and, critically, the reservation settles EXACTLY ONCE
+/// rather than being left to expire or being settled twice.
+#[tokio::test]
+async fn a_client_disconnecting_mid_stream_settles_exactly_once() {
+    use http_body_util::BodyExt;
+
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-client-gone").await;
+    mount_settlement_ok(&server).await;
+
+    // An upstream that hands over one frame and then stalls: the usage frame is
+    // still "in flight" when the client vanishes.
+    let stalling = || async {
+        let stream = futures_util::stream::unfold(0usize, |i| async move {
+            if i == 0 {
+                let first = Bytes::from_static(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                );
+                Some((Ok::<Bytes, std::io::Error>(first), 1))
+            } else {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                None
+            }
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    };
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(stalling))
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    {
+        let resp = app
+            .oneshot(stream_request("gpt-4o", "openai", 4096))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let first = body.frame().await.expect("first frame").expect("no error");
+        assert!(first
+            .data_ref()
+            .is_some_and(|d| d.starts_with(b"data: {\"choices\"")));
+        // ...and the client goes away, dropping the body mid-stream.
+    }
+
+    let abandons = wait_for_path_suffix(&server, "/abandon", 1, Duration::from_secs(5)).await;
+    assert_eq!(
+        abandons.len(),
+        1,
+        "a disconnect mid-stream must still settle, conservatively"
+    );
+    assert!(abandons[0].0.contains("/reservations/res-client-gone/"));
+    // Give any second settlement a chance to show up before asserting there
+    // isn't one.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let all = settlements(&server).await;
+    assert_eq!(all.len(), 1, "settled more than once: {all:?}");
+}
+
+/// Byte-exactness under adversarial framing: whatever offsets the provider
+/// flushes at, the client receives the identical byte sequence — and the
+/// identical chunk sequence — whether or not metering is active.
+#[tokio::test]
+async fn metering_is_byte_exact_for_frames_split_at_arbitrary_offsets() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-byte-exact").await;
+    mount_settlement_ok(&server).await;
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+
+    // 1 byte at a time cuts through every multi-byte character and JSON literal;
+    // the others land mid-frame at unrelated offsets.
+    for step in [1usize, 2, 3, 17, 64, OPENAI_STREAM.len()] {
+        // Unmetered: the same handler with no guard layer at all.
+        let plain = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move { sse_response(split_every(OPENAI_STREAM, step)) }),
+        );
+        let want = drain_chunks(
+            plain
+                .oneshot(stream_request("gpt-4o", "openai", 4096))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let metered = streaming_app(&server.uri(), &bundle, OPENAI_STREAM, step);
+        let got = drain_chunks(
+            metered
+                .oneshot(stream_request("gpt-4o", "openai", 4096))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            joined(&got),
+            OPENAI_STREAM.as_bytes(),
+            "metering corrupted the stream at step {step}"
+        );
+        assert_eq!(
+            got, want,
+            "metering changed the chunk sequence at step {step}"
+        );
+    }
+
+    // ...and every one of those requests still settled on the real usage.
+    let completes = wait_for_path_suffix(&server, "/complete", 6, Duration::from_secs(5)).await;
+    assert_eq!(completes.len(), 6, "one completion per metered request");
+    for (_, c) in &completes {
+        assert_eq!(c["inputTokens"], 11);
+        assert_eq!(c["outputTokens"], 4);
+    }
+    assert!(
+        wait_for_path_suffix(&server, "/abandon", 1, Duration::from_millis(50))
+            .await
+            .is_empty()
+    );
+}
+
+/// Backpressure: the tee inspects chunks as they pass, it does not accumulate
+/// the response. A frame the provider emits immediately must reach the client
+/// immediately, even though a later frame is still seconds away.
+#[tokio::test]
+async fn metering_does_not_buffer_the_stream_or_delay_the_client() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-backpressure").await;
+    mount_settlement_ok(&server).await;
+
+    // Frame 1 now; frame 2 (carrying usage) only after a long pause.
+    let slow_stream = || async {
+        let stream = futures_util::stream::unfold(0usize, |i| async move {
+            match i {
+                0 => Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"}}]}\n\n",
+                    )),
+                    1,
+                )),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    Some((
+                        Ok(Bytes::from_static(
+                            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\ndata: [DONE]\n\n",
+                        )),
+                        2,
+                    ))
+                }
+                _ => None,
+            }
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    };
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(slow_stream))
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    use http_body_util::BodyExt;
+    let started = std::time::Instant::now();
+    let resp = app
+        .oneshot(stream_request("gpt-4o", "openai", 4096))
+        .await
+        .unwrap();
+    let mut body = resp.into_body();
+    let first = body.frame().await.expect("first frame").expect("no error");
+    let elapsed = started.elapsed();
+    assert!(
+        first
+            .data_ref()
+            .is_some_and(|d| d.starts_with(b"data: {\"choices\"")),
+        "the first frame must arrive as sent"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the first frame waited {elapsed:?} — metering is buffering the response \
+         instead of teeing it"
+    );
+
+    // Draining the rest still yields the real usage at settlement. (Settlement
+    // is keyed to the body's lifetime, so the client has to let go of it — same
+    // as a real connection closing.)
+    while let Some(f) = body.frame().await {
+        f.expect("no error");
+    }
+    drop(body);
+    let completes = wait_for_path_suffix(&server, "/complete", 1, Duration::from_secs(5)).await;
+    assert_eq!(completes.len(), 1);
+    assert_eq!(completes[0].1["outputTokens"], 4);
 }

@@ -13,9 +13,10 @@
 //!    with SSE frame boundaries: a flush can land in the middle of the JSON, or
 //!    in the middle of a multi-byte UTF-8 character. Bytes are buffered and only
 //!    *complete* frames (terminated by a blank line, `\n\n` or `\r\n\r\n`) are
-//!    decoded. This mirrors the reassembler already proven in
-//!    `telemetry::middleware` (which is private to that module, so the approach
-//!    is duplicated here rather than the file being touched).
+//!    decoded. The reassembler is
+//!    [`policy::metering::SseFrameBuffer`](crate::policy::metering::SseFrameBuffer)
+//!    — the single shared implementation, also used by `telemetry::middleware`
+//!    and by the guard's streaming settlement.
 //!
 //! 2. **Errors are visible, never a clean EOF.** A truncated stream that still
 //!    ends politely is indistinguishable from a complete answer, so a caller
@@ -30,15 +31,12 @@
 //!    chunk as an OpenAI `usage` object, which is what the telemetry layer reads
 //!    to price the request.
 
+use crate::policy::metering::SseFrameBuffer;
 use axum::body::{Body, Bytes};
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::pin::Pin;
 use tracing::{debug, warn};
-
-/// Upper bound on a single unterminated SSE frame. A frame larger than this is
-/// treated as a broken stream rather than being buffered without limit.
-const MAX_FRAME_BYTES: usize = 5 * 1024 * 1024;
 
 /// Model name used when the upstream never announced one (no `message_start`).
 const UNKNOWN_MODEL: &str = "claude";
@@ -57,62 +55,6 @@ pub struct TransformOutput {
 impl TransformOutput {
     fn text(sse: String) -> Self {
         Self { sse, fatal: None }
-    }
-}
-
-/// Incremental SSE frame reassembler.
-///
-/// Buffers at the **byte** level and hands back only whole frames. A transport
-/// chunk can split a multi-byte UTF-8 character, so decoding per chunk would
-/// corrupt or drop it; frame terminators are ASCII, so a complete frame is
-/// always complete UTF-8.
-#[derive(Default)]
-struct SseFrameBuffer {
-    buf: Vec<u8>,
-}
-
-impl SseFrameBuffer {
-    /// Append transport bytes; return every frame they complete.
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buf.extend_from_slice(bytes);
-        let mut out = Vec::new();
-        while let Some((end, sep_len)) = Self::find_frame_end(&self.buf) {
-            let frame = self.buf.drain(..end + sep_len).collect::<Vec<u8>>();
-            out.push(String::from_utf8_lossy(&frame[..end]).into_owned());
-        }
-        // A frame that never terminates must not grow without bound; emit what
-        // we have so the buffer stays capped. The oversized payload will fail to
-        // parse downstream and surface as an error, which is the honest outcome.
-        if self.buf.len() > MAX_FRAME_BYTES {
-            let frame = std::mem::take(&mut self.buf);
-            out.push(String::from_utf8_lossy(&frame).into_owned());
-        }
-        out
-    }
-
-    /// The unterminated remainder at end of stream, if any.
-    fn flush(&mut self) -> Option<String> {
-        if self.buf.is_empty() {
-            return None;
-        }
-        let frame = std::mem::take(&mut self.buf);
-        let text = String::from_utf8_lossy(&frame).into_owned();
-        if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    }
-
-    /// Offset and length of the first frame terminator, if the buffer holds one.
-    fn find_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
-        let find = |pat: &[u8]| buf.windows(pat.len()).position(|w| w == pat);
-        match (find(b"\r\n\r\n"), find(b"\n\n")) {
-            (Some(a), Some(b)) if a <= b => Some((a, 4)),
-            (_, Some(b)) => Some((b, 2)),
-            (Some(a), None) => Some((a, 4)),
-            (None, None) => None,
-        }
     }
 }
 

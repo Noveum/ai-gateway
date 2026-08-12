@@ -151,10 +151,17 @@ async fn main() {
             );
             // Spawn the usage reporter and register the ALLOWED exporter. BLOCKED
             // events are reported from the guard middleware via the same reporter.
+            //
+            // The exporter is gated on the admission client: while a strict
+            // `cost_cap` is active, each request's *reservation settlement* is
+            // its metered record, and reporting it here as well would count the
+            // same call twice (halving every cap).
             let reporter = UsageReporter::spawn(cfg.clone());
-            metrics_registry
-                .register_exporter(Box::new(NovaGuardUsagePlugin::new(reporter.clone())))
-                .await;
+            let mut exporter = NovaGuardUsagePlugin::new(reporter.clone());
+            if let Some(admission) = &admission {
+                exporter = exporter.metered_by_admission(engine.clone(), admission.clone());
+            }
+            metrics_registry.register_exporter(Box::new(exporter)).await;
             (
                 engine,
                 Some(Arc::new(RemoteLiveState::new(cfg))),

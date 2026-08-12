@@ -26,6 +26,12 @@ pub mod policy;
 pub mod routing;
 pub mod sigv4;
 
+/// Shared metering primitives — SSE frame reassembly and response/stream usage
+/// parsing — re-exported at the crate root because they are consumed by all
+/// three deployment shapes (native telemetry, the Anthropic stream translator,
+/// and the Cloudflare Worker bridge). Compiles on native AND wasm32.
+pub use policy::metering;
+
 // Native runtime (Tokio + Axum server): the binary, Docker image, and library
 // server. Not compiled for the wasm32 (Cloudflare Worker) target.
 #[cfg(not(target_arch = "wasm32"))]

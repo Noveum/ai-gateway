@@ -12,6 +12,12 @@
 //! output-phase enforcement in v1 (a documented limitation shared across LLM
 //! gateways); input-phase enforcement and blocking still apply to streaming
 //! requests.
+//!
+//! Streams are, however, **metered**: a strict-mode stream's body is teed
+//! through [`crate::policy::metering::StreamUsageScanner`] as it flows to the
+//! client, so the platform reservation settles on the provider's real token
+//! counts instead of retaining the `input + max_tokens` estimate. See
+//! [`attach_stream_settlement`].
 
 use std::sync::Arc;
 
@@ -158,6 +164,9 @@ pub async fn guard_middleware(
 
     let mut forward_bytes = bytes.clone();
     let mut body_mutated = false;
+    // This request's forward estimate, retained past the input phase for the
+    // strict fail-open metering path at the bottom of this function.
+    let mut estimate: Option<RequestEstimate> = None;
     // This request's pending-usage reservation. Held as an RAII guard from the
     // moment it is taken, so that a cancellation *anywhere* below — including
     // while awaiting upstream response headers — still transitions the ledger
@@ -200,9 +209,14 @@ pub async fn guard_middleware(
         // `max_output_tokens` is bounded by `MAX_OUTPUT_TOKEN_LIMIT` above, so
         // this cannot overflow; `saturating_add` keeps that true if either
         // bound ever changes.
-        let est_tokens = u64::from(est_input_tokens).saturating_add(
-            max_output_tokens.unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
-        );
+        let est_output_tokens =
+            max_output_tokens.unwrap_or_else(crate::policy::pricing::assumed_output_tokens);
+        let est_tokens = u64::from(est_input_tokens).saturating_add(est_output_tokens);
+        estimate = Some(RequestEstimate {
+            input_tokens: est_input_tokens,
+            output_tokens: u32::try_from(est_output_tokens).unwrap_or(u32::MAX),
+            cost_usd: est_request_cost,
+        });
 
         // --- ADMISSION ---
         //
@@ -446,6 +460,14 @@ pub async fn guard_middleware(
     // or the client disconnects, leaving the conservative estimate applied.
     // Either way the send happens on a spawned task, never on the client's path.
     if let Some(guard) = admission_guard {
+        // A stream's usage is not in the headers or a buffered body — it is in
+        // the LAST SSE frame. Retaining the reservation estimate for it (the old
+        // behavior) charges `input + max_tokens`, routinely ~100x a real
+        // streamed reply. So tee the body: bytes pass through untouched while a
+        // scanner reads the final usage frame, and settle from what it saw.
+        if actual_usage.is_none() && is_event_stream(&response) {
+            return attach_stream_settlement(response, guard, model.clone());
+        }
         return match actual_usage {
             Some(u) => {
                 let cost =
@@ -465,11 +487,24 @@ pub async fn guard_middleware(
                 });
                 response
             }
-            // Streaming responses, non-JSON bodies, and bodies past the
-            // inspection cap all land here: the call reached the provider but no
-            // authoritative usage is recoverable in this layer.
+            // Non-JSON bodies and bodies past the inspection cap land here: the
+            // call reached the provider but no authoritative usage is
+            // recoverable, so the conservative estimate has to stand.
             None => attach_body_guard(response, guard),
         };
+    }
+
+    // --- METERING (strict, but never reserved) ---
+    //
+    // The strict path ran yet we hold no reservation, so admission was
+    // unavailable and the policy failed open. Nothing platform-side knows this
+    // call happened: there is no reservation to settle, and the legacy telemetry
+    // exporter is deliberately silent whenever admission owns metering (see
+    // `NovaGuardUsagePlugin`). Report it here, or an outage of the admission API
+    // would make every call it waved through invisible to the very cost cap that
+    // waved it through.
+    if strict_client.is_some() {
+        report_unreserved_usage(gs.usage.as_ref(), &model, &response, actual_usage, estimate);
     }
 
     // Transfer the guard we have held since `reserve()` into the response body,
@@ -505,39 +540,182 @@ fn attach_body_guard<G: Send + 'static>(response: Response, guard: G) -> Respons
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-/// Authoritative token counts recovered from a provider response body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ActualUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+/// Is this an SSE response (i.e. one whose usage lives in its final frame)?
+fn is_event_stream(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false)
 }
 
-/// Pull the provider's own token counts out of a (non-streaming) response body.
+/// Wrap a streaming response so the provider's real token counts settle the
+/// reservation, while every byte reaches the client unchanged and in order.
 ///
-/// Accepts the OpenAI spelling (`usage.prompt_tokens` / `completion_tokens`) and
-/// the Anthropic one (`usage.input_tokens` / `output_tokens`) — native providers
-/// normalize to OpenAI shape before this middleware runs, but the raw shape
-/// still reaches us on pass-through paths. `None` means "not authoritative":
-/// the caller must NOT invent numbers, it abandons the reservation instead so
-/// the conservative estimate stands.
-pub(crate) fn extract_actual_usage(body: &Value) -> Option<ActualUsage> {
-    let usage = body.get("usage")?;
-    let num = |keys: [&str; 2]| -> Option<u32> {
-        keys.iter()
-            .find_map(|k| usage.get(*k).and_then(|v| v.as_u64()))
-            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
-    };
-    let input = num(["prompt_tokens", "input_tokens"]);
-    let output = num(["completion_tokens", "output_tokens"]);
-    // A `usage` object with neither count is not usage at all.
-    if input.is_none() && output.is_none() {
-        return None;
-    }
-    Some(ActualUsage {
-        input_tokens: input.unwrap_or(0),
-        output_tokens: output.unwrap_or(0),
-    })
+/// The body is **teed, not buffered**: each chunk is handed to the scanner and
+/// then forwarded as the very same [`Bytes`](axum::body::Bytes) value, so chunk
+/// boundaries, ordering and backpressure are exactly what they would be without
+/// metering (the stream is still only polled by the downstream consumer, and
+/// nothing is held back waiting for the usage frame).
+///
+/// Settlement happens when the wrapped stream is dropped — the body having been
+/// fully read, or the client having disconnected — via [`StreamSettler`]'s
+/// `Drop`, which is off the request path.
+fn attach_stream_settlement(
+    response: Response,
+    guard: crate::policy::admission::AdmissionGuard,
+    model: String,
+) -> Response {
+    use futures_util::StreamExt;
+    let (parts, body) = response.into_parts();
+    let mut settler = StreamSettler::new(guard, model);
+    let stream = body.into_data_stream().map(move |chunk| {
+        if let Ok(bytes) = chunk.as_ref() {
+            settler.observe(bytes);
+        }
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
+
+/// Holds a platform reservation for the lifetime of a streaming body and settles
+/// it from the usage the stream actually reported.
+///
+/// * usage recovered (OpenAI's `include_usage` chunk, Anthropic's
+///   `message_delta`) → `complete`, reconciling the reservation DOWN from
+///   `input + max_tokens` to what was really generated;
+/// * no recoverable usage → `abandon`, which retains the conservative estimate.
+///   That covers a client that disconnected mid-stream, a provider that
+///   truncated before reporting, and a provider that never reports usage at all.
+///
+/// Exactly one settlement is ever sent: the guard is moved out of the `Option`
+/// in `Drop`, and `AdmissionGuard`'s own `Drop` is what dispatches it.
+struct StreamSettler {
+    guard: Option<crate::policy::admission::AdmissionGuard>,
+    scanner: crate::policy::metering::StreamUsageScanner,
+    model: String,
+}
+
+impl StreamSettler {
+    fn new(guard: crate::policy::admission::AdmissionGuard, model: String) -> Self {
+        Self {
+            guard: Some(guard),
+            scanner: crate::policy::metering::StreamUsageScanner::new(),
+            model,
+        }
+    }
+
+    /// Inspect one transport chunk. Never mutates or withholds it.
+    fn observe(&mut self, bytes: &[u8]) {
+        self.scanner.push(bytes);
+    }
+}
+
+impl Drop for StreamSettler {
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        self.scanner.finish();
+        match self.scanner.usage() {
+            Some(u) => {
+                let cost = crate::policy::pricing::estimate_cost(
+                    &self.model,
+                    u.input_tokens,
+                    u.output_tokens,
+                );
+                debug!(
+                    reservation = %guard.reservation_id(), model = %self.model,
+                    input_tokens = u.input_tokens, output_tokens = u.output_tokens, cost,
+                    "Nova Guard: completing platform reservation with a stream's reported usage"
+                );
+                guard.complete(crate::policy::admission::SettlementUsage {
+                    model: Some(self.model.clone()),
+                    input_tokens: u64::from(u.input_tokens),
+                    output_tokens: u64::from(u.output_tokens),
+                    cost_usd: cost,
+                    request_count: 1,
+                    event_id: Some(crate::policy::usage::new_event_id()),
+                });
+            }
+            None => {
+                debug!(
+                    reservation = %guard.reservation_id(), model = %self.model,
+                    "Nova Guard: stream ended without recoverable usage; retaining the estimate"
+                );
+                guard.abandon("stream ended without authoritative usage");
+            }
+        }
+    }
+}
+
+/// This request's *forward* estimate, as charged at admission time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RequestEstimate {
+    pub input_tokens: u32,
+    /// The request's output limit, or the assumed completion size when it set none.
+    pub output_tokens: u32,
+    pub cost_usd: f64,
+}
+
+/// Header a Nova Guard synthetic block carries. A "successful" block is still a
+/// block: in `SyntheticSuccess` mode it is served as a 200, so status alone
+/// cannot tell a served call from a refused one.
+const GUARD_BLOCKED_HEADER: &str = "x-noveum-guard-blocked";
+
+/// Report one ALLOWED usage event for a call that ran **without** a platform
+/// reservation while admission owned metering (strict mode, admission
+/// unavailable, policy failed open).
+///
+/// Applies the same "is this metered usage?" filter as the telemetry exporter —
+/// synthetic blocks and failed provider calls are not usage — so the two paths
+/// can never disagree about which requests count.
+fn report_unreserved_usage(
+    usage: Option<&crate::policy::usage::UsageReporter>,
+    model: &str,
+    response: &Response,
+    actual: Option<ActualUsage>,
+    estimate: Option<RequestEstimate>,
+) {
+    let Some(reporter) = usage else { return };
+    if model.trim().is_empty()
+        || response.headers().contains_key(GUARD_BLOCKED_HEADER)
+        || !(200..300).contains(&response.status().as_u16())
+    {
+        return;
+    }
+    // The provider's own counts when the response carried them; otherwise the
+    // conservative forward estimate — the same choice `abandon` makes for a
+    // reservation, and for the same reason: a call this layer cannot measure
+    // (a stream, a body past the inspection cap) must not be metered at $0.
+    let (input_tokens, output_tokens, cost_usd) = match (actual, estimate) {
+        (Some(u), _) => (
+            u.input_tokens,
+            u.output_tokens,
+            crate::policy::pricing::estimate_cost(model, u.input_tokens, u.output_tokens),
+        ),
+        (None, Some(e)) => (e.input_tokens, e.output_tokens, e.cost_usd),
+        // No usage and no estimate: nothing honest to report.
+        (None, None) => return,
+    };
+    debug!(
+        model = %model, input_tokens, output_tokens, cost_usd, measured = actual.is_some(),
+        "Nova Guard: metering a fail-open request that was never reserved"
+    );
+    reporter.report(crate::policy::usage::UsageEvent::allowed(
+        crate::policy::usage::new_event_id(),
+        model,
+        cost_usd,
+        input_tokens,
+        output_tokens,
+    ));
+}
+
+// Authoritative token counts + the parser that recovers them from a buffered
+// provider body. Both live in `policy::metering` so the Worker bridge (which has
+// no Tower/Axum layer) reads usage exactly the way this middleware does.
+pub use crate::policy::metering::{extract_actual_usage, ActualUsage};
 
 /// Should this request be inspected? POST, JSON, on the `/v1/` proxy path.
 fn is_guardable<B>(req: &Request<B>) -> bool {
@@ -588,8 +766,10 @@ async fn enforce_output(
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
     if is_stream {
-        // A stream carries its usage in a final SSE chunk this layer never
-        // parses, so there is no authoritative usage to report here.
+        // A stream carries its usage in a final SSE frame, which this
+        // buffer-the-body layer cannot see. It is NOT unrecoverable, though:
+        // `attach_stream_settlement` tees the body and reads it as it flows, so
+        // the reservation still settles on real numbers.
         debug!("Nova Guard: streaming response passed through without output enforcement (v1)");
         return (response, None);
     }

@@ -94,11 +94,25 @@ The bundle format (`nova-guard.json`) is shared with the Nova Guard SDK:
 
 ## Policy types
 
-All of the types below are enforced in-process. The classifier types
-(`scorer_gate`, `prompt_injection`, `topic_restriction`, `content_moderation`,
-`grounding_check`) are reserved names that parse cleanly but are **not yet
-enforced** (they would require an external scoring service); a bundle containing
-them is accepted and those policies are skipped.
+The policy contract is one versioned JSON Schema,
+[`schema/novaguard-policy.v1.json`](../schema/novaguard-policy.v1.json). It is the
+single source of truth for the gateway, the Noveum platform and the Python SDK;
+the Rust `PolicyType` enum and the platform's TypeScript module are both
+generated from it by `codegen/generate_policy_types.py`, and CI fails on drift.
+Add a policy type there, never by hand in a consumer.
+
+Fourteen types are defined. The nine below are **enforced**. The five classifier
+types (`scorer_gate`, `prompt_injection`, `topic_restriction`,
+`content_moderation`, `grounding_check`) are **reserved**: their config is
+validated, but enforcing them needs an external scoring service this build does
+not call.
+
+A policy the engine cannot enforce is never silently skipped. It is logged at
+`error!` naming the policy and the reason, counted by
+`PolicyEngine::rejected_policies()`, and refuses startup when it came from a
+local bundle. If the policy is marked `failClosed`, it blocks traffic: a policy
+that can never compile can never be evaluated, which is exactly what
+`failClosed` is for. Shadow mode still never blocks.
 
 | Type | Phase(s) | What it does |
 |---|---|---|
