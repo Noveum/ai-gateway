@@ -35,6 +35,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use crate::policy::pricing::CostBreakdown;
 use crate::policy::remote::{RemoteConfig, PLATFORM_CLIENT};
 
 /// Max events per `POST` body (the platform accepts a single object or an array
@@ -114,6 +115,19 @@ pub struct UsageEvent {
     /// ISO-8601 (clamped server-side to the last 48h).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// The pricing catalog version `cost_usd` was computed from, so a billed
+    /// amount can be traced back to the exact rate card that produced it.
+    /// Without this a historical cost is unreconcilable the moment a rate
+    /// changes, and every rate in the catalog changes eventually.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing_version: Option<String>,
+    /// The itemized cost: uncached input, cache read, cache write, output and
+    /// per-request tool fees, plus whether any dimension could not be priced.
+    /// Posted for auditability — an ALLOWED event that says `$0.07` and nothing
+    /// else cannot be checked against an invoice, and one whose total quietly
+    /// omits an unpriceable dimension cannot be trusted at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_breakdown: Option<CostBreakdown>,
 }
 
 impl UsageEvent {
@@ -138,7 +152,35 @@ impl UsageEvent {
             policy_id: None,
             reason: None,
             timestamp: Some(now_iso()),
+            pricing_version: None,
+            cost_breakdown: None,
         }
+    }
+
+    /// An ALLOWED event carrying the full itemized cost.
+    ///
+    /// Preferred over [`UsageEvent::allowed`] wherever a breakdown exists: the
+    /// total is taken from the breakdown (which already charges a conservative
+    /// bound for any dimension the catalog could not price), and the components
+    /// plus the catalog version ride along so the platform can audit and
+    /// reconcile the amount rather than take a bare number on trust.
+    pub fn allowed_with_breakdown(
+        event_id: String,
+        model: impl Into<String>,
+        breakdown: CostBreakdown,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) -> Self {
+        let mut event = Self::allowed(
+            event_id,
+            model,
+            breakdown.total_usd,
+            input_tokens,
+            output_tokens,
+        );
+        event.pricing_version = Some(breakdown.pricing_version.clone());
+        event.cost_breakdown = Some(breakdown);
+        event
     }
 
     /// A BLOCKED event sent in place of the model call. `blocked_by` must be one
@@ -162,6 +204,10 @@ impl UsageEvent {
             policy_id,
             reason: reason.map(|r| truncate(r, MAX_REASON_LEN)),
             timestamp: Some(now_iso()),
+            // A block never ran: there is no cost, so there is nothing to
+            // itemize and no rate card to trace an amount back to.
+            pricing_version: None,
+            cost_breakdown: None,
         }
     }
 }
