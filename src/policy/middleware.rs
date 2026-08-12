@@ -210,12 +210,14 @@ pub async fn guard_middleware(
                 return invalid_output_limit_response(key);
             }
         };
-        let est_request_cost = crate::policy::pricing::estimate_request_cost(
+        // Always yields a figure: an unknown model reserves the defensive
+        // assumption rather than $0, so it cannot walk past a cap it will then
+        // be billed against. See `pricing::reserve_request_cost`.
+        let est_request_cost = crate::policy::pricing::reserve_request_cost(
             &model,
             est_input_tokens,
             max_output_tokens,
-        )
-        .unwrap_or(0.0);
+        );
         // `max_output_tokens` is bounded by `MAX_OUTPUT_TOKEN_LIMIT` above, so
         // this cannot overflow; `saturating_add` keeps that true if either
         // bound ever changes.

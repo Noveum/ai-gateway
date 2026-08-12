@@ -218,6 +218,9 @@ async fn handle_regular_response(
 
     debug!("Extracted provider metrics: {:?}", provider_metrics);
 
+    let mut provider_metrics = provider_metrics;
+    resolve_model_for_metering(&mut provider_metrics.model, req_body.as_ref());
+
     let (cost, cost_breakdown) = meter(
         provider_metrics.cost,
         &provider_metrics.model,
@@ -481,6 +484,10 @@ async fn handle_streaming_response(
                 .iter()
                 .rev()
                 .find(|c| c.get("usage").map(|u| u.is_object()).unwrap_or(false));
+            // Streams are where a placeholder id survives: if no event ever named
+            // the model, the extractor's substitute is still sitting here, and
+            // metering it would price a call whose model was never learned.
+            resolve_model_for_metering(&mut accumulated_metrics.model, req_body.as_ref());
             let (cost, breakdown) = meter(
                 accumulated_metrics.cost,
                 &accumulated_metrics.model,
@@ -577,6 +584,44 @@ fn ingest_stream_payload(
                 *final_metrics_found = true;
             }
         }
+    }
+}
+
+/// Replace a placeholder model id with the one the client actually asked for.
+///
+/// Streaming extractors substitute a literal when an individual event carries no
+/// `model` field - Groq's is `"llama"`, Anthropic's is `"claude"`. Usually a
+/// later event names the real model and `merge_streaming` adopts it. When none
+/// ever does, the placeholder survives to the metering boundary, and because it
+/// matches nothing in the catalog it is priced as an *unknown model*: the
+/// defensive catalog maximum of $15/$60 per 1M. For a `llama-3.3-70b` stream
+/// that is roughly 50x the real rate.
+///
+/// The fix is to resolve the id rather than to weaken the assumption, which is
+/// load-bearing for genuinely unknown models. The request body names the model -
+/// it is the same value the guard middleware already admits and reserves
+/// against - so metering and admission agree by construction rather than by
+/// coincidence.
+///
+/// A request that names no model either leaves the placeholder in place: there
+/// is nothing to resolve it to, and the conservative assumption is then the
+/// right answer.
+fn resolve_model_for_metering(model: &mut String, req_body: Option<&Value>) {
+    if !ProviderMetrics::is_placeholder_model(model) {
+        return;
+    }
+    let requested = req_body
+        .and_then(|b| b.get("model"))
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|m| !ProviderMetrics::is_placeholder_model(m));
+    if let Some(requested) = requested {
+        debug!(
+            "Metering: no response event named the model (placeholder {:?}); \
+             falling back to the requested model {:?}",
+            model, requested
+        );
+        *model = requested.to_string();
     }
 }
 
@@ -1098,5 +1143,57 @@ mod meter_tests {
         // The token pair alone cannot see this fee at all.
         let tokens_only = backfill_cost(None, "sonar-pro", Some(100), Some(100)).unwrap();
         assert!(cost.unwrap() > tokens_only);
+    }
+
+    /// The Groq over-metering bug. A stream whose events never name the model
+    /// leaves the extractor's placeholder in place; pricing it as an unknown
+    /// model charges the catalog maximum, ~50x a real llama rate.
+    #[test]
+    fn a_placeholder_model_resolves_to_the_requested_one() {
+        use serde_json::json;
+
+        let req = json!({"model": "llama-3.3-70b-versatile", "stream": true});
+
+        // Every placeholder the extractors substitute is resolved.
+        for placeholder in ["", "unknown", "llama", "claude", "  "] {
+            let mut model = placeholder.to_string();
+            resolve_model_for_metering(&mut model, Some(&req));
+            assert_eq!(
+                model, "llama-3.3-70b-versatile",
+                "placeholder {placeholder:?} must resolve to the requested model"
+            );
+        }
+
+        // A model the response DID name is authoritative and must not be
+        // overwritten by the request - a provider may serve an alias.
+        let mut model = "llama-3.1-8b-instant".to_string();
+        resolve_model_for_metering(&mut model, Some(&req));
+        assert_eq!(model, "llama-3.1-8b-instant");
+
+        // Nothing to resolve to: the placeholder stands, and the defensive
+        // unknown-model assumption is then the correct answer.
+        for body in [None, Some(json!({})), Some(json!({"model": "unknown"}))] {
+            let mut model = "llama".to_string();
+            resolve_model_for_metering(&mut model, body.as_ref());
+            assert_eq!(model, "llama", "body {body:?} carries no model to use");
+        }
+    }
+
+    /// The resolved id is what pricing sees, so the bug is fixed where it hurt:
+    /// the metered cost.
+    #[test]
+    fn resolving_the_placeholder_prices_the_real_model_not_the_assumption() {
+        use serde_json::json;
+
+        let assumed = crate::policy::pricing::price_call("llama", 1000, 1000).usd;
+        let mut model = "llama".to_string();
+        resolve_model_for_metering(&mut model, Some(&json!({"model": "gpt-4o"})));
+        let resolved = crate::policy::pricing::price_call(&model, 1000, 1000).usd;
+
+        assert!(
+            resolved < assumed,
+            "resolving must lower the cost from the catalog maximum: \
+             assumed {assumed}, resolved {resolved}"
+        );
     }
 }

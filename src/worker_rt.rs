@@ -733,8 +733,9 @@ async fn proxy(
                 Ok(v) => v,
                 Err(key) => return invalid_output_limit(key),
             };
-            let est_cost = crate::policy::pricing::estimate_request_cost(&model, est_in, max_out)
-                .unwrap_or(0.0);
+            // Unknown models reserve the defensive assumption, not $0 - the
+            // edge must not admit what the native path would refuse.
+            let est_cost = crate::policy::pricing::reserve_request_cost(&model, est_in, max_out);
             let request = AdmitRequest {
                 // Fresh idempotency key per logical request; the client's own
                 // retries inside `admit` reuse it, so a transport failure

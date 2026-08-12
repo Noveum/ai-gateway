@@ -272,6 +272,15 @@ during the rollout.
 > size. `rate_limit` follows the same reservation as the cost cap on the strict
 > path and is otherwise per-process.
 
+> **An unknown model is priced high, not rejected.** A model id the catalog does
+> not know is estimated at the catalog's *maximum* published rate (today $15/$60
+> per 1M), tagged as an assumption, and logged once per distinct id. It is
+> reserved at that rate too, so it cannot consume cap headroom it will later be
+> billed for. The gateway does not refuse unrecognized model ids — it is a
+> pass-through proxy, and doing so would break every provider model launch. To
+> refuse calls you cannot meter, set `failClosed: true` on a `cost_cap`: that
+> blocks an unpriceable model, per policy rather than globally.
+
 > **Costs are estimates, not billing.** The pricing table
 > (`src/policy/pricing.rs`) models standard per-token rates and documented
 > long-context tiers. It does **not** model cached input, cache writes, batch

@@ -335,9 +335,25 @@ impl BillableUsage {
 /// early and an alertable warning; under-estimating a real model leaks spend
 /// past every cost cap silently, which is exactly the bug this replaces.
 ///
-/// NOTE: the *number* is a defensive default, not a ratified pricing policy
-/// (see NOV-135). Whether an unknown model should instead be rejected outright
-/// is likewise a policy decision; this function only guarantees it is never $0.
+/// NOV-135, decided. Two questions were open here; both are now settled.
+///
+/// **The rate stays the derived catalog maximum.** It is not invented, it rises
+/// automatically with the catalog, and it errs in the only safe direction:
+/// over-estimating a typo costs one early block plus an alertable warning, while
+/// under-estimating a real model leaks spend past every cap silently. The
+/// complaint that drove this — Groq streams metering ~50x high — was never the
+/// assumption's fault. Those streams arrived carrying a *placeholder* id that no
+/// event had ever populated, and the cure was to resolve it from the request
+/// (`telemetry::middleware::resolve_model_for_metering`), not to lower the
+/// assumption for every genuinely unknown model.
+///
+/// **An unknown model is priced high, never rejected.** This gateway is a
+/// pass-through proxy; refusing an id it does not recognize would turn every
+/// provider model launch into an outage on a component that has no business
+/// having an opinion about which models exist. Operators who *do* want an
+/// unmeterable call refused already have a per-policy lever that is strictly
+/// better than a global switch: a `cost_cap` with `failClosed: true` blocks a
+/// model it cannot meter. Strictness belongs to the policy, not the proxy.
 pub fn assumed_unknown_price() -> ModelPrice {
     static ASSUMED: OnceLock<ModelPrice> = OnceLock::new();
     *ASSUMED.get_or_init(|| {
@@ -851,10 +867,8 @@ pub fn assumed_output_tokens() -> u64 {
 /// has no pricing entry — the caller decides whether an unmeterable call fails
 /// open or closed (`cost_cap` blocks unknown models when `fail_closed`).
 ///
-/// This is the *admission* path and still fails open by returning `None`;
-/// switching it to reserve [`assumed_unknown_price`] instead — i.e. letting an
-/// unknown model consume cap headroom before it runs — is a policy decision
-/// pending NOV-135. The *billing* path ([`price_usage`]) is already defensive.
+/// This is the catalog-only signal. Callers that must reserve an amount should
+/// use [`reserve_request_cost`], which never returns `None`.
 pub fn estimate_request_cost(
     model: &str,
     input_tokens: u32,
@@ -866,6 +880,31 @@ pub fn estimate_request_cost(
         (input_tokens as f64 / 1_000_000.0) * p.input_per_1m
             + (out as f64 / 1_000_000.0) * p.output_per_1m,
     )
+}
+
+/// The amount to reserve for a request before forwarding it. **Always yields a
+/// figure**, falling back to [`assumed_unknown_price`] for a model the catalog
+/// does not know.
+///
+/// NOV-135, decided. Admission used to return `None` for an unknown model and
+/// every caller read that as `0.0`, so an unknown model reserved **nothing**
+/// while [`price_usage`] billed it at the catalog maximum on the way out. A cost
+/// cap could therefore be walked straight past by naming a model the gateway had
+/// never heard of — the same class of hole as metering a stream at its estimate,
+/// and reachable by anyone who can pick a model id.
+///
+/// Reserving and billing now rest on the same assumption, so a cap sees an
+/// unknown model coming. The direction is deliberate: over-reserving a typo
+/// costs one request blocked slightly early plus an alertable warning, while
+/// under-reserving a real model leaks spend past every cap silently.
+pub fn reserve_request_cost(model: &str, input_tokens: u32, max_output_tokens: Option<u64>) -> f64 {
+    estimate_request_cost(model, input_tokens, max_output_tokens).unwrap_or_else(|| {
+        let p = assumed_unknown_price();
+        warn_unknown_model(model, &canonical(model), p);
+        let out = max_output_tokens.unwrap_or_else(assumed_output_tokens);
+        (input_tokens as f64 / 1_000_000.0) * p.input_per_1m
+            + (out as f64 / 1_000_000.0) * p.output_per_1m
+    })
 }
 
 /// The forward reservation for a request, as a full breakdown.
@@ -1164,6 +1203,49 @@ mod tests {
         let c = estimate_cost("gpt-4o-mini", 1000, 500);
         let expected = (1000.0 / 1e6) * 0.15 + (500.0 / 1e6) * 0.60;
         assert!((c - expected).abs() < 1e-12);
+    }
+
+    /// NOV-135. Admission used to return `None` for an unknown model and every
+    /// caller read that as $0, so an unknown id reserved nothing and was then
+    /// billed at the catalog maximum. A cost cap could be walked past by naming
+    /// a model the gateway had never heard of.
+    #[test]
+    fn an_unknown_model_reserves_the_assumption_not_zero() {
+        let assumed = assumed_unknown_price();
+
+        // Catalog-only signal still reports "no entry".
+        assert!(estimate_request_cost("totally-made-up-model", 1000, Some(1000)).is_none());
+
+        // The reservation path always yields, at the assumed rates.
+        let reserved = reserve_request_cost("totally-made-up-model", 1000, Some(1000));
+        let expected = (1000.0 / 1_000_000.0) * assumed.input_per_1m
+            + (1000.0 / 1_000_000.0) * assumed.output_per_1m;
+        assert!(
+            (reserved - expected).abs() < f64::EPSILON,
+            "expected the assumed rates, got {reserved}"
+        );
+        assert!(reserved > 0.0, "an unknown model must never reserve $0");
+
+        // A known model is unaffected: it reserves exactly its catalog price.
+        let known = reserve_request_cost("gpt-4o", 1000, Some(1000));
+        assert_eq!(
+            Some(known),
+            estimate_request_cost("gpt-4o", 1000, Some(1000)),
+            "a priced model must not be touched by the fallback"
+        );
+        assert!(
+            known < reserved,
+            "the assumption bounds every catalog rate, so it must cost more"
+        );
+
+        // Reserving and billing now rest on the SAME assumption, which is the
+        // whole point: the cap sees what it will later be charged.
+        let billed = price_call("totally-made-up-model", 1000, 1000);
+        assert!(
+            (billed.usd - reserved).abs() < f64::EPSILON,
+            "reservation {reserved} and billing {} must agree",
+            billed.usd
+        );
     }
 
     #[test]

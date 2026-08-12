@@ -50,8 +50,19 @@ impl ProviderMetrics {
     /// Whether a model id is a real identifier (vs. an extractor placeholder
     /// like `"claude"`, `"llama"`, or `"unknown"` used when a chunk carries no
     /// model field).
-    fn is_placeholder_model(model: &str) -> bool {
-        matches!(model, "" | "unknown" | "claude" | "llama")
+    /// Ids that mean "this chunk did not name the model", not "the model is
+    /// called this".
+    ///
+    /// Streaming extractors substitute one of these when an individual event
+    /// carries no `model` field. None of them is a real catalog id, so letting
+    /// one reach the pricing table is not a lookup miss on a real model — it is
+    /// pricing a call whose model was never learned. That is how a Groq
+    /// `llama-3.3-70b` stream came to be metered at the catalog maximum
+    /// ($15/$60 per 1M), roughly 50x its real rate. The cure is to resolve the
+    /// id from the request, not to weaken the unknown-model assumption; see
+    /// `resolve_model_for_metering` in `crate::telemetry::middleware`.
+    pub(crate) fn is_placeholder_model(model: &str) -> bool {
+        matches!(model.trim(), "" | "unknown" | "claude" | "llama")
     }
 
     /// Fold metrics extracted from a later streaming chunk into this running
