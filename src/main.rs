@@ -106,6 +106,22 @@ async fn main() {
 
     let remote_cfg =
         RemoteConfig::from_env().unwrap_or_else(|e| fatal_guard_config(&e.to_string()));
+
+    // Client for the platform's atomic admission API (strict-mode cost caps).
+    // Validated against the bridge configuration: `NOVEUM_GUARD_COST_ENFORCEMENT=strict`
+    // with no bridge is a hard error, not a silent downgrade to per-replica
+    // (i.e. replica-count-multiplied) enforcement.
+    let admission =
+        noveum_ai_gateway::policy::admission::AdmissionClient::from_env(remote_cfg.as_ref())
+            .unwrap_or_else(|e| fatal_guard_config(&e.to_string()))
+            .map(Arc::new);
+    if admission.is_some() {
+        info!(
+            "Nova Guard: platform atomic admission available (used by cost caps in strict \
+             enforcement mode; advisory caps keep the in-process pending ledger)"
+        );
+    }
+
     let (policy_engine, live, usage) = match remote_cfg {
         Some(cfg) => {
             info!(
@@ -181,6 +197,7 @@ async fn main() {
         policy_engine.clone(),
         live,
         usage,
+        admission,
     );
     let app = build_router(state);
 

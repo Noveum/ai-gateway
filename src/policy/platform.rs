@@ -38,6 +38,16 @@ fn normalize_config(policy_type: &str, mut config: Value) -> Value {
         let a = config["action"].as_str().unwrap();
         config["action"] = json!(map_action(a));
     }
+    if policy_type == "cost_cap" {
+        // `enforcementMode` selects platform-atomic admission (`strict`) over the
+        // per-process pending ledger (`advisory`). The platform spells its enums
+        // in SCREAMING_CASE; the gateway's `CostEnforcementMode` is snake_case,
+        // and an unmatched variant is a *parse error* that would drop the whole
+        // policy — i.e. silently remove a cap. Normalize the casing here.
+        if let Some(m) = config.get("enforcementMode").and_then(|m| m.as_str()) {
+            config["enforcementMode"] = json!(m.trim().to_ascii_lowercase());
+        }
+    }
     if policy_type == "rate_limit" {
         if let Some(windows) = config.get_mut("windows").and_then(|w| w.as_array_mut()) {
             for w in windows.iter_mut() {

@@ -244,7 +244,7 @@ pub async fn fetch_bundle_conditional(
 }
 
 /// Trim an error body for logging (WAF/CDN error pages can be large HTML).
-fn truncate_body(body: &str) -> String {
+pub(crate) fn truncate_body(body: &str) -> String {
     const MAX: usize = 512;
     let trimmed = body.trim();
     if trimmed.len() <= MAX {

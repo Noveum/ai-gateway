@@ -59,6 +59,7 @@ fn router(engine: PolicyEngine) -> Router {
         live: None,
         usage: None,
         pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+        admission: None,
     };
     Router::new()
         .route("/v1/chat/completions", post(echo_handler))

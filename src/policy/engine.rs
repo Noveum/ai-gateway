@@ -355,6 +355,54 @@ impl PolicyEngine {
         s.cost_caps.len() + s.rate_limits.len()
     }
 
+    /// Does the active policy set contain a `cost_cap` in **strict** enforcement
+    /// mode? Strict means the cap must hold across replicas, so the middleware
+    /// routes the request through the platform's atomic admission API instead of
+    /// the per-process pending ledger (see [`crate::policy::admission`]).
+    ///
+    /// Re-read per request because the policy set hot-swaps; `O(active caps)`
+    /// over an `ArcSwap` load, no locking.
+    pub fn has_strict_cost_cap(&self) -> bool {
+        self.state
+            .load()
+            .cost_caps
+            .iter()
+            .any(|cc| cc.config.enforcement_mode == CostEnforcementMode::Strict)
+    }
+
+    /// The decision to apply when platform **admission** could not be evaluated.
+    ///
+    /// Deliberately reuses the same fail-closed/fail-open computation as an
+    /// unavailable `/state` ([`PolicyEngine::unavailable_state_decision`]) so an
+    /// admission outage and a state outage behave identically: a `failClosed`
+    /// policy blocks, everything else allows with the explicit reason recorded.
+    ///
+    /// Returns the blocking decision if any strict cap fails closed, else the
+    /// first fail-open decision (whose `reason` names the outage), else `None`
+    /// when no strict cap is active at all.
+    pub fn admission_unavailable_decision(&self, reason: &str) -> Option<PolicyDecision> {
+        let state = self.state.load();
+        let mut fail_open: Option<PolicyDecision> = None;
+        for cc in state
+            .cost_caps
+            .iter()
+            .filter(|cc| cc.config.enforcement_mode == CostEnforcementMode::Strict)
+        {
+            let d = self.unavailable_decision_with_reason(
+                &cc.meta,
+                "cost_cap",
+                cc.config.action,
+                true,
+                &format!("platform admission unavailable ({reason})"),
+            );
+            if d.is_blocking() {
+                return Some(d);
+            }
+            fail_open.get_or_insert(d);
+        }
+        fail_open
+    }
+
     pub fn block_mode(&self) -> BlockResponseMode {
         self.block_mode
     }
@@ -765,6 +813,26 @@ impl PolicyEngine {
         action: PolicyAction,
         strict: bool,
     ) -> PolicyDecision {
+        self.unavailable_decision_with_reason(
+            meta,
+            policy_type,
+            action,
+            strict,
+            "live cost/rate state unavailable",
+        )
+    }
+
+    /// [`PolicyEngine::unavailable_state_decision`] with an explicit cause, so
+    /// an admission outage records *which* dependency was unavailable while
+    /// keeping identical fail-closed semantics.
+    fn unavailable_decision_with_reason(
+        &self,
+        meta: &PolicyMeta,
+        policy_type: &str,
+        action: PolicyAction,
+        strict: bool,
+        cause: &str,
+    ) -> PolicyDecision {
         let fail_closed = meta.fail_closed || (strict && !self.fail_open_default);
         if fail_closed {
             let mut d = PolicyDecision::allow(&meta.id, &meta.name, policy_type, meta.mode);
@@ -772,11 +840,11 @@ impl PolicyEngine {
             d.score = 1.0;
             d.severity = Severity::Critical;
             d.action = action;
-            d.reason = "live cost/rate state unavailable; failing closed".to_string();
+            d.reason = format!("{cause}; failing closed");
             d
         } else {
             let mut d = PolicyDecision::allow(&meta.id, &meta.name, policy_type, meta.mode);
-            d.reason = "live cost/rate state unavailable; failing open".to_string();
+            d.reason = format!("{cause}; failing open");
             d
         }
     }

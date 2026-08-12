@@ -95,7 +95,17 @@ pub struct GuardState {
     /// yet reflected in the platform counters (usage posts asynchronously,
     /// `/state` is cached). Added on top of the platform spend when evaluating
     /// cost caps so a burst near the cap can't all slip through.
+    ///
+    /// **Advisory mode only.** It is per-process, so N replicas enforce a cap N
+    /// times over; strict mode uses [`admission`](crate::policy::admission)
+    /// instead. Still the right tool when there is no platform bridge at all,
+    /// and when a cap is explicitly advisory.
     pub pending: Arc<crate::policy::remote::PendingSpend>,
+    /// Client for the platform's atomic admission API. `Some` whenever the
+    /// platform bridge is configured; whether a given request actually uses it
+    /// is decided per request by
+    /// [`AdmissionClient::strict_for`](crate::policy::admission::AdmissionClient::strict_for).
+    pub admission: Option<Arc<crate::policy::admission::AdmissionClient>>,
 }
 
 pub async fn guard_middleware(
@@ -153,6 +163,17 @@ pub async fn guard_middleware(
     // while awaiting upstream response headers — still transitions the ledger
     // entry out of ACTIVE instead of leaking it until the 15-minute backstop.
     let mut reservation: Option<crate::policy::remote::ReservationGuard> = None;
+    // The platform-side reservation, in strict mode. Same RAII discipline, but
+    // the hold lives in the control plane, so it is shared by every replica.
+    let mut admission_guard: Option<crate::policy::admission::AdmissionGuard> = None;
+
+    // Strict (cross-replica) or advisory (per-process) cost enforcement for this
+    // request? Decided per request because both the policy set and the
+    // deployment-wide override can change under a running gateway.
+    let strict_client = gs
+        .admission
+        .as_ref()
+        .filter(|a| a.strict_for(engine.has_strict_cost_cap()));
 
     if let Some(mut body_json) = json.clone() {
         let input_text = flatten_input_text(&body_json);
@@ -183,13 +204,79 @@ pub async fn guard_middleware(
             max_output_tokens.unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
         );
 
-        // Reserve this request's predicted usage (cost + one request + tokens)
-        // and read the other in-flight reservations in ONE critical section —
-        // reserving *before* evaluating means two concurrent requests always
-        // see each other's reservation, so a burst near an almost-exhausted
-        // cost cap OR rate limit can't all pass on the same stale counters.
-        // Blocked requests release the reservation below.
-        if gs.usage.is_some() {
+        // --- ADMISSION ---
+        //
+        // STRICT: the platform reserves atomically against ONE counter shared by
+        // every replica, and its answer is final. The local ledger is
+        // deliberately NOT applied on top — that would count this request's
+        // estimate twice.
+        //
+        // ADVISORY (or no platform bridge): reserve in the per-process ledger
+        // and fold the *other* in-flight reservations into the counters the
+        // engine evaluates. Race-free within one process, multiplied by replica
+        // count across a fleet — which is exactly why strict mode exists.
+        if let Some(client) = strict_client {
+            let admit = crate::policy::admission::AdmitRequest {
+                // Fresh idempotency key per logical request. Retries inside the
+                // client reuse it, so a transport failure replays the same
+                // reservation instead of reserving twice.
+                request_id: crate::policy::usage::new_event_id(),
+                provider: Some(provider.clone()),
+                model: model.clone(),
+                estimated_input_tokens: u64::from(est_input_tokens),
+                maximum_output_tokens: max_output_tokens
+                    .unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
+                estimated_cost_usd: est_request_cost,
+            };
+            match client.admit(&admit).await {
+                crate::policy::admission::Admission::Allowed(res) => {
+                    // Scope the guard immediately: from here on every exit path
+                    // settles the reservation (see `AdmissionGuard`).
+                    admission_guard = Some(crate::policy::admission::AdmissionGuard::new(
+                        client.clone(),
+                        res.id,
+                    ));
+                }
+                crate::policy::admission::Admission::Blocked(decision) => {
+                    let block = decision.to_policy_decision();
+                    info!(
+                        provider = %provider, model = %model, policy = %block.policy_id,
+                        scope = ?decision.scope, dimension = ?decision.dimension,
+                        limit = ?decision.limit, projected = ?decision.projected,
+                        reason = %block.reason,
+                        "Nova Guard blocked request (platform admission)"
+                    );
+                    // No BLOCKED usage event here: the platform *is* what
+                    // blocked this call, so it already holds the record. Posting
+                    // one to `/usage` would double-report the limit hit (and
+                    // re-fire the owner email).
+                    return block_response(&provider, &model, &block, engine.block_mode());
+                }
+                crate::policy::admission::Admission::Unavailable(reason) => {
+                    // Never an implicit allow. Apply `failClosed` exactly as an
+                    // unavailable `/state` would.
+                    match engine.admission_unavailable_decision(&reason) {
+                        Some(d) if d.is_blocking() => {
+                            warn!(
+                                provider = %provider, model = %model, policy = %d.policy_id,
+                                reason = %d.reason,
+                                "Nova Guard: platform admission unavailable; failing closed"
+                            );
+                            return block_response(&provider, &model, &d, engine.block_mode());
+                        }
+                        Some(d) => warn!(
+                            provider = %provider, model = %model, policy = %d.policy_id,
+                            reason = %d.reason,
+                            "Nova Guard: platform admission unavailable; failing open"
+                        ),
+                        None => warn!(
+                            provider = %provider, model = %model, reason = %reason,
+                            "Nova Guard: platform admission unavailable and no strict cap is active"
+                        ),
+                    }
+                }
+            }
+        } else if gs.usage.is_some() {
             let (res, others) = gs.pending.reserve(est_request_cost, est_tokens);
             // Scope the guard to this future immediately: from here on, every
             // exit path — block, panic, or the whole middleware future being
@@ -244,6 +331,12 @@ pub async fn guard_middleware(
             // completion TTL, which is for calls that really were forwarded).
             if let Some(guard) = reservation.take() {
                 guard.release();
+            }
+            // Same for a platform reservation: the call provably never reached
+            // the provider, so `cancel` (which releases the hold) is correct
+            // here — and is the ONLY place it is.
+            if let Some(guard) = admission_guard.take() {
+                guard.cancel(format!("blocked by gateway policy {}", block.policy_id));
             }
             info!(
                 provider = %provider, model = %model, policy = %block.policy_id,
@@ -343,7 +436,41 @@ pub async fn guard_middleware(
     let response = next.run(forwarded).await;
 
     // --- OUTPUT PHASE ---
-    let response = enforce_output(&engine, &provider, &model, response, live_state.as_ref()).await;
+    let (response, actual_usage) =
+        enforce_output(&engine, &provider, &model, response, live_state.as_ref()).await;
+
+    // --- SETTLEMENT (strict mode) ---
+    //
+    // `complete` with the real token counts when we recovered them; otherwise
+    // the reservation rides the response body and `abandon`s when the body ends
+    // or the client disconnects, leaving the conservative estimate applied.
+    // Either way the send happens on a spawned task, never on the client's path.
+    if let Some(guard) = admission_guard {
+        return match actual_usage {
+            Some(u) => {
+                let cost =
+                    crate::policy::pricing::estimate_cost(&model, u.input_tokens, u.output_tokens);
+                debug!(
+                    reservation = %guard.reservation_id(), model = %model,
+                    input_tokens = u.input_tokens, output_tokens = u.output_tokens, cost,
+                    "Nova Guard: completing platform reservation with authoritative usage"
+                );
+                guard.complete(crate::policy::admission::SettlementUsage {
+                    model: Some(model.clone()),
+                    input_tokens: u64::from(u.input_tokens),
+                    output_tokens: u64::from(u.output_tokens),
+                    cost_usd: cost,
+                    request_count: 1,
+                    event_id: Some(crate::policy::usage::new_event_id()),
+                });
+                response
+            }
+            // Streaming responses, non-JSON bodies, and bodies past the
+            // inspection cap all land here: the call reached the provider but no
+            // authoritative usage is recoverable in this layer.
+            None => attach_body_guard(response, guard),
+        };
+    }
 
     // Transfer the guard we have held since `reserve()` into the response body,
     // so the reservation stays ACTIVE until the body finishes (or the client
@@ -354,18 +481,21 @@ pub async fn guard_middleware(
     // awaited upstream headers), the same guard would already have completed
     // the reservation on the way out.
     match reservation {
-        Some(guard) => attach_reservation_guard(response, guard),
+        Some(guard) => attach_body_guard(response, guard),
         None => response,
     }
 }
 
 /// Wrap the response body so `guard` is dropped exactly when the body has been
-/// fully streamed to the client — or the connection is dropped — marking the
-/// reservation completed. The bytes pass through untouched.
-fn attach_reservation_guard(
-    response: Response,
-    guard: crate::policy::remote::ReservationGuard,
-) -> Response {
+/// fully streamed to the client — or the connection is dropped. The bytes pass
+/// through untouched.
+///
+/// Generic over the guard type: a local
+/// [`ReservationGuard`](crate::policy::remote::ReservationGuard) completes its
+/// ledger entry on drop, a platform
+/// [`AdmissionGuard`](crate::policy::admission::AdmissionGuard) settles its
+/// reservation. Both must survive exactly as long as the body does.
+fn attach_body_guard<G: Send + 'static>(response: Response, guard: G) -> Response {
     use futures_util::StreamExt;
     let (parts, body) = response.into_parts();
     let stream = body.into_data_stream().map(move |chunk| {
@@ -373,6 +503,40 @@ fn attach_reservation_guard(
         chunk
     });
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// Authoritative token counts recovered from a provider response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActualUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+/// Pull the provider's own token counts out of a (non-streaming) response body.
+///
+/// Accepts the OpenAI spelling (`usage.prompt_tokens` / `completion_tokens`) and
+/// the Anthropic one (`usage.input_tokens` / `output_tokens`) — native providers
+/// normalize to OpenAI shape before this middleware runs, but the raw shape
+/// still reaches us on pass-through paths. `None` means "not authoritative":
+/// the caller must NOT invent numbers, it abandons the reservation instead so
+/// the conservative estimate stands.
+pub(crate) fn extract_actual_usage(body: &Value) -> Option<ActualUsage> {
+    let usage = body.get("usage")?;
+    let num = |keys: [&str; 2]| -> Option<u32> {
+        keys.iter()
+            .find_map(|k| usage.get(*k).and_then(|v| v.as_u64()))
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+    };
+    let input = num(["prompt_tokens", "input_tokens"]);
+    let output = num(["completion_tokens", "output_tokens"]);
+    // A `usage` object with neither count is not usage at all.
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(ActualUsage {
+        input_tokens: input.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+    })
 }
 
 /// Should this request be inspected? POST, JSON, on the `/v1/` proxy path.
@@ -405,13 +569,17 @@ pub use crate::routing::{
     apply_input_transforms, apply_output_transforms, flatten_input_text, flatten_output_text,
 };
 
+/// Run output-phase enforcement, returning the (possibly rewritten or blocking)
+/// response plus the provider's authoritative token counts when the body was
+/// buffered and carried them. `None` usage means the caller must not claim to
+/// know what this call consumed.
 async fn enforce_output(
     engine: &PolicyEngine,
     provider: &str,
     model: &str,
     response: Response,
     live_state: Option<&crate::policy::rules::LiveState>,
-) -> Response {
+) -> (Response, Option<ActualUsage>) {
     // Skip streaming responses (documented v1 limitation).
     let is_stream = response
         .headers()
@@ -420,8 +588,10 @@ async fn enforce_output(
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
     if is_stream {
+        // A stream carries its usage in a final SSE chunk this layer never
+        // parses, so there is no authoritative usage to report here.
         debug!("Nova Guard: streaming response passed through without output enforcement (v1)");
-        return response;
+        return (response, None);
     }
 
     // If the response declares a length beyond our inspection cap, pass it
@@ -434,7 +604,7 @@ async fn enforce_output(
         .and_then(|s| s.parse::<usize>().ok());
     if matches!(declared_len, Some(n) if n > MAX_BODY) {
         debug!("Nova Guard: response exceeds inspection cap; passing through unchanged");
-        return response;
+        return (response, None);
     }
 
     let (parts, body) = response.into_parts();
@@ -445,21 +615,26 @@ async fn enforce_output(
             // the original body is no longer recoverable. Return an honest error
             // envelope with a correct status rather than a 200 carrying a string.
             warn!("Nova Guard: chunked response exceeded inspection cap; returning 502");
-            return Response::builder()
+            return (Response::builder()
                 .status(axum::http::StatusCode::BAD_GATEWAY)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"error":{"message":"upstream response exceeded gateway inspection limit","type":"gateway_error"}}"#,
                 ))
-                .expect("static error response is valid");
+                .expect("static error response is valid"), None);
         }
     };
 
     let json: Option<Value> = serde_json::from_slice(&bytes).ok();
     let Some(body_json) = json else {
         // Not JSON (or empty) — pass through unchanged.
-        return Response::from_parts(parts, Body::from(bytes));
+        return (Response::from_parts(parts, Body::from(bytes)), None);
     };
+
+    // The provider's own token counts, if it reported them. Read BEFORE any
+    // block/transform path so settlement is accurate even when output-phase
+    // enforcement replaces the body: the model call happened either way.
+    let actual_usage = extract_actual_usage(&body_json);
 
     // Native providers (notably Anthropic) convert the upstream body to OpenAI
     // chat-completion shape BEFORE this middleware runs. Pick the flatten/transform
@@ -476,7 +651,7 @@ async fn enforce_output(
 
     let output_text = flatten_output_text(output_provider, &body_json);
     if output_text.is_empty() {
-        return Response::from_parts(parts, Body::from(bytes));
+        return (Response::from_parts(parts, Body::from(bytes)), actual_usage);
     }
 
     let result = engine.evaluate(
@@ -494,7 +669,12 @@ async fn enforce_output(
             provider = %provider, model = %model, policy = %block.policy_id,
             "Nova Guard blocked response (output phase)"
         );
-        return block_response(provider, model, block, engine.block_mode());
+        // The provider call already happened, so the reservation still settles
+        // with the real usage even though the client gets a synthetic block.
+        return (
+            block_response(provider, model, block, engine.block_mode()),
+            actual_usage,
+        );
     }
 
     // Output transform: redact EVERY assistant text segment in place (all
@@ -506,12 +686,12 @@ async fn enforce_output(
             if let Ok(v) = serde_json::to_vec(&out_json) {
                 let mut parts = parts;
                 parts.headers.remove(header::CONTENT_LENGTH);
-                return Response::from_parts(parts, Body::from(v));
+                return (Response::from_parts(parts, Body::from(v)), actual_usage);
             }
         }
     }
 
-    Response::from_parts(parts, Body::from(bytes))
+    (Response::from_parts(parts, Body::from(bytes)), actual_usage)
 }
 
 fn log_decisions(
@@ -681,6 +861,54 @@ mod tests {
             "messages": [{"role": "user", "content": "no pii here"}]
         });
         assert!(!apply_input_transforms(&e, "gpt-4o", &mut j));
+    }
+
+    #[test]
+    fn actual_usage_is_read_from_either_provider_spelling() {
+        // OpenAI shape.
+        assert_eq!(
+            extract_actual_usage(&serde_json::json!({
+                "usage": {"prompt_tokens": 123, "completion_tokens": 45, "total_tokens": 168}
+            })),
+            Some(ActualUsage {
+                input_tokens: 123,
+                output_tokens: 45
+            })
+        );
+        // Anthropic shape (reaches us on pass-through paths).
+        assert_eq!(
+            extract_actual_usage(&serde_json::json!({
+                "usage": {"input_tokens": 7, "output_tokens": 9}
+            })),
+            Some(ActualUsage {
+                input_tokens: 7,
+                output_tokens: 9
+            })
+        );
+        // A half-reported usage block still counts what it does carry.
+        assert_eq!(
+            extract_actual_usage(&serde_json::json!({"usage": {"completion_tokens": 5}})),
+            Some(ActualUsage {
+                input_tokens: 0,
+                output_tokens: 5
+            })
+        );
+    }
+
+    #[test]
+    fn absent_or_empty_usage_is_not_authoritative() {
+        // Each of these must yield `None` so the caller ABANDONS the reservation
+        // (estimate retained) instead of completing it with invented zeros —
+        // completing at $0 would silently release the whole hold.
+        for body in [
+            serde_json::json!({"choices": [{"message": {"content": "hi"}}]}),
+            serde_json::json!({"usage": {}}),
+            serde_json::json!({"usage": {"total_tokens": 10}}),
+            serde_json::json!({"usage": null}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(extract_actual_usage(&body), None, "body: {body}");
+        }
     }
 
     #[test]

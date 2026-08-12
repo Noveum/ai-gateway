@@ -39,6 +39,12 @@ pub mod source;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod remote;
 
+// Cross-replica atomic admission (POST .../policies/admit + reservation
+// settlement). Strict-mode `cost_cap` enforcement calls this instead of the
+// per-process `remote::PendingSpend` ledger. Native-only (reqwest).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod admission;
+
 // Best-effort usage reporting (POST .../policies/usage) — advances the platform's
 // cost/rate counters (ALLOWED) and records limit blocks (BLOCKED). Native-only.
 #[cfg(not(target_arch = "wasm32"))]

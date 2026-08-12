@@ -82,6 +82,10 @@ pub struct AppState {
     /// `None` when platform-managed Nova Guard isn't configured. ALLOWED events
     /// are reported by the telemetry usage exporter instead.
     pub usage: Option<crate::policy::usage::UsageReporter>,
+    /// Optional client for the platform's atomic admission API, used by
+    /// strict-mode `cost_cap` policies so a cap holds across replicas instead of
+    /// being enforced once per process. `None` when the bridge isn't configured.
+    pub admission: Option<Arc<crate::policy::admission::AdmissionClient>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -92,6 +96,7 @@ impl AppState {
         policy: Arc<PolicyEngine>,
         live: Option<Arc<crate::policy::remote::RemoteLiveState>>,
         usage: Option<crate::policy::usage::UsageReporter>,
+        admission: Option<Arc<crate::policy::admission::AdmissionClient>>,
     ) -> Self {
         Self {
             config,
@@ -99,6 +104,7 @@ impl AppState {
             policy,
             live,
             usage,
+            admission,
         }
     }
 }
@@ -134,6 +140,7 @@ pub fn build_router(state: AppState) -> Router {
                 live: state.live.clone(),
                 usage: state.usage.clone(),
                 pending: Arc::new(policy::remote::PendingSpend::new()),
+                admission: state.admission.clone(),
             },
             policy::middleware::guard_middleware,
         ))
