@@ -19,6 +19,13 @@ use serde_json::{json, Value};
 use crate::policy::config::PolicyBundle;
 use crate::policy::rules::LiveState;
 
+/// The env vars/secrets that configure the platform bridge. Declared in this
+/// shared module because both the native bootstrap
+/// ([`crate::policy::remote::RemoteConfig::from_values`]) and the Worker's
+/// refusal path validate the same pair, and their messages must agree.
+pub const API_KEY_VAR: &str = "NOVEUM_API_KEY";
+pub const PROJECT_ID_VAR: &str = "NOVEUM_GUARD_PROJECT_ID";
+
 fn map_action(_action: &str) -> &'static str {
     // Platform Phase 0 only defines BLOCK; map everything to the gateway's `block`.
     "block"
@@ -175,9 +182,11 @@ pub fn state_to_live_state(state: &Value) -> LiveState {
 
     let (cost_usd_by_window, requests_by_window, tokens_by_window) = parse_scope(state);
     // Optional org-scope aggregates (`{"org": {"cost": {...}, "rate": {...}}}`) —
-    // used to evaluate org-sourced policies against org-wide spend. Absent on
-    // platforms that don't ship them yet; org policies then fall back to the
-    // project counters.
+    // used to evaluate org-sourced policies against org-wide spend. A platform
+    // that doesn't ship them yet leaves these maps empty, which the engine
+    // treats as *unavailable state* for an org policy (fail-closed blocks,
+    // fail-open allows with a reason). It never substitutes project counters:
+    // that would let every project consume the whole org allowance separately.
     let (org_cost_usd_by_window, org_requests_by_window, org_tokens_by_window) =
         state.get("org").map(parse_scope).unwrap_or_default();
 

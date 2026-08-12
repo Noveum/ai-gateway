@@ -104,13 +104,16 @@ enforcing nothing:
 | Configuration | Worker behavior |
 |---|---|
 | `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` set | **503.** The platform bridge (remote policy fetch, live cost/rate state, usage reporting, admission ledger) is not compiled for `wasm32`. |
+| Only *one* of `NOVEUM_API_KEY` / `NOVEUM_GUARD_PROJECT_ID` set | **503.** A half-applied bridge configuration is still an attempt to enable enforcement; falling through to an unguarded proxy would reward the mistake with a 200. |
 | `NOVEUM_GUARD_POLICIES` containing `cost_cap` or `rate_limit` | **503.** There is no live spend/rate backend, so these can only ever evaluate to "allow" — and their `failClosed` flag is neutralized along with them. |
+| `NOVEUM_GUARD_POLICIES` set but not valid JSON / not a valid bundle | **503**, plus a structured `console_error`. Parsing the error away would silently drop every policy the operator deployed. |
+| `NOVEUM_GUARD_POLICIES` unset (or empty) | Transparent proxy — the checked-in default. |
 | `NOVEUM_GUARD_POLICIES` with text policies only | Enforced, identical to native. |
 
-Both refusals are deliberate: the failure mode they replace is an operator
-believing a hard cap or a fail-closed policy is in force at the edge while every
-request passes. **Use the native gateway for platform-managed Nova Guard and for
-any cost/rate enforcement.**
+Every refusal above is deliberate: the failure mode they replace is an operator
+believing a hard cap, a fail-closed policy, or *any* policy set is in force at
+the edge while every request passes. **Use the native gateway for
+platform-managed Nova Guard and for any cost/rate enforcement.**
 
 Supporting them here would require a Worker-native state plane — a Durable Object
 for atomic reservation/reconciliation, plus a `wasm32` HTTP path to the Noveum

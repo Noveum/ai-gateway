@@ -70,14 +70,42 @@ async fn main() {
     // (`NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID`), policies are fetched from the
     // Noveum platform and live cost/rate state is queried per request; otherwise
     // policies load from the local source (`NOVEUM_GUARD_POLICIES_FILE` / inline
-    // `NOVEUM_GUARD_POLICIES`). Any load failure degrades to a transparent
-    // pass-through so the gateway never fails to boot.
+    // `NOVEUM_GUARD_POLICIES`).
+    //
+    // Nothing here degrades an *explicitly configured* guard into a silent
+    // pass-through: a broken or half-applied configuration, and a platform
+    // bridge whose first policy fetch fails, both abort startup. A gateway that
+    // looks healthy while enforcing nothing is the worst possible outcome, so
+    // the only way to serve unguarded traffic under a configured bridge is the
+    // deliberate `NOVEUM_GUARD_ALLOW_UNGUARDED_START` escape hatch below.
     info!("Initializing Nova Guard policy engine");
     use noveum_ai_gateway::policy::engine::EngineOptions;
     use noveum_ai_gateway::policy::remote::{RemoteConfig, RemoteLiveState};
     use noveum_ai_gateway::policy::usage::UsageReporter;
     use noveum_ai_gateway::telemetry::NovaGuardUsagePlugin;
-    let remote_cfg = RemoteConfig::from_env();
+
+    /// Abort startup on a Nova Guard configuration the gateway must not paper
+    /// over. Logs at ERROR (so it lands in whatever collects stderr) and exits
+    /// non-zero, which makes a Kubernetes rollout fail visibly instead of
+    /// bringing up replicas that enforce nothing.
+    fn fatal_guard_config(error: &str) -> ! {
+        tracing::error!(error, "Nova Guard: refusing to start");
+        eprintln!("FATAL: Nova Guard configuration error: {error}");
+        std::process::exit(1);
+    }
+
+    let allow_unguarded_start =
+        std::env::var(noveum_ai_gateway::policy::remote::ALLOW_UNGUARDED_START_VAR)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+
+    let remote_cfg =
+        RemoteConfig::from_env().unwrap_or_else(|e| fatal_guard_config(&e.to_string()));
     let (policy_engine, live, usage) = match remote_cfg {
         Some(cfg) => {
             info!(
@@ -85,28 +113,18 @@ async fn main() {
                 "Nova Guard: fetching policies from the Noveum platform"
             );
             // A live-state backend (the platform bridge) is wired here, so the
-            // engine honors `failClosed` (a `/state` outage blocks). This holds
-            // even on the local fallback below, so a later poller swap-in of
-            // platform policies enforces `failClosed` correctly too.
+            // engine honors `failClosed` (a `/state` outage blocks).
             let mut opts = EngineOptions::from_env();
             opts.live_state_backed = true;
-            let (engine, etag) = match noveum_ai_gateway::policy::remote::fetch_bundle_with_etag(
+            // Aborts startup if the first fetch fails, so no replica ever
+            // serves `/v1/*` believing a policy set is loaded when none is.
+            let (engine, etag) = noveum_ai_gateway::policy::remote::bootstrap_engine(
                 &cfg,
+                opts.clone(),
+                allow_unguarded_start,
             )
             .await
-            {
-                Ok((bundle, etag)) => (PolicyEngine::from_bundle(&bundle, opts.clone()), etag),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Nova Guard: platform policy fetch failed; falling back to local bundle");
-                    let bundle = noveum_ai_gateway::policy::source::load_from_env()
-                            .await
-                            .unwrap_or_else(|le| {
-                                tracing::warn!(error = %le, "Nova Guard: local bundle load failed; starting pass-through");
-                                noveum_ai_gateway::policy::PolicyBundle::default()
-                            });
-                    (PolicyEngine::from_bundle(&bundle, opts.clone()), None)
-                }
-            };
+            .unwrap_or_else(|e| fatal_guard_config(&e));
             let engine = Arc::new(engine);
             // Background poller: refresh policies from `/effective` ~60s and
             // hot-swap the engine (self-heals if the startup fetch failed).
@@ -127,7 +145,14 @@ async fn main() {
                 Some(reporter),
             )
         }
-        None => (Arc::new(PolicyEngine::from_env().await), None, None),
+        None => {
+            // No platform bridge. A local bundle is optional, but a configured
+            // one that fails to load is fatal rather than silently ignored.
+            let engine = PolicyEngine::from_env()
+                .await
+                .unwrap_or_else(|e| fatal_guard_config(&e));
+            (Arc::new(engine), None, None)
+        }
     };
     info!(
         "Nova Guard: {} active policies ({}{})",

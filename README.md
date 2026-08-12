@@ -146,19 +146,53 @@ PORT=8080 noveum-ai-gateway
 | `NOVEUM_GUARD_PROJECT_ID` | — | Noveum project whose Nova Guard policies to enforce |
 | `NOVEUM_API_URL` | `https://api.noveum.ai` | Platform API base URL |
 | `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Assumed completion size for cost/rate admission when a request sets no `max_tokens`. Raise it for stricter (earlier-blocking) hard-cap admission of unbounded requests |
+| `NOVEUM_GUARD_ALLOW_UNGUARDED_START` | `false` | **Emergency use only.** Lets the gateway start when the first platform policy fetch fails, serving traffic with *no* enforcement until a later poll succeeds. Without it, that failure aborts startup |
 
-> **Cost caps are enforced against reported spend plus a per-process estimate of
-> in-flight requests.** Usage is reported asynchronously and `/state` is cached,
-> so a cap can be briefly overshot by roughly the cost of the requests admitted
-> in that window per gateway instance; a strict cross-instance guarantee needs a
-> platform-side atomic reservation, which the API does not offer yet.
+### Platform-managed Nova Guard: supported deployment scope
 
-> **Deployment scope.** Platform-managed Nova Guard and *any* `cost_cap` /
-> `rate_limit` policy require the **native gateway**. The Cloudflare Worker
-> supports stateless inline text policies only, and returns a 503
-> `gateway_configuration_error` for either of those configurations rather than
-> accepting them and enforcing nothing — see
-> [docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md#nova-guard-scope-on-the-worker-stateless-policies-only).
+Platform-managed Nova Guard is currently a **beta for a native, dedicated
+single-project gateway**. Read this before enabling it anywhere.
+
+- **One deployment enforces exactly one project.** `NOVEUM_GUARD_PROJECT_ID` is
+  process-wide, so every request a replica handles is metered and capped against
+  that one project — regardless of who sent it.
+- **Do not enable it on a shared/multi-tenant gateway.** Setting a single project
+  ID on a deployment that serves several tenants (such as the public
+  `gateway.noveum.ai`) would bill and cap all of their traffic against one
+  project. Tenant identity derived server-side from the caller's credentials is
+  planned for a follow-up change; until then, run a dedicated deployment per
+  project.
+- **Caller-supplied routing headers are not identity.** `x-project-id` /
+  `x-organization-id` from a client are never trusted as tenant identity.
+- **Use a scoped Noveum service key** with `guardrails:read` (policies + state)
+  and `guardrails:ingest` (usage reporting) — not a personal or full-access key.
+- **Native only.** The Cloudflare Worker returns a 503
+  `gateway_configuration_error` for platform-managed Nova Guard and for *any*
+  inline `cost_cap` / `rate_limit` policy, rather than accepting the
+  configuration and enforcing nothing — see
+  [docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md#nova-guard-scope-on-the-worker-stateless-policies-only).
+
+> **Cost and rate caps are per-process, estimate-based admission — not a strict
+> cross-replica hard cap.** Each instance reserves against reported spend plus
+> its own in-flight estimate. Usage is reported asynchronously and `/state` is
+> cached, so a cap can be briefly overshot by roughly the cost of the requests
+> admitted in that window *per replica*, and a request with no `max_tokens` is
+> admitted against the `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` heuristic rather than
+> its true output size. A strict guarantee across replicas needs a platform-side
+> atomic reservation, which the API does not offer yet.
+
+> **Costs are estimates, not billing.** The pricing table
+> (`src/policy/pricing.rs`) models standard per-token rates and documented
+> long-context tiers. It does **not** model cached input, cache writes, batch
+> discounts, or per-request tool/search fees, so a cap on a cache-heavy or
+> tool-heavy workload will read low. Do not treat these figures as an invoice.
+
+> **A configured guard never degrades to a silent pass-through.** Half-applied
+> credentials (one of `NOVEUM_API_KEY` / `NOVEUM_GUARD_PROJECT_ID`), empty
+> values, a malformed policy bundle, or a failed first policy fetch all abort
+> startup with a non-zero exit rather than booting a gateway that looks healthy
+> while enforcing nothing. An *absent* configuration is still a normal
+> transparent proxy.
 
 ## 📚 Usage Examples
 

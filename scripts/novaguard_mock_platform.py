@@ -25,6 +25,15 @@ Config via env:
   MOCK_EVENTS_FILE       append every received usage event as JSONL here
   MOCK_PROMPT_TOKENS     mock provider prompt_tokens     (default 100000)
   MOCK_COMPLETION_TOKENS mock provider completion_tokens (default 100000)
+  MOCK_POLICY_SOURCE     policy source: project | org    (default project)
+  MOCK_ORG_STATE         serve the nested `org` block in /state (default 1).
+                         Set 0 to emulate an older platform: an org-scoped
+                         policy must then take the unavailable-state path
+                         rather than reading the project's counters.
+  MOCK_ORG_OTHER_USD     spend already on the org's books from OTHER projects,
+                         so an org cap trips on combined usage (default 0.0)
+  MOCK_STATE_UNAVAILABLE /state answers 503 instead of zeroed counters, to
+                         exercise the total-storage-outage path (default 0)
 
 Every request is logged to stderr; received usage events are printed (and, when
 MOCK_EVENTS_FILE is set, appended as JSON lines so a test harness can assert on
@@ -46,16 +55,35 @@ EVENTS_FILE = os.environ.get("MOCK_EVENTS_FILE", "")
 PROMPT_TOKENS = int(os.environ.get("MOCK_PROMPT_TOKENS", "100000"))
 COMPLETION_TOKENS = int(os.environ.get("MOCK_COMPLETION_TOKENS", "100000"))
 
+POLICY_SOURCE = os.environ.get("MOCK_POLICY_SOURCE", "project")
+# Serve the nested organization block in /state (the real backend now does).
+# Set to "0" to emulate an older platform that ships project counters only —
+# an org-scoped policy must then take the unavailable-state path, NOT silently
+# read the project's counters.
+SERVE_ORG_STATE = os.environ.get("MOCK_ORG_STATE", "1").lower() in ("1", "true", "yes")
+# Emulate a total storage outage: /state answers 503, never zeroed counters.
+STATE_UNAVAILABLE = os.environ.get("MOCK_STATE_UNAVAILABLE", "0").lower() in ("1", "true", "yes")
+# Spend already on the organization's books from OTHER projects, so an org cap
+# can be tripped by combined usage rather than this project's alone.
+ORG_OTHER_USD = float(os.environ.get("MOCK_ORG_OTHER_USD", "0.0"))
+
 _lock = threading.Lock()
+
+def _empty_scope():
+    return {
+        "cost": {"1d_rolling": 0.0, "7d_rolling": 0.0, "30d_rolling": 0.0, "1mo_calendar": 0.0, "perModel": {}},
+        "rate": {"requests_1m": 0, "requests_1h": 0, "requests_1d": 0, "tokens_1m": 0, "tokens_1h": 0, "tokens_1d": 0},
+    }
+
 # Live, mutable state. ALLOWED usage events accumulate into `cost` so a cost cap
-# climbs and trips exactly like the real durable counters.
-_state = {
-    "cost": {"1d_rolling": 0.0, "7d_rolling": 0.0, "30d_rolling": 0.0, "1mo_calendar": 0.0, "perModel": {}},
-    "rate": {"requests_1m": 0, "requests_1h": 0, "requests_1d": 0, "tokens_1m": 0, "tokens_1h": 0, "tokens_1d": 0},
-}
+# climbs and trips exactly like the real durable counters. Every event lands in
+# BOTH scopes, matching the backend's dual-prefix write.
+_state = _empty_scope()
+_org_state = _empty_scope()
 _seed = float(os.environ.get("MOCK_SEED_USD", "0.0"))
 for w in ("1d_rolling", "7d_rolling", "30d_rolling", "1mo_calendar"):
     _state["cost"][w] = _seed
+    _org_state["cost"][w] = _seed + ORG_OTHER_USD
 
 POLICIES = {
     "policies": [
@@ -67,7 +95,7 @@ POLICIES = {
             "failClosed": FAIL_CLOSED,
             "mode": None,  # deprecated/null on the real backend; gateway should still ENFORCE
             "priority": 10,
-            "source": "project",
+            "source": POLICY_SOURCE,
             "config": {"window": WINDOW, "maxUsd": MAX_USD, "action": "BLOCK"},
         }
     ]
@@ -109,13 +137,22 @@ class Handler(BaseHTTPRequestHandler):
             log("GET /effective -> 200 (1 cost_cap, maxUsd=%s, failClosed=%s)" % (MAX_USD, FAIL_CLOSED))
             return self._send(200, POLICIES, {"ETag": POLICIES_ETAG, "Cache-Control": "private, max-age=30"})
         if self.path.endswith("/policies/state"):
+            if STATE_UNAVAILABLE:
+                # Both durable stores are gone. 503 — never a 200 full of
+                # zeros, which a gateway cannot tell from an idle project.
+                log("GET /state -> 503 (GUARDRAIL_STATE_UNAVAILABLE)")
+                return self._send(503, {"error": {"code": "GUARDRAIL_STATE_UNAVAILABLE"}})
             with _lock:
                 body = dict(_state)
+                if SERVE_ORG_STATE:
+                    body["org"] = dict(_org_state)
                 body["asOf"] = "2026-07-28T00:00:00Z"
                 body["ttlSeconds"] = 30
                 body["stale"] = False
                 spent = _state["cost"][WINDOW]
-            log("GET /state -> 200 (cost[%s]=%.4f / cap %.4f)" % (WINDOW, spent, MAX_USD))
+                org_spent = _org_state["cost"][WINDOW]
+            log("GET /state -> 200 (cost[%s]=%.4f, org=%s / cap %.4f)"
+                % (WINDOW, spent, ("%.4f" % org_spent) if SERVE_ORG_STATE else "absent", MAX_USD))
             return self._send(200, body)
         return self._send(404, {"error": "not found"})
 
@@ -142,10 +179,12 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     persisted += 1
                     cost = float(e.get("costUsd", 0.0) or 0.0)
+                    # Apply to BOTH scopes, like the backend's dual-prefix write.
                     for w in ("1d_rolling", "7d_rolling", "30d_rolling", "1mo_calendar"):
                         _state["cost"][w] += cost
-                    log("  <- ALLOWED event: model=%s costUsd=%.5f (window total now %.5f)"
-                        % (e.get("model"), cost, _state["cost"][WINDOW]))
+                        _org_state["cost"][w] += cost
+                    log("  <- ALLOWED event: model=%s costUsd=%.5f (project total %.5f, org total %.5f)"
+                        % (e.get("model"), cost, _state["cost"][WINDOW], _org_state["cost"][WINDOW]))
             return self._send(202, {"success": True, "accepted": accepted, "persisted": persisted, "blocked": blocked})
         if self.path.startswith("/v1/chat/completions"):
             # Mock OpenAI provider: echo the model, fixed content, configurable usage.

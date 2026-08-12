@@ -1,5 +1,12 @@
 name: Rust
 
+# The PR gate. Every check here is hermetic: no provider API keys, no network
+# calls to real LLM providers, no Noveum platform credentials. That is the whole
+# point — a green tick on this workflow has to mean the tests actually ran, so
+# reviewers can use it as evidence. Real-provider smoke tests live in
+# `provider-smoke.yml` (scheduled/manual) so a stale fixture or an expired key
+# can never make this gate flaky.
+
 on:
   push:
     branches: [ "main" ]
@@ -8,24 +15,76 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so a new upstream release can't change what the gate builds.
+  WORKER_BUILD_VERSION: "0.8.5"
+  WRANGLER_VERSION: "4.120.0"
 
 jobs:
-  build:
-
+  native:
+    name: Format, lint, test (native)
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    # - name: Run tests
-    #   run: cargo test --verbose
-    #   env:
-    #     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-    #     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-    #     GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-    #     TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-    #     FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-    #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-    #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-    #     AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose
+
+      # Run the hermetic suites by name rather than `cargo test`, which would
+      # also pull in `run_integration_tests` (that one needs live provider keys
+      # and belongs in the scheduled smoke workflow).
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Nova Guard platform integration tests
+        run: cargo test --test novaguard_platform
+
+      - name: Policy middleware integration tests
+        run: cargo test --test policy_integration
+
+      - name: Reject whitespace errors in the diff
+        run: git diff --check
+
+  worker:
+    name: Build and dry-run the Cloudflare Worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with the WASM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: worker
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install worker-build
+        run: cargo install worker-build --version "${WORKER_BUILD_VERSION}" --locked
+
+      # Compiles the crate for wasm32 and generates the JS shim. This is what
+      # catches a change that builds natively but breaks the edge target (a
+      # `tokio`/`reqwest` import leaking into shared code, say).
+      - name: worker-build --release
+        run: worker-build --release
+
+      # Validates wrangler.toml and the generated bundle without publishing.
+      - name: wrangler deploy --dry-run
+        run: npx --yes "wrangler@${WRANGLER_VERSION}" deploy --dry-run

@@ -1,0 +1,41 @@
+name: Provider smoke tests
+
+# Real calls to real LLM providers. Deliberately NOT part of the PR gate: these
+# need live API keys and depend on provider availability and response shapes, so
+# a failure here means "a provider or a key changed", not "this PR is broken".
+# Keeping them out of `rust.yml` is what lets the PR gate stay trustworthy.
+#
+# Run manually from the Actions tab, or on the nightly schedule below.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 04:00 UTC daily.
+    - cron: "0 4 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: Live provider integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run provider integration tests
+        run: cargo test --test run_integration_tests -- --nocapture
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}

@@ -26,7 +26,8 @@ use noveum_ai_gateway::policy::engine::EngineOptions;
 use noveum_ai_gateway::policy::middleware::{guard_middleware, GuardState};
 use noveum_ai_gateway::policy::platform::translate_bundle;
 use noveum_ai_gateway::policy::remote::{
-    fetch_bundle_conditional, fetch_bundle_with_etag, PolicyFetch, RemoteConfig, RemoteLiveState,
+    bootstrap_engine, fetch_bundle_conditional, fetch_bundle_with_etag, PolicyFetch, RemoteConfig,
+    RemoteLiveState,
 };
 use noveum_ai_gateway::policy::usage::{new_event_id, UsageEvent, UsageReporter};
 use noveum_ai_gateway::policy::PolicyEngine;
@@ -764,4 +765,207 @@ async fn overflow_sized_max_tokens_is_rejected_with_400() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// §4.5 — an explicitly configured guard must never degrade to pass-through.
+// ---------------------------------------------------------------------------
+
+/// A configured platform bridge whose FIRST policy fetch fails must not start.
+/// There is no known policy set at that point, so every request would be
+/// forwarded with zero enforcement while the deployment looks healthy.
+#[tokio::test]
+async fn initial_policy_fetch_failure_does_not_serve_unguarded_traffic() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(format!(
+            "/api/v1/projects/{PROJECT}/policies/effective"
+        )))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream exploded"))
+        .mount(&server)
+        .await;
+
+    let opts = EngineOptions {
+        live_state_backed: true,
+        ..Default::default()
+    };
+    let Err(err) = bootstrap_engine(&cfg(&server.uri()), opts.clone(), false).await else {
+        panic!("a failed cold-start fetch must abort startup");
+    };
+    // The message has to tell an operator what happened and how to override.
+    assert!(err.contains("unguarded"), "unhelpful message: {err}");
+    assert!(
+        err.contains(noveum_ai_gateway::policy::remote::ALLOW_UNGUARDED_START_VAR),
+        "message must name the override var: {err}"
+    );
+
+    // The escape hatch exists, but it is opt-in and yields an EMPTY engine —
+    // never a silently-loaded local bundle standing in for platform policy.
+    let (engine, etag) = bootstrap_engine(&cfg(&server.uri()), opts, true)
+        .await
+        .expect("the override must allow an unguarded start");
+    assert_eq!(engine.active_policy_count(), 0);
+    assert!(etag.is_none());
+}
+
+/// The happy path still compiles the fetched bundle and returns its ETag for
+/// the poller to revalidate against.
+#[tokio::test]
+async fn successful_cold_start_compiles_platform_policies() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(format!(
+            "/api/v1/projects/{PROJECT}/policies/effective"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_json(json!({
+                    "policies": [{
+                        "id": "p1",
+                        "name": "cap",
+                        "type": "COST_CAP",
+                        "enabled": true,
+                        "source": "project",
+                        "config": { "window": "30d_rolling", "maxUsd": 100.0, "action": "BLOCK" }
+                    }]
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let (engine, etag) = bootstrap_engine(
+        &cfg(&server.uri()),
+        EngineOptions {
+            live_state_backed: true,
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+    .expect("a successful fetch must start");
+    assert_eq!(engine.active_policy_count(), 1);
+    assert_eq!(etag.as_deref(), Some("\"v1\""));
+}
+
+/// A *configured* local bundle that cannot be parsed is a configuration error,
+/// not a pass-through. An *absent* one stays pass-through: that is the default
+/// deployment and must keep booting.
+#[tokio::test]
+async fn configured_but_malformed_local_bundle_is_an_error() {
+    use noveum_ai_gateway::policy::source::{load_from_env, load_from_file};
+
+    let dir = std::env::temp_dir();
+
+    // Malformed file → Err, which `PolicyEngine::from_env` now propagates
+    // instead of swallowing into an empty engine.
+    let bad = dir.join(format!("nova-guard-bad-{}.json", uuid::Uuid::new_v4()));
+    tokio::fs::write(&bad, "{ \"policies\": [ ").await.unwrap();
+    let e = load_from_file(bad.to_str().unwrap())
+        .await
+        .expect_err("malformed bundle must not parse");
+    assert!(e.contains("not a valid nova-guard bundle"), "got: {e}");
+    tokio::fs::remove_file(&bad).await.ok();
+
+    // A syntactically valid but EMPTY bundle is legitimate: it means "no
+    // policies", and must load cleanly rather than being mistaken for broken.
+    let empty = dir.join(format!("nova-guard-empty-{}.json", uuid::Uuid::new_v4()));
+    tokio::fs::write(&empty, r#"{"policies":[]}"#)
+        .await
+        .unwrap();
+    let bundle = load_from_file(empty.to_str().unwrap())
+        .await
+        .expect("an empty bundle is valid configuration");
+    assert_eq!(bundle.policies.len(), 0);
+    tokio::fs::remove_file(&empty).await.ok();
+
+    // No source configured at all → empty bundle, no error. (This test process
+    // sets neither `NOVEUM_GUARD_POLICIES_FILE` nor `NOVEUM_GUARD_POLICIES`.)
+    let none = load_from_env()
+        .await
+        .expect("an unconfigured source is not an error");
+    assert_eq!(none.policies.len(), 0);
+}
+
+/// The backend now answers a total Redis+Postgres outage with
+/// `503 GUARDRAIL_STATE_UNAVAILABLE` instead of a 200 carrying zeroed counters.
+/// Both gateway dispositions must handle that explicitly: fail-closed blocks,
+/// fail-open allows but records *why*. Neither may read the 503 as "$0 spent".
+#[tokio::test]
+async fn state_503_is_unavailable_state_not_zero_usage() {
+    for fail_closed in [true, false] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(match_path(state_path()))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": { "code": "GUARDRAIL_STATE_UNAVAILABLE" }
+            })))
+            .mount(&server)
+            .await;
+        mount_usage_ok(&server).await;
+
+        let c = cfg(&server.uri());
+        // A cap of $10 that zeroed counters would sail straight through.
+        let payload = json!({"policies":[{
+            "policyId":"pol_1","name":"Daily cap","type":"COST_CAP",
+            "enabled":true,"failClosed":fail_closed,
+            "config":{"window":"1d_rolling","maxUsd":10.0,"action":"BLOCK"}
+        }]});
+        let bundle = translate_bundle(&payload).unwrap();
+        let engine = Arc::new(PolicyEngine::from_bundle(&bundle, backed_opts()));
+        let gs = GuardState {
+            engine,
+            live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
+            usage: Some(UsageReporter::spawn(c.clone())),
+            pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(echo_handler))
+            .layer(from_fn_with_state(gs, guard_middleware));
+
+        let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        if fail_closed {
+            assert!(
+                resp.headers().contains_key("x-noveum-guard-blocked"),
+                "failClosed policy must block on a 503 /state"
+            );
+        } else {
+            assert!(
+                !resp.headers().contains_key("x-noveum-guard-blocked"),
+                "fail-open policy must allow on a 503 /state"
+            );
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+}
+
+/// A 503 must not be parsed as a state document. The live-state client has to
+/// surface "unavailable" so the engine can apply its fail-closed/fail-open
+/// semantics — silently yielding an all-zero `LiveState` would satisfy every
+/// cost cap during an outage.
+#[tokio::test]
+async fn state_503_never_yields_a_zero_valued_live_state() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": { "code": "GUARDRAIL_STATE_UNAVAILABLE" }
+        })))
+        .mount(&server)
+        .await;
+
+    let live = RemoteLiveState::new(cfg(&server.uri()));
+    let state = live.get().await;
+    assert!(
+        state.is_none(),
+        "a 503 must read as unavailable state, not as zeroed counters"
+    );
 }

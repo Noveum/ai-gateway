@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::policy::config::PolicyBundle;
 use crate::policy::engine::PolicyEngine;
@@ -48,34 +48,118 @@ const STATE_TTL: Duration = Duration::from_secs(10);
 const POLICY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Connection details for the platform NovaGuard API.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteConfig {
     pub base_url: String,
     pub api_key: String,
     pub project_id: String,
 }
 
+/// An explicitly-configured platform bridge that cannot be used as configured.
+///
+/// Distinct from "not configured": an operator who set one of the two required
+/// variables, or set one to an empty value, is *trying* to enable enforcement.
+/// Starting a silent pass-through there is the worst outcome — the gateway
+/// looks healthy while no cap is in force. Callers surface this and refuse to
+/// start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConfigError {
+    pub message: String,
+}
+
+impl std::fmt::Display for RemoteConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RemoteConfigError {}
+
+// The env var names the platform bridge is configured with. Defined in the
+// shared `platform` module (the Worker validates the same pair) and re-exported
+// here so native callers can keep reaching for them via `remote::`.
+pub use crate::policy::platform::{API_KEY_VAR, PROJECT_ID_VAR};
+
 impl RemoteConfig {
-    /// Build from env, or `None` if platform-managed Nova Guard isn't configured
-    /// (`NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` both required).
-    pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("NOVEUM_API_KEY")
-            .ok()
-            .filter(|s| !s.trim().is_empty())?;
-        let project_id = std::env::var("NOVEUM_GUARD_PROJECT_ID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())?;
-        let base_url = std::env::var("NOVEUM_API_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_API_URL.to_string())
+    /// Build from env. See [`RemoteConfig::from_values`] for the semantics;
+    /// this only reads the variables (`None` = unset) and supplies
+    /// `NOVEUM_API_URL`.
+    pub fn from_env() -> Result<Option<Self>, RemoteConfigError> {
+        Self::from_values(
+            std::env::var(API_KEY_VAR).ok().as_deref(),
+            std::env::var(PROJECT_ID_VAR).ok().as_deref(),
+            std::env::var("NOVEUM_API_URL").ok().as_deref(),
+        )
+    }
+
+    /// Decide what a given pair of configuration values means. Pure, so the
+    /// matrix below is testable without mutating process env.
+    ///
+    /// * neither variable present (`None`) → `Ok(None)`: platform-managed Nova
+    ///   Guard is intentionally disabled;
+    /// * both present and non-empty → `Ok(Some(config))`;
+    /// * exactly one present, or either present but empty/whitespace →
+    ///   `Err(RemoteConfigError)`.
+    ///
+    /// That last case used to be indistinguishable from "disabled", so a
+    /// typo'd or half-deployed secret silently started an unguarded
+    /// pass-through while the operator believed caps were being enforced.
+    pub fn from_values(
+        api_key: Option<&str>,
+        project_id: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Result<Option<Self>, RemoteConfigError> {
+        let err = |message: String| Err(RemoteConfigError { message });
+        let blank = |v: Option<&str>| v.is_some_and(|s| s.trim().is_empty());
+
+        // Present but blank: an unresolved template or a stripped CI variable,
+        // never a deliberate choice.
+        if blank(api_key) {
+            return err(format!(
+                "{API_KEY_VAR} is set but empty; platform-managed Nova Guard cannot start. \
+                 Provide a Noveum service key with `guardrails:read` + `guardrails:ingest`, \
+                 or unset both {API_KEY_VAR} and {PROJECT_ID_VAR} to run without the platform bridge."
+            ));
+        }
+        if blank(project_id) {
+            return err(format!(
+                "{PROJECT_ID_VAR} is set but empty; platform-managed Nova Guard cannot start. \
+                 Provide the project id to enforce for, or unset both {API_KEY_VAR} and \
+                 {PROJECT_ID_VAR} to run without the platform bridge."
+            ));
+        }
+
+        let (api_key, project_id) = match (api_key, project_id) {
+            (None, None) => return Ok(None),
+            (Some(k), Some(p)) => (k.trim().to_string(), p.trim().to_string()),
+            // Exactly one of the pair: a half-applied configuration.
+            (Some(_), None) => {
+                return err(format!(
+                    "{API_KEY_VAR} is set but {PROJECT_ID_VAR} is not; platform-managed Nova \
+                     Guard needs both. Set {PROJECT_ID_VAR}, or unset {API_KEY_VAR} to run \
+                     without the platform bridge."
+                ))
+            }
+            (None, Some(_)) => {
+                return err(format!(
+                    "{PROJECT_ID_VAR} is set but {API_KEY_VAR} is not; platform-managed Nova \
+                     Guard needs both. Set {API_KEY_VAR}, or unset {PROJECT_ID_VAR} to run \
+                     without the platform bridge."
+                ))
+            }
+        };
+
+        let base_url = base_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_API_URL)
             .trim_end_matches('/')
             .to_string();
-        Some(Self {
+        Ok(Some(Self {
             base_url,
             api_key,
             project_id,
-        })
+        }))
     }
 
     fn policies_url(&self) -> String {
@@ -182,6 +266,55 @@ pub async fn fetch_bundle_with_etag(
     match fetch_bundle_conditional(cfg, None).await? {
         PolicyFetch::Modified { bundle, etag } => Ok((bundle, etag)),
         PolicyFetch::NotModified => Err("unexpected 304 without a prior ETag".to_string()),
+    }
+}
+
+/// The deliberate override that lets a configured platform bridge start with no
+/// policy set at all. Emergency operation only: the platform is unreachable and
+/// serving traffic without caps beats serving none.
+pub const ALLOW_UNGUARDED_START_VAR: &str = "NOVEUM_GUARD_ALLOW_UNGUARDED_START";
+
+/// Build the startup engine for a configured platform bridge.
+///
+/// On a successful first fetch, returns the compiled engine and the `ETag` to
+/// seed the poller with. When the first fetch **fails** there is no known
+/// policy set, so every request would be forwarded unguarded — that is an
+/// `Err`, and the caller aborts startup, unless `allow_unguarded_start` opts
+/// into it explicitly.
+///
+/// The old behavior (fall back to the local bundle, else an empty one) is
+/// deliberately gone: an operator who configured the platform bridge did not
+/// ask for whatever happens to be on disk, and an empty bundle enforces
+/// nothing while looking perfectly healthy.
+pub async fn bootstrap_engine(
+    cfg: &RemoteConfig,
+    opts: crate::policy::engine::EngineOptions,
+    allow_unguarded_start: bool,
+) -> Result<(PolicyEngine, Option<String>), String> {
+    match fetch_bundle_with_etag(cfg).await {
+        Ok((bundle, etag)) => Ok((PolicyEngine::from_bundle(&bundle, opts), etag)),
+        Err(e) if allow_unguarded_start => {
+            // ERROR, not WARN: the gateway is up and enforcing nothing. This
+            // line is the only signal that a cap an operator believes is live
+            // is not, so it must clear any WARN-level log filter.
+            error!(
+                error = %e, override_var = ALLOW_UNGUARDED_START_VAR,
+                "Nova Guard: initial platform policy fetch FAILED and the unguarded-start override \
+                 is set; serving traffic with NO enforcement until a poll succeeds"
+            );
+            Ok((
+                PolicyEngine::from_bundle(&PolicyBundle::default(), opts),
+                None,
+            ))
+        }
+        Err(e) => Err(format!(
+            "the initial platform policy fetch from {} failed ({e}), so no policy set is known and \
+             every request would be forwarded unguarded. Startup is aborted deliberately. Fix \
+             connectivity/credentials and restart, or set {ALLOW_UNGUARDED_START_VAR}=true to \
+             start unguarded anyway (emergency use only — caps and fail-closed policies will NOT \
+             be enforced until a later poll succeeds).",
+            cfg.base_url
+        )),
     }
 }
 
@@ -656,6 +789,84 @@ async fn fetch_state_conditional(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The full configuration matrix from the review's §4.5. `None` is an unset
+    /// variable; `Some("")`/`Some("  ")` is one that is set but empty.
+    #[test]
+    fn remote_config_distinguishes_disabled_from_misconfigured() {
+        // Neither set: platform-managed Nova Guard is off, and that is fine.
+        assert_eq!(RemoteConfig::from_values(None, None, None), Ok(None));
+
+        // Both set: configured.
+        let cfg = RemoteConfig::from_values(Some("sk-test"), Some("proj_1"), None)
+            .unwrap()
+            .expect("both values present must configure the bridge");
+        assert_eq!(cfg.api_key, "sk-test");
+        assert_eq!(cfg.project_id, "proj_1");
+        assert_eq!(cfg.base_url, DEFAULT_API_URL);
+
+        // Exactly one set: a half-applied config must NOT start pass-through.
+        for (key, project, expect_names) in [
+            (Some("sk-test"), None, API_KEY_VAR),
+            (None, Some("proj_1"), PROJECT_ID_VAR),
+        ] {
+            let e = RemoteConfig::from_values(key, project, None)
+                .expect_err("exactly one variable must be a configuration error");
+            assert!(
+                e.message.contains(expect_names) && e.message.contains("needs both"),
+                "unhelpful message: {}",
+                e.message
+            );
+        }
+
+        // Set but empty/whitespace: a broken secret, not a choice.
+        for (key, project, culprit) in [
+            (Some(""), Some("proj_1"), API_KEY_VAR),
+            (Some("   "), Some("proj_1"), API_KEY_VAR),
+            (Some("sk-test"), Some(""), PROJECT_ID_VAR),
+            (Some("sk-test"), Some("\t "), PROJECT_ID_VAR),
+            (Some(""), Some(""), API_KEY_VAR),
+            // Empty on one side and absent on the other is still explicit.
+            (Some(""), None, API_KEY_VAR),
+            (None, Some(""), PROJECT_ID_VAR),
+        ] {
+            let e = RemoteConfig::from_values(key, project, None)
+                .expect_err("an empty value must be a configuration error");
+            assert!(
+                e.message.contains(culprit) && e.message.contains("empty"),
+                "unhelpful message for ({key:?}, {project:?}): {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
+    fn remote_config_normalizes_values_and_base_url() {
+        // Surrounding whitespace on a real value is trimmed, not treated as
+        // part of the key (a common copy-paste / `echo` artifact in secrets).
+        let cfg = RemoteConfig::from_values(
+            Some(" sk-test\n"),
+            Some(" proj_1 "),
+            Some("  https://api.example.com/  "),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.api_key, "sk-test");
+        assert_eq!(cfg.project_id, "proj_1");
+        // Trailing slashes are stripped so the URL builders can't double up.
+        assert_eq!(cfg.base_url, "https://api.example.com");
+        assert_eq!(
+            cfg.policies_url(),
+            "https://api.example.com/api/v1/projects/proj_1/policies/effective"
+        );
+        // An unset or blank base URL falls back to the default host.
+        for base in [None, Some(""), Some("   ")] {
+            let c = RemoteConfig::from_values(Some("k"), Some("p"), base)
+                .unwrap()
+                .unwrap();
+            assert_eq!(c.base_url, DEFAULT_API_URL, "base={base:?}");
+        }
+    }
 
     #[test]
     fn reserve_returns_only_other_reservations() {

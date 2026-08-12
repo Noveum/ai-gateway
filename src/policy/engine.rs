@@ -223,28 +223,30 @@ impl PolicyEngine {
     /// * `NOVEUM_GUARD_POLICIES_FILE` — path to a `nova-guard.json` bundle
     /// * `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` — `synthetic_success` | `provider_error`
     ///
-    /// Any load/parse error degrades to an empty (pass-through) engine with a
-    /// warning; the gateway never fails to boot because of policy config.
+    /// An *absent* policy source stays pass-through (that's the default
+    /// deployment). A *configured but unreadable or malformed* one is an error:
+    /// degrading it to pass-through leaves the operator believing policies they
+    /// wrote are in force. The caller refuses to start.
     ///
     /// Native only (reads env + filesystem). The Cloudflare Worker builds the
     /// engine from an in-memory bundle via [`PolicyEngine::from_bundle`].
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn from_env() -> Self {
+    pub async fn from_env() -> Result<Self, String> {
         // Single source of truth for the env parsing (falsey-value list,
         // block-mode mapping) — shared with the platform path via
         // `EngineOptions::from_env` so the three call sites can't drift.
         let opts = EngineOptions::from_env();
 
         if !opts.enabled {
-            return Self::from_bundle(&PolicyBundle::default(), opts);
+            return Ok(Self::from_bundle(&PolicyBundle::default(), opts));
         }
 
-        let bundle = super::source::load_from_env().await.unwrap_or_else(|e| {
-            warn!(error = %e, "failed to load policy bundle; starting with pass-through (no policies)");
-            PolicyBundle::default()
-        });
+        // `load_from_env` already separates the two cases: it returns an empty
+        // bundle when no source is configured, and an error only when one is
+        // configured and cannot be loaded.
+        let bundle = super::source::load_from_env().await?;
 
-        Self::from_bundle(&bundle, opts)
+        Ok(Self::from_bundle(&bundle, opts))
     }
 
     fn compile(bundle: &PolicyBundle, enabled: bool, live_state_backed: bool) -> EngineState {
@@ -259,7 +261,7 @@ impl PolicyEngine {
             if meta.org_scoped {
                 info!(
                     policy = %meta.id,
-                    "org-sourced policy: enforcing against org counters when /state provides them, else project counters"
+                    "org-sourced policy: enforcing against org counters only; a /state response without them is treated as unavailable state, never as project counters"
                 );
             }
             if live_state_backed {
@@ -588,18 +590,15 @@ impl PolicyEngine {
         }
 
         let window_key = window_label(cc.config.window);
-        // Org-sourced policies enforce against org-scope counters when the
-        // control plane supplies them; otherwise fall back to the project
-        // counters (an org cap then only bounds each project separately).
-        // The fallback is PER WINDOW KEY — an org section that carries other
-        // windows but not this policy's window must not turn a known project
-        // spend into "state unavailable".
+        // A policy reads ONLY its own scope's counters. Substituting project
+        // spend for a missing org counter is not a conservative fallback: it
+        // silently rescopes the cap so every project may consume the whole org
+        // allowance separately. A missing counter is missing state — the
+        // unavailable-state decision below (fail-closed blocks, fail-open
+        // allows with an explicit reason) is the honest answer.
         let spend = live_state.and_then(|s| {
             if cc.meta.org_scoped {
-                s.org_cost_usd_by_window
-                    .get(window_key)
-                    .or_else(|| s.cost_usd_by_window.get(window_key))
-                    .copied()
+                s.org_cost_usd_by_window.get(window_key).copied()
             } else {
                 s.cost_usd_by_window.get(window_key).copied()
             }
@@ -678,72 +677,74 @@ impl PolicyEngine {
     ) -> PolicyDecision {
         match live_state {
             Some(state) => {
-                // Org-sourced policies read org-scope counters when available
-                // (see eval_cost_cap). The fallback is PER PERIOD and per
-                // counter kind — an org section missing this window's period
-                // (or one whole kind) still enforces against the matching
-                // project counter instead of silently skipping the check.
+                // A policy reads ONLY its own scope's counters — an org policy
+                // must never be satisfied by project counters (see
+                // eval_cost_cap). A configured limit whose counter is absent is
+                // unmeasurable, not satisfied: it takes the unavailable-state
+                // decision rather than silently passing the check.
                 let requests_for = |period: &str| {
                     if rl.meta.org_scoped {
-                        state
-                            .org_requests_by_window
-                            .get(period)
-                            .or_else(|| state.requests_by_window.get(period))
-                            .copied()
+                        state.org_requests_by_window.get(period).copied()
                     } else {
                         state.requests_by_window.get(period).copied()
                     }
                 };
                 let tokens_for = |period: &str| {
                     if rl.meta.org_scoped {
-                        state
-                            .org_tokens_by_window
-                            .get(period)
-                            .or_else(|| state.tokens_by_window.get(period))
-                            .copied()
+                        state.org_tokens_by_window.get(period).copied()
                     } else {
                         state.tokens_by_window.get(period).copied()
                     }
                 };
                 for w in &rl.config.windows {
                     if let Some(max) = w.max_requests {
-                        if let Some(count) = requests_for(&w.period) {
-                            if count >= max {
-                                let mut d = PolicyDecision::allow(
-                                    &rl.meta.id,
-                                    &rl.meta.name,
-                                    "rate_limit",
-                                    rl.meta.mode,
-                                );
-                                d.flagged = true;
-                                d.score = 1.0;
-                                d.severity = Severity::High;
-                                d.action = w.action;
-                                d.reason = format!(
-                                    "requests {count} reached limit {max} per {}",
-                                    w.period
-                                );
-                                return d;
-                            }
+                        let Some(count) = requests_for(&w.period) else {
+                            return self.unavailable_state_decision(
+                                &rl.meta,
+                                "rate_limit",
+                                w.action,
+                                false,
+                            );
+                        };
+                        if count >= max {
+                            let mut d = PolicyDecision::allow(
+                                &rl.meta.id,
+                                &rl.meta.name,
+                                "rate_limit",
+                                rl.meta.mode,
+                            );
+                            d.flagged = true;
+                            d.score = 1.0;
+                            d.severity = Severity::High;
+                            d.action = w.action;
+                            d.reason =
+                                format!("requests {count} reached limit {max} per {}", w.period);
+                            return d;
                         }
                     }
                     if let Some(max) = w.max_tokens {
-                        if let Some(count) = tokens_for(&w.period) {
-                            if count >= max {
-                                let mut d = PolicyDecision::allow(
-                                    &rl.meta.id,
-                                    &rl.meta.name,
-                                    "rate_limit",
-                                    rl.meta.mode,
-                                );
-                                d.flagged = true;
-                                d.score = 1.0;
-                                d.severity = Severity::High;
-                                d.action = w.action;
-                                d.reason =
-                                    format!("tokens {count} reached limit {max} per {}", w.period);
-                                return d;
-                            }
+                        let Some(count) = tokens_for(&w.period) else {
+                            return self.unavailable_state_decision(
+                                &rl.meta,
+                                "rate_limit",
+                                w.action,
+                                false,
+                            );
+                        };
+                        if count >= max {
+                            let mut d = PolicyDecision::allow(
+                                &rl.meta.id,
+                                &rl.meta.name,
+                                "rate_limit",
+                                rl.meta.mode,
+                            );
+                            d.flagged = true;
+                            d.score = 1.0;
+                            d.severity = Severity::High;
+                            d.action = w.action;
+                            d.reason =
+                                format!("tokens {count} reached limit {max} per {}", w.period);
+                            return d;
                         }
                     }
                 }
@@ -1068,71 +1069,145 @@ mod tests {
         assert!(!r2.is_blocked());
     }
 
+    /// An engine wired to a live-state backend, as the platform bridge builds
+    /// it. `failClosed` is only honored in this shape — without a state backend
+    /// `compile` deliberately neutralizes it (nothing could ever satisfy it).
+    fn live_state_engine(json: &str) -> PolicyEngine {
+        let bundle = PolicyBundle::from_json_str(json).unwrap();
+        PolicyEngine::from_bundle(
+            &bundle,
+            EngineOptions {
+                live_state_backed: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// An org-scoped `cost_cap` at $100 over `30d_rolling`, on a live-state
+    /// backed engine. `fail_closed` selects the variant of the same policy.
+    fn org_cost_cap_engine(fail_closed: bool) -> PolicyEngine {
+        live_state_engine(&format!(
+            r#"{{"policies":[{{"name":"orgcap","type":"cost_cap","mode":"enforce","source":"org",
+            "failClosed":{fail_closed},
+            "config":{{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}}}]}}"#
+        ))
+    }
+
     #[test]
     fn org_sourced_cost_cap_reads_org_counters() {
-        let json = r#"{"policies":[{"name":"orgcap","type":"cost_cap","mode":"enforce","source":"org",
-            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#;
-        let e = engine(json);
-        // Project spend is under the cap, org spend is over: must block.
+        let e = org_cost_cap_engine(false);
+        // Project spend is under the cap, org spend is over: must block on org.
         let mut ls = LiveState::default();
         ls.cost_usd_by_window.insert("30d_rolling".into(), 10.0);
         ls.org_cost_usd_by_window
             .insert("30d_rolling".into(), 150.0);
         let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
         assert!(r.is_blocked(), "org policy must enforce against org spend");
-        // Without org counters it falls back to the (under-cap) project spend.
+        // ...and the reverse: org under cap, project over. The org policy must
+        // read org state and allow, not block on the project's spend.
         let mut ls2 = LiveState::default();
-        ls2.cost_usd_by_window.insert("30d_rolling".into(), 10.0);
+        ls2.cost_usd_by_window.insert("30d_rolling".into(), 150.0);
+        ls2.org_cost_usd_by_window.insert("30d_rolling".into(), 1.0);
         let r2 = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls2));
-        assert!(!r2.is_blocked());
+        assert!(!r2.is_blocked(), "org policy must not read project spend");
     }
 
     #[test]
-    fn partial_org_section_falls_back_per_counter_kind() {
-        // A staged platform rollout may ship an `org` section with only ONE
-        // counter kind. The missing kind must fall back to project counters,
-        // not degrade to "state unavailable" / silently allow.
-        // Org section has only rate data → an org cost cap uses project spend.
-        let cap = engine(
-            r#"{"policies":[{"name":"orgcap","type":"cost_cap","mode":"enforce","source":"org",
+    fn missing_org_cost_window_never_substitutes_project_cost() {
+        // Substituting project spend would rescope the cap: every project could
+        // then consume the full org allowance separately. A missing org counter
+        // is missing state, so a fail-open policy allows with that reason...
+        let e = org_cost_cap_engine(false);
+        let mut ls = LiveState::default();
+        ls.cost_usd_by_window.insert("30d_rolling".into(), 150.0); // over cap
+        ls.org_requests_by_window.insert("1m".into(), 1); // org section present, wrong kind
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+        assert!(!r.is_blocked(), "fail-open unavailable state must allow");
+        assert!(
+            r.decisions.iter().any(|d| d.reason.contains("unavailable")),
+            "the allow must be recorded as unavailable state, not as a pass"
+        );
+        // ...and an org section carrying only *other* windows behaves the same:
+        // the per-window key is what's missing, and it is not substitutable.
+        let mut ls2 = LiveState::default();
+        ls2.org_cost_usd_by_window.insert("1d_rolling".into(), 1.0);
+        ls2.cost_usd_by_window.insert("30d_rolling".into(), 150.0);
+        let r2 = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls2));
+        assert!(!r2.is_blocked());
+        assert!(r2
+            .decisions
+            .iter()
+            .any(|d| d.reason.contains("unavailable")));
+    }
+
+    #[test]
+    fn fail_closed_missing_org_cost_state_blocks() {
+        let e = org_cost_cap_engine(true);
+        // Project spend known and *under* cap; org counter absent. Fail-closed
+        // must block rather than borrow the project's reassuring number.
+        let mut ls = LiveState::default();
+        ls.cost_usd_by_window.insert("30d_rolling".into(), 1.0);
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+        assert!(r.is_blocked(), "fail-closed missing org state must block");
+        assert!(r.block.unwrap().reason.contains("unavailable"));
+    }
+
+    #[test]
+    fn missing_org_rate_counters_use_unavailable_semantics() {
+        // A configured limit whose counter is absent is unmeasurable, not
+        // satisfied — the old code skipped the check and allowed outright.
+        for (kind, config) in [
+            (
+                "requests",
+                r#"{"windows":[{"period":"1m","maxRequests":60,"action":"block"}]}"#,
+            ),
+            (
+                "tokens",
+                r#"{"windows":[{"period":"1m","maxTokens":1000,"action":"block"}]}"#,
+            ),
+        ] {
+            // Fail-open: allowed, but recorded as unavailable state.
+            let open = engine(&format!(
+                r#"{{"policies":[{{"name":"orgrl","type":"rate_limit","mode":"enforce","source":"org",
+                "config":{config}}}]}}"#
+            ));
+            // Project counters are populated and over the limit; the org policy
+            // must not read them.
+            let mut ls = LiveState::default();
+            ls.requests_by_window.insert("1m".into(), 100);
+            ls.tokens_by_window.insert("1m".into(), 10_000);
+            let r = open.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+            assert!(!r.is_blocked(), "{kind}: fail-open must allow");
+            assert!(
+                r.decisions.iter().any(|d| d.reason.contains("unavailable")),
+                "{kind}: missing org counter must report unavailable state"
+            );
+
+            // Fail-closed: the same missing counter blocks.
+            let closed = live_state_engine(&format!(
+                r#"{{"policies":[{{"name":"orgrl","type":"rate_limit","mode":"enforce","source":"org",
+                "failClosed":true,"config":{config}}}]}}"#
+            ));
+            let r2 = closed.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+            assert!(r2.is_blocked(), "{kind}: fail-closed must block");
+            assert!(r2.block.unwrap().reason.contains("unavailable"));
+        }
+    }
+
+    #[test]
+    fn project_policies_are_unaffected_by_org_counters() {
+        // The no-substitution rule runs both ways: a project policy reads only
+        // project counters even when org counters are present and over cap.
+        let e = engine(
+            r#"{"policies":[{"name":"projcap","type":"cost_cap","mode":"enforce","source":"project",
             "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
         );
         let mut ls = LiveState::default();
-        ls.cost_usd_by_window.insert("30d_rolling".into(), 150.0);
-        ls.org_requests_by_window.insert("1m".into(), 1); // org rate only
-        let r = cap.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
-        assert!(
-            r.is_blocked(),
-            "org cost cap must fall back to (over-cap) project spend"
-        );
-        // Org section has only cost data → an org rate limit uses project rate.
-        let rl = engine(
-            r#"{"policies":[{"name":"orgrl","type":"rate_limit","mode":"enforce","source":"org",
-            "config":{"windows":[{"period":"1m","maxRequests":60,"action":"block"}]}}]}"#,
-        );
-        let mut ls2 = LiveState::default();
-        ls2.requests_by_window.insert("1m".into(), 100);
-        ls2.org_cost_usd_by_window.insert("30d_rolling".into(), 1.0); // org cost only
-        let r2 = rl.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls2));
-        assert!(
-            r2.is_blocked(),
-            "org rate limit must fall back to (over-limit) project requests"
-        );
-        // Org section populated but MISSING this policy's window key: the
-        // fallback must be per key, not per map — a known project spend must
-        // not degrade to "state unavailable".
-        let cap30 = engine(
-            r#"{"policies":[{"name":"orgcap","type":"cost_cap","mode":"enforce","source":"org",
-            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
-        );
-        let mut ls3 = LiveState::default();
-        ls3.org_cost_usd_by_window.insert("1d_rolling".into(), 1.0); // other window only
-        ls3.cost_usd_by_window.insert("30d_rolling".into(), 150.0);
-        let r3 = cap30.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls3));
-        assert!(
-            r3.is_blocked(),
-            "missing org window must fall back to the matching project window"
-        );
+        ls.cost_usd_by_window.insert("30d_rolling".into(), 10.0);
+        ls.org_cost_usd_by_window
+            .insert("30d_rolling".into(), 5_000.0);
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+        assert!(!r.is_blocked(), "project cap must not read org spend");
     }
 
     #[test]

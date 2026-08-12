@@ -1,3 +1,22 @@
+# Shared public gateway (gateway.noveum.ai).
+#
+# ⚠ DO NOT add NOVEUM_API_KEY / NOVEUM_GUARD_PROJECT_ID to this Deployment.
+#
+# Platform-managed Nova Guard is scoped to a *dedicated, single-project*
+# gateway: NOVEUM_GUARD_PROJECT_ID is process-wide, so every request a replica
+# serves would be metered and capped against that one project no matter which
+# tenant sent it. This deployment is multi-tenant and, with an HPA up to 50
+# replicas, its per-process admission estimate is not a cross-replica cap
+# either. Enabling it here would both mis-bill tenants and advertise a hard cap
+# that does not exist.
+#
+# To run platform-managed Nova Guard today, create a SEPARATE Deployment for the
+# one project, with its own scoped Noveum service key (`guardrails:read` +
+# `guardrails:ingest`). Enabling it on this shared deployment needs the
+# server-side tenant resolution planned for a follow-up change.
+#
+# See the "Platform-managed Nova Guard: supported deployment scope" section of
+# the README.
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

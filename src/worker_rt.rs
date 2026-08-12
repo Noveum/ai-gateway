@@ -46,6 +46,7 @@ use serde_json::{json, Value};
 use worker::*;
 
 use crate::policy::decision::{Phase, PolicyDecision};
+use crate::policy::platform::{API_KEY_VAR, PROJECT_ID_VAR};
 use crate::policy::synthetic::{block_body, block_status, policy_header_token, BlockResponseMode};
 use crate::policy::PolicyEngine;
 use crate::routing::{
@@ -140,11 +141,13 @@ const RESPONSE_SKIP_HEADERS: &[&str] = &["content-length", "content-encoding"];
 /// Build the Nova Guard engine from an in‑memory bundle.
 ///
 /// On the edge, policies come from the `NOVEUM_GUARD_POLICIES` Worker var/secret
-/// (inline JSON) or KV (future); there is no filesystem. Absent/invalid config
-/// degrades to a transparent pass‑through, exactly like the native `from_env`.
-/// Honors `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` the same way `PolicyEngine::from_env`
-/// does, so block shapes match the native server.
-fn build_engine(env: &Env) -> PolicyEngine {
+/// (inline JSON) or KV (future); there is no filesystem. An *absent* bundle is a
+/// transparent pass‑through, exactly like the native `from_env`; a *present but
+/// malformed* one is a configuration error (`Err`) that the caller turns into a
+/// 503 — parsing it away would leave the operator believing the policies they
+/// deployed are in force. Honors `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` the same way
+/// `PolicyEngine::from_env` does, so block shapes match the native server.
+fn build_engine(env: &Env) -> core::result::Result<PolicyEngine, String> {
     use crate::policy::config::PolicyBundle;
     use crate::policy::engine::EngineOptions;
 
@@ -169,14 +172,20 @@ fn build_engine(env: &Env) -> PolicyEngine {
         ..Default::default()
     };
 
-    let bundle = env
+    let configured = env
         .var("NOVEUM_GUARD_POLICIES")
         .ok()
         .map(|v| v.to_string())
-        .and_then(|s| PolicyBundle::from_json_str(&s).ok())
-        .unwrap_or_default();
+        .filter(|s| !s.trim().is_empty());
 
-    PolicyEngine::from_bundle(&bundle, opts)
+    let bundle = match configured {
+        None => PolicyBundle::default(),
+        Some(s) => PolicyBundle::from_json_str(&s).map_err(|e| {
+            format!("NOVEUM_GUARD_POLICIES is set but is not a valid nova-guard bundle: {e}")
+        })?,
+    };
+
+    Ok(PolicyEngine::from_bundle(&bundle, opts))
 }
 
 /// Copy `src` headers into a fresh `Headers`, skipping any whose (lowercased)
@@ -304,18 +313,38 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // enforcement or metering while the operator believes the platform bridge is
     // active. Refuse loudly instead of failing open — see the module docs for
     // why this target is scoped to stateless inline policies.
-    let remote_configured = ["NOVEUM_API_KEY", "NOVEUM_GUARD_PROJECT_ID"]
-        .iter()
-        .all(|k| {
-            env.secret(k)
-                .map(|v| !v.to_string().trim().is_empty())
-                .or_else(|_| env.var(k).map(|v| !v.to_string().trim().is_empty()))
-                .unwrap_or(false)
-        });
-    if remote_configured {
+    // `present` counts a variable that exists at all, blank or not: an operator
+    // who set `NOVEUM_API_KEY=""` is trying to enable the bridge and deserves
+    // an error, not a silent unenforced proxy. This mirrors the native
+    // `RemoteConfig::from_values` matrix.
+    let present = |k: &str| {
+        env.secret(k)
+            .map(|v| v.to_string())
+            .or_else(|_| env.var(k).map(|v| v.to_string()))
+            .is_ok()
+    };
+    let key_set = present(API_KEY_VAR);
+    let project_set = present(PROJECT_ID_VAR);
+    if key_set && project_set {
         return unsupported_guard_config(
             "platform-managed Nova Guard (NOVEUM_API_KEY/NOVEUM_GUARD_PROJECT_ID) is not supported on the Cloudflare Worker deployment: remote policy fetch, live cost/rate state, usage reporting and the admission ledger are native-only. Unset these vars and use an inline NOVEUM_GUARD_POLICIES bundle of stateless text policies, or deploy the native gateway.",
         );
+    }
+    // Exactly one of the pair: a half-applied configuration. Refuse it on its
+    // own terms rather than falling through to an unguarded proxy — otherwise
+    // the operator's mistake is rewarded with a 200 and zero enforcement.
+    if key_set || project_set {
+        let (set, missing) = if key_set {
+            (API_KEY_VAR, PROJECT_ID_VAR)
+        } else {
+            (PROJECT_ID_VAR, API_KEY_VAR)
+        };
+        return unsupported_guard_config(&format!(
+            "{set} is set but {missing} is not: platform-managed Nova Guard needs both, and it is \
+             not supported on the Cloudflare Worker deployment in any case. Unset {set} and use an \
+             inline NOVEUM_GUARD_POLICIES bundle of stateless text policies, or deploy the native \
+             gateway."
+        ));
     }
 
     let provider = req
@@ -350,7 +379,15 @@ async fn handle(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .map(|ct| ct.to_ascii_lowercase().contains("application/json"))
         .unwrap_or(false);
 
-    let engine = build_engine(&env);
+    // A malformed inline bundle is a configuration error, not a pass-through:
+    // proxying the request would silently drop every policy the operator wrote.
+    let engine = match build_engine(&env) {
+        Ok(engine) => engine,
+        Err(e) => {
+            console_error!("Nova Guard configuration error: {e}");
+            return unsupported_guard_config(&e);
+        }
+    };
     // An inline bundle may still carry `cost_cap` / `rate_limit` policies. They
     // need a live cross-request state backend, which this target does not have,
     // so they would evaluate to "allow" on every request — and `failClosed`

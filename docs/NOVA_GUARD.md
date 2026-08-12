@@ -102,8 +102,8 @@ them is accepted and those policies are skipped.
 
 | Type | Phase(s) | What it does |
 |---|---|---|
-| `cost_cap` | input | Block/flag when project spend over a window crosses a cap (soft + hard). **Requires a cross-request state backend** (not bundled today); without one it fails open — see [Modes and fail-safety](#modes-and-fail-safety). |
-| `rate_limit` | input | Block when requests/tokens over a window exceed a limit. **Requires a cross-request state backend** (not bundled today); without one it fails open. |
+| `cost_cap` | input | Block/flag when spend over a window crosses a cap (soft + hard). **Requires a cross-request state backend** — supplied by platform-managed Nova Guard on the native gateway; without one it fails open. See [Modes and fail-safety](#modes-and-fail-safety). |
+| `rate_limit` | input | Block when requests/tokens over a window exceed a limit. **Requires a cross-request state backend** — same as `cost_cap`. |
 | `model_allowlist` | input | Allow only listed models (or deny specific ones); supports `gpt-4*` wildcards. |
 | `regex_match` | input/output/both | Block/redact/mask/flag on regex matches (linear-time, ReDoS-safe). |
 | `banned_substrings` | input/output/both | Block/redact a fixed list of literal terms (Aho-Corasick). |
@@ -132,11 +132,32 @@ compose — each policy (in priority order) sees the previous policy's mutated
 text.
 
 `cost_cap` and `rate_limit` need a cross-request state backend (spend/rate
-counters) to evaluate. No backend is bundled today, so they **always fail open**
-(allow) — and a `failClosed: true` on those two types is neutralized at load time
-with a warning, so a stale bundle can't block 100% of traffic. (The stateless
-policy types — regex, PII, secrets, banned substrings, model allowlist, JSON
-schema, token caps — enforce fully with no backend.)
+counters) to evaluate. There are two cases:
+
+* **No backend** (local bundle only, or the Cloudflare Worker) — they cannot be
+  evaluated, so they **always fail open** (allow), and a `failClosed: true` on
+  those two types is neutralized at load time with a warning so a stale bundle
+  can't block 100% of traffic. The Worker refuses such a bundle outright with a
+  503 rather than accepting it and enforcing nothing.
+* **Platform-managed Nova Guard** (native, `NOVEUM_API_KEY` +
+  `NOVEUM_GUARD_PROJECT_ID`) — live counters come from the Noveum platform, so
+  both types evaluate for real and `failClosed` is honored: a `/state` outage,
+  or a counter the policy needs that the response does not carry, blocks.
+
+(The stateless policy types — regex, PII, secrets, banned substrings, model
+allowlist, JSON schema, token caps — enforce fully with no backend.)
+
+### Scope of enforcement under the platform bridge
+
+* A policy reads **only its own scope's counters**. An organization-sourced
+  policy is evaluated against organization counters; if the platform's `/state`
+  response does not carry them, that is *unavailable state* (fail-closed blocks,
+  fail-open allows with an explicit reason) — project counters are never
+  substituted, because that would let every project consume the whole
+  organization allowance separately.
+* Admission is **per-process and estimate-based**: each replica reserves against
+  reported spend plus its own in-flight estimate. It is not an atomic
+  cross-replica hard cap. See the README's deployment-scope section.
 
 ## Streaming
 
