@@ -60,6 +60,37 @@ curl -i localhost:8787/v1/chat/completions \
 Verified locally: `/health`, OpenAI + Groq proxy (real upstreams), and the SSN
 block all behave identically to the native server.
 
+### Hermetic end-to-end proof of the platform bridge
+
+```bash
+scripts/novaguard_worker_e2e.sh          # NODE_BIN_DIR=... if node < 22 is first on PATH
+```
+
+This is the only coverage of the three things that exist **only** on `wasm32`
+and are therefore invisible to `cargo test`: `worker::Fetch` against the control
+plane, `ctx.wait_until` settlement, and the SSE stream tee. Everything else in
+`worker_remote.rs` is a pure function with native unit tests; these three were
+previously proven by compilation alone.
+
+It needs no Cloudflare account, no Noveum backend and no provider key.
+`scripts/novaguard_mock_platform.py` plays both the control plane and the OpenAI
+upstream, and the Worker is pointed at it with `NOVEUM_API_URL` and
+`OPENAI_BASE_URL`. Four phases, each with a fresh isolate (a restart is how the
+60s in-isolate policy cache is dropped between them):
+
+| Phase | Proves |
+|---|---|
+| 1. Allowed | `/effective` + `/state` + `/admit` over `worker::Fetch`; `stream_options.include_usage` forced onto the upstream request; the SSE stream reaching the client intact; and `ctx.wait_until` settling **after** the body completes, at the stream's real token counts rather than the estimate |
+| 2. No usage frame | The reservation **abandons** with a distinguishing reason and the conservative estimate stays applied, rather than completing at a fabricated zero |
+| 3. `/admit` 503 | A fail-closed strict cap **blocks** and the provider is never called: a 503 is unevaluable, never an implicit allow |
+| 4. Over the cap | A platform block arrives as **HTTP 200 `{allowed:false}`**, the reason reaches the client, and the provider is never called |
+
+Phase 1 is the one worth reading the output of. A `gpt-4o` request with
+`max_tokens: 4096` reserves `$0.040965` up front and settles at `$0.0000675` —
+the tee recovered 11 input / 4 output tokens from the terminal usage frame, so
+the hold is reconciled down by ~600x. Without the tee, every streamed request on
+the edge would bill at its ceiling.
+
 ## Deploy to the global edge
 
 ```bash
@@ -88,6 +119,13 @@ After deploy, the gateway answers at `https://noveum-ai-gateway.<account>.worker
 - `NOVEUM_API_KEY` (**secret**) + `NOVEUM_GUARD_PROJECT_ID` — enable
   platform-managed Nova Guard; see the next section. Optional companions:
   `NOVEUM_API_URL`, `NOVEUM_GUARD_ALLOW_UNGUARDED_START`.
+- `NOVEUM_GUARD_TENANCY` — `dedicated` only. `shared` is native-only and is
+  **refused** with a 503 rather than ignored; see the table below.
+- `OPENAI_BASE_URL` — send `x-provider: openai` traffic to a compatible upstream
+  instead of `api.openai.com`. The same override the native gateway honors, and
+  normalized by the same rule (trim, drop trailing slashes, reject empty). It is
+  what lets the Worker be tested against a local mock; in production leave it
+  unset.
 
 Non-JSON `/v1/*` request bodies (multipart, binary) are forwarded byte-for-byte
 and are not inspected; only `application/json` bodies run through Nova Guard.

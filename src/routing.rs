@@ -7,6 +7,11 @@ use serde_json::{json, Value};
 
 use crate::policy::{decision::Phase, PolicyEngine};
 
+/// Base-URL override for the OpenAI upstream (the OpenAI SDK convention).
+/// Declared here because both the native provider and the Worker honor it, and
+/// a request must reach the same upstream whichever one serves it.
+pub const OPENAI_BASE_URL_VAR: &str = "OPENAI_BASE_URL";
+
 /// Where an OpenAI-compatible request should be forwarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderRoute {
@@ -45,12 +50,39 @@ pub fn resolve_provider(name: &str) -> Option<ProviderRoute> {
 
 /// Build the upstream URL for a proxied request.
 pub fn upstream_url(route: &ProviderRoute, request_path: &str) -> String {
+    upstream_url_with_base(route, request_path, None)
+}
+
+/// Normalize an operator-supplied base-URL override.
+///
+/// Trim, drop trailing slashes, and only *then* reject empty, so whitespace or a
+/// bare `"///"` cannot produce a broken base URL. Byte-for-byte the rule the
+/// native `OpenAIProvider::new` applies to `OPENAI_BASE_URL`, because a request
+/// must resolve to the same upstream whichever deployment shape serves it.
+pub fn normalize_base_url(raw: Option<&str>) -> Option<String> {
+    raw.map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// [`upstream_url`], with an optional base that replaces the route's own.
+///
+/// The route table is a compile-time list of real provider hostnames, which
+/// leaves the Worker with no way to be pointed at a local endpoint. That is not
+/// only a testing inconvenience: it is why the Worker's control-plane path could
+/// not be exercised end to end before shipping. `override_base` is already
+/// normalized by [`normalize_base_url`]; `strip_v1` still applies, so an
+/// override behaves exactly like the base it replaces.
+pub fn upstream_url_with_base(
+    route: &ProviderRoute,
+    request_path: &str,
+    override_base: Option<&str>,
+) -> String {
     let path = if route.strip_v1 {
         request_path.strip_prefix("/v1").unwrap_or(request_path)
     } else {
         request_path
     };
-    format!("{}{}", route.base_url, path)
+    format!("{}{}", override_base.unwrap_or(route.base_url), path)
 }
 
 /// Flatten the user-supplied input text from a chat/completions-style body.
@@ -500,6 +532,59 @@ pub fn bedrock_converse_to_openai(resp: &Value, model: &str, created_ts: i64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The override has to normalize identically on both deployment shapes, or
+    /// the same `OPENAI_BASE_URL` sends a request to two different upstreams.
+    #[test]
+    fn a_base_url_override_is_normalized_then_rejected_if_empty() {
+        assert_eq!(
+            normalize_base_url(Some("  http://127.0.0.1:8899///  ")).as_deref(),
+            Some("http://127.0.0.1:8899")
+        );
+        assert_eq!(
+            normalize_base_url(Some("https://api.test.dev")).as_deref(),
+            Some("https://api.test.dev")
+        );
+        // Normalize FIRST, reject empty second: whitespace and a bare "///"
+        // must not survive as a base URL.
+        for empty in [None, Some(""), Some("   "), Some("///"), Some("  //  ")] {
+            assert_eq!(normalize_base_url(empty), None, "{empty:?} must not apply");
+        }
+    }
+
+    #[test]
+    fn an_override_replaces_the_base_and_still_honors_strip_v1() {
+        let openai = resolve_provider("openai").unwrap();
+        assert_eq!(
+            upstream_url(&openai, "/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            upstream_url_with_base(
+                &openai,
+                "/v1/chat/completions",
+                Some("http://127.0.0.1:8899")
+            ),
+            "http://127.0.0.1:8899/v1/chat/completions"
+        );
+        // No override is exactly the old behaviour.
+        assert_eq!(
+            upstream_url_with_base(&openai, "/v1/chat/completions", None),
+            upstream_url(&openai, "/v1/chat/completions")
+        );
+        // `strip_v1` belongs to the route, not the base, so an override on a
+        // stripping provider still drops the version segment.
+        let gemini = resolve_provider("gemini").unwrap();
+        assert!(gemini.strip_v1);
+        assert_eq!(
+            upstream_url_with_base(
+                &gemini,
+                "/v1/chat/completions",
+                Some("http://127.0.0.1:8899")
+            ),
+            "http://127.0.0.1:8899/chat/completions"
+        );
+    }
 
     #[test]
     fn resolves_openai_compatible_providers() {

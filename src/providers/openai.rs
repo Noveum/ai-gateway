@@ -33,11 +33,12 @@ impl OpenAIProvider {
         // hermetic E2E, or a self-hosted compatible endpoint. Normalize first
         // (trim, drop trailing slashes) and only then reject empty values, so
         // whitespace or a bare "///" can't produce a broken base URL.
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .map(|s| s.trim().trim_end_matches('/').to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "https://api.openai.com".to_string());
+        let base_url = crate::routing::normalize_base_url(
+            std::env::var(crate::routing::OPENAI_BASE_URL_VAR)
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|| "https://api.openai.com".to_string());
         Self { base_url }
     }
 }

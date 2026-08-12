@@ -148,6 +148,7 @@ PORT=8080 noveum-ai-gateway
 | `NOVEUM_API_URL` | `https://api.noveum.ai` | Platform API base URL (both modes) |
 | `NOVEUM_GUARD_TENANT_TTL_SECS` | `300` | Shared mode: how long one credential→tenant resolution is reused. Matches the platform's own API-key cache, so the gateway is never *more* stale than the control plane it mirrors |
 | `NOVEUM_GUARD_TENANT_CACHE_MAX` | `1024` | Shared mode: how many distinct tenants one process keeps warm (compiled policies, counters, reservations). A tenant idle for 10 minutes is dropped, which is also what makes a revoked credential self-heal |
+| `OPENAI_BASE_URL` | `https://api.openai.com` | Send `x-provider: openai` traffic to a compatible upstream. Honored by both the native gateway and the Cloudflare Worker |
 | `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Assumed completion size for cost/rate admission when a request sets no `max_tokens`. Raise it for stricter (earlier-blocking) hard-cap admission of unbounded requests |
 | `NOVEUM_GUARD_ALLOW_UNGUARDED_START` | `false` | **Emergency use only.** Lets the gateway start when the first platform policy fetch fails, serving traffic with *no* enforcement until a later poll succeeds. Without it, that failure aborts startup |
 

@@ -33,3 +33,7 @@ build/
 .wrangler/
 node_modules/
 .dev.vars
+
+# Python bytecode from the test-double scripts
+__pycache__/
+*.pyc

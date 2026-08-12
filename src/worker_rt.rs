@@ -74,8 +74,9 @@ use crate::policy::worker_remote::{
 use crate::policy::PolicyEngine;
 use crate::routing::{
     apply_input_transforms, apply_output_transforms, bedrock_converse_to_openai,
-    flatten_input_text, flatten_output_text, openai_to_bedrock_converse, resolve_provider,
-    transform_anthropic_to_openai_format, upstream_url,
+    flatten_input_text, flatten_output_text, normalize_base_url, openai_to_bedrock_converse,
+    resolve_provider, transform_anthropic_to_openai_format, upstream_url_with_base,
+    OPENAI_BASE_URL_VAR,
 };
 use crate::sigv4;
 
@@ -905,7 +906,15 @@ async fn proxy(
     } else {
         let route = route.expect("checked above");
         out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
-        let base = upstream_url(&route, &path);
+        // `OPENAI_BASE_URL` targets a compatible upstream, the same override the
+        // native gateway honors. Scoped to `x-provider: openai` for the same
+        // reason it is there: it is the OpenAI SDK convention, not a general
+        // per-provider redirect.
+        let base_override = provider
+            .eq_ignore_ascii_case("openai")
+            .then(|| normalize_base_url(env_value(&env, OPENAI_BASE_URL_VAR).as_deref()))
+            .flatten();
+        let base = upstream_url_with_base(&route, &path, base_override.as_deref());
         url = match &query {
             Some(q) => format!("{base}?{q}"),
             None => base,
