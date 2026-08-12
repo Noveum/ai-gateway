@@ -7,6 +7,7 @@
 //! from Anthropic's `usage.input_tokens`/`output_tokens` and priced via the
 //! shared table.
 
+use super::anthropic_stream;
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
@@ -143,13 +144,27 @@ impl Provider for AnthropicProvider {
                 debug!("No request-id header found for Anthropic streaming response");
             }
 
-            // Currently, we'll return the original streaming response without transformation
-            // as transforming streams is complex and should be implemented more carefully
+            // Only a successful event-stream is Anthropic's message protocol. A
+            // non-2xx body is an error envelope and is passed through unchanged
+            // (same rule as the non-streaming path below).
+            if !parts.status.is_success() {
+                debug!(
+                    "Anthropic returned {} on a streaming request; passing the body through",
+                    parts.status
+                );
+                return Ok(Response::from_parts(parts, body));
+            }
 
-            // TODO: Implement proper streaming transformation for Anthropic to OpenAI format
-            // This would require inspecting each chunk, transforming it to OpenAI format,
-            // and reconstructing the stream. For now, we'll focus on regular responses.
-            debug!("Returning streaming response without transformation");
+            // Translate Anthropic's message events into OpenAI `chat.completion.chunk`
+            // frames terminated by `data: [DONE]`. The transformer reassembles SSE
+            // frames byte-exactly (transport chunks split frames at arbitrary
+            // offsets, including mid-UTF-8), merges `input_tokens` from
+            // `message_start` with `output_tokens` from `message_delta` into the
+            // OpenAI `usage` object on the final chunk, and surfaces upstream
+            // errors / truncation as a visible `event: error` frame instead of a
+            // clean EOF that would look like a complete response.
+            debug!("Transforming Anthropic event stream to OpenAI chunk format");
+            let body = anthropic_stream::transform_body(body, chrono::Utc::now().timestamp());
             return Ok(Response::from_parts(parts, body));
         }
 
@@ -497,6 +512,50 @@ mod tests {
         // claude-sonnet-4-5 family: 3.0 in / 15.0 out per 1M
         let expected = (100.0 / 1e6) * 3.0 + (40.0 / 1e6) * 15.0;
         assert!((m.cost.unwrap() - expected).abs() < 1e-9);
+    }
+
+    /// The streamed usage must survive the Anthropic→OpenAI translation: the
+    /// telemetry layer reads the *transformed* chunks (the provider runs before
+    /// the metrics middleware), so cost/metering depends on the final chunk this
+    /// transformer emits being readable by the extractor.
+    #[test]
+    fn streamed_usage_reaches_the_metrics_extractor() {
+        use super::super::anthropic_stream::AnthropicStreamTransformer;
+
+        let upstream = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_9\",\"model\":\"claude-sonnet-4-5-20250929\",\"usage\":{\"input_tokens\":100}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":40}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut transformer = AnthropicStreamTransformer::new(1_700_000_000);
+        let mut sse = transformer.push(upstream.as_bytes()).sse;
+        sse.push_str(&transformer.finish().sse);
+
+        // Feed the transformed frames through the extractor exactly as the
+        // telemetry middleware does, merging as it goes.
+        let mut merged = ProviderMetrics::default();
+        for payload in sse
+            .split("\n\n")
+            .filter_map(|f| f.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+        {
+            if let Some(m) = AnthropicMetricsExtractor.extract_streaming_metrics(payload) {
+                merged.merge_streaming(m);
+            }
+        }
+
+        assert_eq!(merged.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(merged.input_tokens, Some(100), "from message_start");
+        assert_eq!(merged.output_tokens, Some(40), "from message_delta");
+        assert_eq!(merged.total_tokens, Some(140));
+        assert_eq!(merged.request_id.as_deref(), Some("msg_9"));
+        let expected = (100.0 / 1e6) * 3.0 + (40.0 / 1e6) * 15.0;
+        assert!(
+            (merged.cost.unwrap() - expected).abs() < 1e-9,
+            "streamed cost must match the non-streaming price: {:?}",
+            merged.cost
+        );
     }
 
     #[test]
