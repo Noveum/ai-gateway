@@ -66,11 +66,21 @@ async fn main() {
             .await;
     }
 
-    // Nova Guard policy engine. If platform-managed Nova Guard is configured
-    // (`NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID`), policies are fetched from the
-    // Noveum platform and live cost/rate state is queried per request; otherwise
-    // policies load from the local source (`NOVEUM_GUARD_POLICIES_FILE` / inline
-    // `NOVEUM_GUARD_POLICIES`).
+    // Nova Guard policy engine. Platform-managed Nova Guard runs in one of two
+    // explicit, mutually exclusive deployment modes (`NOVEUM_GUARD_TENANCY`):
+    //
+    // * DEDICATED (`NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID`) — one
+    //   process-wide project. Policies are fetched once at startup and live
+    //   cost/rate state is queried per request, all for that one project. This
+    //   is also what an unset `NOVEUM_GUARD_TENANCY` means, so existing
+    //   deployments are untouched.
+    // * SHARED (`NOVEUM_GUARD_TENANCY=shared`, no process-wide project or key) —
+    //   every `/v1/*` caller presents its own Noveum key, and the project +
+    //   organization to enforce against are derived from it server-side. This
+    //   is what a multi-tenant deployment such as `gateway.noveum.ai` requires.
+    //
+    // With neither configured, policies load from the local source
+    // (`NOVEUM_GUARD_POLICIES_FILE` / inline `NOVEUM_GUARD_POLICIES`).
     //
     // Nothing here degrades an *explicitly configured* guard into a silent
     // pass-through: a broken or half-applied configuration, and a platform
@@ -80,7 +90,7 @@ async fn main() {
     // deliberate `NOVEUM_GUARD_ALLOW_UNGUARDED_START` escape hatch below.
     info!("Initializing Nova Guard policy engine");
     use noveum_ai_gateway::policy::engine::EngineOptions;
-    use noveum_ai_gateway::policy::remote::{RemoteConfig, RemoteLiveState};
+    use noveum_ai_gateway::policy::remote::RemoteLiveState;
     use noveum_ai_gateway::policy::usage::UsageReporter;
     use noveum_ai_gateway::telemetry::NovaGuardUsagePlugin;
 
@@ -104,17 +114,48 @@ async fn main() {
             })
             .unwrap_or(false);
 
-    let remote_cfg =
-        RemoteConfig::from_env().unwrap_or_else(|e| fatal_guard_config(&e.to_string()));
+    // Which deployment mode? A half-applied or contradictory configuration
+    // (shared tenancy *and* a process-wide project id, `dedicated` with no
+    // credentials, an unknown mode string) is an error here, not a precedence
+    // rule resolved silently at runtime.
+    let tenancy = noveum_ai_gateway::policy::remote::GuardTenancy::from_env()
+        .unwrap_or_else(|e| fatal_guard_config(&e.to_string()));
+
+    // A local bundle in shared mode would be loaded and never enforced (each
+    // tenant is evaluated against its own policy set), and a local
+    // `cost_cap`/`rate_limit` would be one counter shared by every tenant.
+    if let Some(e) = noveum_ai_gateway::policy::remote::shared_mode_local_bundle_conflict(
+        matches!(
+            tenancy,
+            Some(noveum_ai_gateway::policy::remote::GuardTenancy::Shared(_))
+        ),
+        std::env::var("NOVEUM_GUARD_POLICIES_FILE").ok().as_deref(),
+        std::env::var("NOVEUM_GUARD_POLICIES").ok().as_deref(),
+    ) {
+        fatal_guard_config(&e);
+    }
+
+    let remote_cfg = tenancy.as_ref().and_then(|t| t.dedicated()).cloned();
+    let shared_cfg = match &tenancy {
+        Some(noveum_ai_gateway::policy::remote::GuardTenancy::Shared(c)) => Some(c.clone()),
+        _ => None,
+    };
 
     // Client for the platform's atomic admission API (strict-mode cost caps).
     // Validated against the bridge configuration: `NOVEUM_GUARD_COST_ENFORCEMENT=strict`
     // with no bridge is a hard error, not a silent downgrade to per-replica
     // (i.e. replica-count-multiplied) enforcement.
-    let admission =
+    //
+    // Shared mode has no process-wide client: admission reserves against ONE
+    // project's counter, so each tenant gets its own (built by `SharedTenancy`,
+    // which validates the same variable).
+    let admission = if shared_cfg.is_some() {
+        None
+    } else {
         noveum_ai_gateway::policy::admission::AdmissionClient::from_env(remote_cfg.as_ref())
             .unwrap_or_else(|e| fatal_guard_config(&e.to_string()))
-            .map(Arc::new);
+            .map(Arc::new)
+    };
     if admission.is_some() {
         info!(
             "Nova Guard: platform atomic admission available (used by cost caps in strict \
@@ -122,75 +163,116 @@ async fn main() {
         );
     }
 
-    let (policy_engine, live, usage) = match remote_cfg {
-        Some(cfg) => {
-            info!(
-                project = %cfg.project_id, api = %cfg.base_url,
-                "Nova Guard: fetching policies from the Noveum platform"
-            );
-            // A live-state backend (the platform bridge) is wired here, so the
-            // engine honors `failClosed` (a `/state` outage blocks).
-            let mut opts = EngineOptions::from_env();
-            opts.live_state_backed = true;
-            // Aborts startup if the first fetch fails, so no replica ever
-            // serves `/v1/*` believing a policy set is loaded when none is.
-            let (engine, etag) = noveum_ai_gateway::policy::remote::bootstrap_engine(
-                &cfg,
-                opts.clone(),
-                allow_unguarded_start,
-            )
-            .await
-            .unwrap_or_else(|e| fatal_guard_config(&e));
-            let engine = Arc::new(engine);
-            // Background poller: refresh policies from `/effective` ~60s and
-            // hot-swap the engine (self-heals if the startup fetch failed).
-            noveum_ai_gateway::policy::remote::spawn_policy_poller(
-                cfg.clone(),
-                engine.clone(),
-                etag,
-            );
-            // Spawn the usage reporter and register the ALLOWED exporter. BLOCKED
-            // events are reported from the guard middleware via the same reporter.
-            //
-            // The exporter is gated on the admission client: while a strict
-            // `cost_cap` is active, each request's *reservation settlement* is
-            // its metered record, and reporting it here as well would count the
-            // same call twice (halving every cap).
-            let reporter = UsageReporter::spawn(cfg.clone());
-            let mut exporter = NovaGuardUsagePlugin::new(reporter.clone());
-            if let Some(admission) = &admission {
-                exporter = exporter.metered_by_admission(engine.clone(), admission.clone());
-            }
-            metrics_registry.register_exporter(Box::new(exporter)).await;
-            (
-                engine,
-                Some(Arc::new(RemoteLiveState::new(cfg))),
-                Some(reporter),
-            )
-        }
-        None => {
-            // No platform bridge. A local bundle is optional, but a configured
-            // one that fails to load is fatal rather than silently ignored.
-            let engine = PolicyEngine::from_env()
+    // Shared gateway: build the tenancy layer. Nothing is fetched at startup —
+    // there is no tenant yet — but a misconfiguration still aborts here.
+    let tenancy_layer = shared_cfg.map(|cfg| {
+        let base_url = cfg.base_url.clone();
+        let ttl = cfg.resolution_ttl;
+        let max = cfg.max_tenants;
+        let shared = noveum_ai_gateway::policy::middleware::SharedTenancy::from_env(
+            cfg,
+            allow_unguarded_start,
+        )
+        .unwrap_or_else(|e| fatal_guard_config(&e.to_string()));
+        info!(
+            api = %base_url, resolution_ttl_secs = ttl.as_secs(), max_tenants = max,
+            credential_header = noveum_ai_gateway::policy::remote::TENANT_CREDENTIAL_HEADER,
+            "Nova Guard: SHARED gateway — every /v1/* caller is authenticated and its project + \
+             organization are derived from its own Noveum key; policies, counters, reservations \
+             and usage are keyed by that derived tenant"
+        );
+        Arc::new(shared)
+    });
+
+    let (policy_engine, live, usage) = if tenancy_layer.is_some() {
+        // The process-wide engine is a deliberately empty no-op in shared mode:
+        // every guarded request is evaluated against the engine of the tenant
+        // derived from its credential, injected by `tenant_middleware`. There is
+        // likewise no process-wide live state or usage reporter — one of either
+        // would be a cross-tenant counter.
+        (
+            Arc::new(PolicyEngine::from_bundle(
+                &noveum_ai_gateway::policy::PolicyBundle::default(),
+                EngineOptions::default(),
+            )),
+            None,
+            None,
+        )
+    } else {
+        match remote_cfg {
+            Some(cfg) => {
+                info!(
+                    project = %cfg.project_id, api = %cfg.base_url,
+                    "Nova Guard: fetching policies from the Noveum platform"
+                );
+                // A live-state backend (the platform bridge) is wired here, so the
+                // engine honors `failClosed` (a `/state` outage blocks).
+                let mut opts = EngineOptions::from_env();
+                opts.live_state_backed = true;
+                // Aborts startup if the first fetch fails, so no replica ever
+                // serves `/v1/*` believing a policy set is loaded when none is.
+                let (engine, etag) = noveum_ai_gateway::policy::remote::bootstrap_engine(
+                    &cfg,
+                    opts.clone(),
+                    allow_unguarded_start,
+                )
                 .await
                 .unwrap_or_else(|e| fatal_guard_config(&e));
-            (Arc::new(engine), None, None)
+                let engine = Arc::new(engine);
+                // Background poller: refresh policies from `/effective` ~60s and
+                // hot-swap the engine (self-heals if the startup fetch failed).
+                noveum_ai_gateway::policy::remote::spawn_policy_poller(
+                    cfg.clone(),
+                    engine.clone(),
+                    etag,
+                );
+                // Spawn the usage reporter and register the ALLOWED exporter. BLOCKED
+                // events are reported from the guard middleware via the same reporter.
+                //
+                // The exporter is gated on the admission client: while a strict
+                // `cost_cap` is active, each request's *reservation settlement* is
+                // its metered record, and reporting it here as well would count the
+                // same call twice (halving every cap).
+                let reporter = UsageReporter::spawn(cfg.clone());
+                let mut exporter = NovaGuardUsagePlugin::new(reporter.clone());
+                if let Some(admission) = &admission {
+                    exporter = exporter.metered_by_admission(engine.clone(), admission.clone());
+                }
+                metrics_registry.register_exporter(Box::new(exporter)).await;
+                (
+                    engine,
+                    Some(Arc::new(RemoteLiveState::new(cfg))),
+                    Some(reporter),
+                )
+            }
+            None => {
+                // No platform bridge. A local bundle is optional, but a configured
+                // one that fails to load is fatal rather than silently ignored.
+                let engine = PolicyEngine::from_env()
+                    .await
+                    .unwrap_or_else(|e| fatal_guard_config(&e));
+                (Arc::new(engine), None, None)
+            }
         }
     };
-    info!(
-        "Nova Guard: {} active policies ({}{})",
-        policy_engine.active_policy_count(),
-        if policy_engine.is_enabled() {
-            "enabled"
-        } else {
-            "disabled (pass-through)"
-        },
-        if live.is_some() {
-            ", platform live-state + usage reporting"
-        } else {
-            ""
-        }
-    );
+    if tenancy_layer.is_some() {
+        info!("Nova Guard: policies are per-tenant in shared mode; none are loaded process-wide");
+    } else {
+        info!(
+            "Nova Guard: {} active policies ({}{})",
+            policy_engine.active_policy_count(),
+            if policy_engine.is_enabled() {
+                "enabled"
+            } else {
+                "disabled (pass-through)"
+            },
+            if live.is_some() {
+                ", platform live-state + usage reporting"
+            } else {
+                ""
+            }
+        );
+    }
 
     // Kept out of `AppState` so the shutdown path below can flush whatever is
     // still queued once the server stops accepting requests.
@@ -205,6 +287,7 @@ async fn main() {
         live,
         usage,
         admission,
+        tenancy_layer,
     );
     let app = build_router(state);
 

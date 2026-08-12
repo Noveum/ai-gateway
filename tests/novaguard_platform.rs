@@ -2614,3 +2614,780 @@ async fn metering_does_not_buffer_the_stream_or_delay_the_client() {
     assert_eq!(completes.len(), 1);
     assert_eq!(completes[0].1["outputTokens"], 4);
 }
+
+// ===========================================================================
+// Shared-gateway tenancy (§6.4 / NOV-117)
+// ===========================================================================
+//
+// These tests stand up ONE mock platform serving TWO organizations with TWO
+// projects each, and drive the real router stack (`tenant_middleware` wrapping
+// `guard_middleware`). Isolation is asserted three ways, because any one of
+// them alone could pass while the others leak:
+//
+//  1. *Behavior* — identical policies + identical models, different counters:
+//     org A blocks, org B is served.
+//  2. *Wire* — every platform stub is matched on BOTH the project path AND the
+//     caller's bearer token, so a request made for the wrong tenant, or with
+//     the wrong tenant's credential, matches nothing and 404s (which the
+//     gateway surfaces as a failure rather than silently succeeding).
+//  3. *State* — one tenant's pending reservations and cached live state cannot
+//     move another tenant's admission decision.
+
+use noveum_ai_gateway::policy::middleware::{tenant_middleware, SharedTenancy};
+use noveum_ai_gateway::policy::remote::{SharedTenancyConfig, TENANT_CREDENTIAL_HEADER};
+
+const ORG_A: &str = "org_alpha";
+const ORG_B: &str = "org_beta";
+const KEY_A: &str = "nv_key_alpha";
+const KEY_B: &str = "nv_key_beta";
+/// A third organization with exactly ONE project, for the "no routing header"
+/// case (a key entitled to several projects has nothing to default to).
+const ORG_SOLO: &str = "org_solo";
+const KEY_SOLO: &str = "nv_key_solo";
+
+fn policies_path(project: &str) -> String {
+    format!("/api/v1/projects/{project}/policies/effective")
+}
+fn tenant_state_path(project: &str) -> String {
+    format!("/api/v1/projects/{project}/policies/state")
+}
+fn tenant_usage_path(project: &str) -> String {
+    format!("/api/v1/projects/{project}/policies/usage")
+}
+fn bearer(key: &str) -> String {
+    format!("Bearer {key}")
+}
+
+/// Stub the platform's project listing — the call that establishes identity.
+/// Matched on the bearer token, so each key sees only its own organization.
+async fn mount_identity(server: &MockServer, key: &str, org: &str, projects: &[&str]) {
+    let body: Vec<Value> = projects
+        .iter()
+        .map(|p| json!({"id": p, "name": p, "organizationId": org}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(match_path("/api/v1/projects"))
+        .and(match_header("authorization", bearer(key).as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+/// Stub one project's policy set, live state and usage sink — all matched on
+/// the owning key's bearer token. Any call made under a different credential
+/// matches no stub and 404s, which is exactly the signal a cross-tenant leak
+/// would produce.
+async fn mount_project(
+    server: &MockServer,
+    key: &str,
+    project: &str,
+    policies: Value,
+    state: Value,
+) {
+    Mock::given(method("GET"))
+        .and(match_path(policies_path(project)))
+        .and(match_header("authorization", bearer(key).as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(policies))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(match_path(tenant_state_path(project)))
+        .and(match_header("authorization", bearer(key).as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(state))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(match_path(tenant_usage_path(project)))
+        .and(match_header("authorization", bearer(key).as_str()))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .set_body_json(json!({"success":true,"accepted":1,"persisted":1,"blocked":0})),
+        )
+        .mount(server)
+        .await;
+}
+
+/// A `cost_cap` at `max_usd`. Deliberately byte-identical across tenants so the
+/// cache-keying test cannot pass by the policies happening to differ.
+fn shared_cost_cap(max_usd: f64) -> Value {
+    json!({"policies":[{
+        "policyId":"pol_cap","name":"Daily cap","type":"COST_CAP",
+        "enabled":true,"failClosed":true,
+        "config":{"window":"1d_rolling","maxUsd":max_usd,"action":"BLOCK"}
+    }]})
+}
+
+fn spend_state(cost_usd: f64) -> Value {
+    json!({"cost":{"1d_rolling":cost_usd},"rate":{"requests_1m":0},"stale":false,"ttlSeconds":30})
+}
+
+/// The real shared-gateway stack: tenancy layer outside, guard layer inside,
+/// and a process-wide `GuardState` that is an EMPTY no-op engine — exactly what
+/// `main.rs` builds in shared mode. If the tenancy layer ever failed to inject
+/// a tenant, the guard layer would enforce nothing, so every "blocked" assertion
+/// below is also a proof that injection happened.
+fn shared_stack(server_uri: &str) -> (Router, Arc<SharedTenancy>) {
+    let cfg = SharedTenancyConfig {
+        base_url: server_uri.trim_end_matches('/').to_string(),
+        resolution_ttl: Duration::from_secs(300),
+        max_tenants: 64,
+    };
+    let shared = Arc::new(SharedTenancy::new(cfg, backed_opts(), None, false));
+    let process_wide = GuardState {
+        engine: Arc::new(PolicyEngine::from_bundle(
+            &noveum_ai_gateway::policy::PolicyBundle::default(),
+            EngineOptions::default(),
+        )),
+        live: None,
+        usage: None,
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+        admission: None,
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_handler))
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .layer(from_fn_with_state(process_wide, guard_middleware))
+        .layer(from_fn_with_state(shared.clone(), tenant_middleware));
+    (app, shared)
+}
+
+/// One chat request, optionally carrying a credential and routing headers.
+fn tenant_request(key: Option<&str>, project: Option<&str>, org: Option<&str>) -> Request<Body> {
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hello there"}]});
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-provider", "openai");
+    if let Some(k) = key {
+        b = b.header(TENANT_CREDENTIAL_HEADER, k);
+    }
+    if let Some(p) = project {
+        b = b.header("x-project-id", p);
+    }
+    if let Some(o) = org {
+        b = b.header("x-organization-id", o);
+    }
+    b.body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn blocked(resp: &Response) -> bool {
+    resp.headers().contains_key("x-noveum-guard-blocked")
+}
+
+async fn body_string(resp: Response) -> String {
+    use http_body_util::BodyExt;
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+/// Every platform path touched under a given bearer token.
+async fn paths_for_key(server: &MockServer, key: &str) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            r.headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v == bearer(key))
+        })
+        .map(|r| r.url.path().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn shared_mode_isolates_two_organizations_with_two_projects_each() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+
+    // Two organizations, two projects each. Every project carries the SAME
+    // cost cap; only the spend differs, and only in org A's first project.
+    mount_identity(&server, KEY_A, ORG_A, &["proj_a1", "proj_a2"]).await;
+    mount_identity(&server, KEY_B, ORG_B, &["proj_b1", "proj_b2"]).await;
+    mount_project(
+        &server,
+        KEY_A,
+        "proj_a1",
+        shared_cost_cap(10.0),
+        spend_state(25.0),
+    )
+    .await;
+    mount_project(
+        &server,
+        KEY_A,
+        "proj_a2",
+        shared_cost_cap(10.0),
+        spend_state(0.0),
+    )
+    .await;
+    mount_project(
+        &server,
+        KEY_B,
+        "proj_b1",
+        shared_cost_cap(10.0),
+        spend_state(0.0),
+    )
+    .await;
+    mount_project(
+        &server,
+        KEY_B,
+        "proj_b2",
+        shared_cost_cap(10.0),
+        spend_state(0.0),
+    )
+    .await;
+
+    let (app, shared) = shared_stack(&server.uri());
+
+    // Org A / project 1 is over its cap → blocked.
+    let a1 = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert!(blocked(&a1), "org A's over-cap project must be blocked");
+
+    // Org B / project 1: identical policy, identical model, its own counters →
+    // served. A shared cache keyed by anything but the tenant would have
+    // blocked this too.
+    let b1 = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_B), Some("proj_b1"), None))
+        .await
+        .unwrap();
+    assert!(
+        !blocked(&b1),
+        "org B must not inherit org A's spend: {}",
+        body_string(b1).await
+    );
+
+    // The second project of each org is likewise independent.
+    let a2 = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a2"), None))
+        .await
+        .unwrap();
+    assert!(!blocked(&a2), "org A's OTHER project has its own counters");
+    let b2 = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_B), Some("proj_b2"), None))
+        .await
+        .unwrap();
+    assert!(!blocked(&b2));
+
+    // Four distinct tenants are warm, none shared.
+    assert_eq!(shared.warm_tenants(), 4);
+
+    // On the wire: org A's credential never touched a project of org B, and
+    // vice versa. This is the assertion that would fail on a cache keyed by a
+    // client-supplied header.
+    let a_paths = paths_for_key(&server, KEY_A).await;
+    assert!(
+        a_paths.iter().all(|p| !p.contains("proj_b")),
+        "org A's key reached an org B project: {a_paths:?}"
+    );
+    assert!(a_paths.iter().any(|p| p.contains("proj_a1")));
+    let b_paths = paths_for_key(&server, KEY_B).await;
+    assert!(
+        b_paths.iter().all(|p| !p.contains("proj_a")),
+        "org B's key reached an org A project: {b_paths:?}"
+    );
+
+    // The BLOCKED usage event was reported against org A's project only.
+    let a_events = wait_for_usage(
+        &server,
+        &tenant_usage_path("proj_a1"),
+        1,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(a_events.len(), 1, "{a_events:?}");
+    assert_eq!(a_events[0]["blockedBy"], "COST_CAP");
+    for other in ["proj_a2", "proj_b1", "proj_b2"] {
+        let events = wait_for_usage(
+            &server,
+            &tenant_usage_path(other),
+            usize::MAX,
+            Duration::from_millis(150),
+        )
+        .await;
+        assert!(
+            events.iter().all(|e| e["status"] != "BLOCKED"),
+            "a block leaked into {other}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_mode_keeps_reservations_per_tenant() {
+    // Reservations are the other half of "counters": a request admitted for org
+    // B must not consume org A's remaining allowance. Both tenants get the same
+    // `maxRequests: 1` policy over frozen zero counters, so the ledger is the
+    // only thing that can block.
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "40");
+    let server = MockServer::start().await;
+    let one_per_minute = json!({"policies":[{
+        "policyId":"pol_rl","name":"one per minute","type":"RATE_LIMIT",
+        "enabled":true,"failClosed":true,
+        "config":{"windows":[{"period":"1m","maxRequests":1,"action":"BLOCK"}]}
+    }]});
+    mount_identity(&server, KEY_A, ORG_A, &["proj_a1", "proj_a2"]).await;
+    mount_identity(&server, KEY_B, ORG_B, &["proj_b1", "proj_b2"]).await;
+    mount_project(
+        &server,
+        KEY_A,
+        "proj_a1",
+        one_per_minute.clone(),
+        spend_state(0.0),
+    )
+    .await;
+    mount_project(&server, KEY_B, "proj_b1", one_per_minute, spend_state(0.0)).await;
+
+    let (app, _shared) = shared_stack(&server.uri());
+    let send = |key: &'static str, project: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(tenant_request(Some(key), Some(project), None))
+                .await
+                .unwrap();
+            let was_blocked = blocked(&resp);
+            // Drain the body so the reservation completes, as a real client would.
+            let _ = body_string(resp).await;
+            was_blocked
+        }
+    };
+
+    // Org B burns its single request, then hits its own limit.
+    assert!(
+        !send(KEY_B, "proj_b1").await,
+        "org B's first request passes"
+    );
+    assert!(
+        send(KEY_B, "proj_b1").await,
+        "org B's second request must see its own reservation"
+    );
+    // Org A's allowance is untouched by any of that.
+    assert!(
+        !send(KEY_A, "proj_a1").await,
+        "org B's traffic must not consume org A's rate allowance"
+    );
+    // ...and org A then limits itself, proving its ledger is real, not absent.
+    assert!(
+        send(KEY_A, "proj_a1").await,
+        "org A's second request must see org A's own reservation"
+    );
+}
+
+#[tokio::test]
+async fn shared_mode_rejects_a_project_the_credential_is_not_entitled_to() {
+    let server = MockServer::start().await;
+    mount_identity(&server, KEY_A, ORG_A, &["proj_a1", "proj_a2"]).await;
+    mount_identity(&server, KEY_B, ORG_B, &["proj_b1", "proj_b2"]).await;
+    mount_project(
+        &server,
+        KEY_B,
+        "proj_b1",
+        shared_cost_cap(10.0),
+        spend_state(0.0),
+    )
+    .await;
+
+    let (app, shared) = shared_stack(&server.uri());
+    // Org A's key pointing `x-project-id` at an org B project. This is the
+    // header-spoofing case: it is an ERROR, never a silent override.
+    let resp = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_b1"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_string(resp).await;
+    assert!(body.contains("project_not_entitled"), "{body}");
+    assert!(body.contains("proj_b1"), "{body}");
+
+    // Nothing was warmed, and org A's key never touched an org B path.
+    assert_eq!(shared.warm_tenants(), 0);
+    let a_paths = paths_for_key(&server, KEY_A).await;
+    assert!(
+        a_paths.iter().all(|p| !p.contains("proj_b1")),
+        "the refused project was still fetched: {a_paths:?}"
+    );
+
+    // A project that exists nowhere gets the identical answer, so the status
+    // code discloses nothing about other organizations' projects.
+    let resp = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_ghost"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // A spoofed ORGANIZATION header is refused the same way, even when paired
+    // with a project the key really does own.
+    let resp = app
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a1"), Some(ORG_B)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_string(resp).await;
+    assert!(body.contains("organization_mismatch"), "{body}");
+}
+
+#[tokio::test]
+async fn shared_mode_without_a_routing_header_resolves_to_the_credentials_own_project() {
+    let server = MockServer::start().await;
+    mount_identity(&server, KEY_SOLO, ORG_SOLO, &["proj_solo"]).await;
+    mount_project(
+        &server,
+        KEY_SOLO,
+        "proj_solo",
+        shared_cost_cap(10.0),
+        spend_state(0.0),
+    )
+    .await;
+    // A second organization exists and must never be reachable by accident.
+    mount_identity(&server, KEY_A, ORG_A, &["proj_a1", "proj_a2"]).await;
+
+    let (app, shared) = shared_stack(&server.uri());
+    let resp = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_SOLO), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!blocked(&resp));
+    assert_eq!(shared.warm_tenants(), 1);
+    let paths = paths_for_key(&server, KEY_SOLO).await;
+    assert!(
+        paths.iter().any(|p| p.contains("proj_solo")),
+        "the key's own project was not used: {paths:?}"
+    );
+
+    // A key entitled to SEVERAL projects and no routing header is refused
+    // rather than guessed at — guessing would meter one project's spend
+    // against another project's budget.
+    let resp = app
+        .oneshot(tenant_request(Some(KEY_A), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(resp).await;
+    assert!(body.contains("project_id_required"), "{body}");
+}
+
+#[tokio::test]
+async fn shared_mode_fails_closed_on_an_unusable_credential() {
+    let server = MockServer::start().await;
+    // A valid tenant exists — the point is that a bad credential never lands on it.
+    mount_identity(&server, KEY_A, ORG_A, &["proj_a1", "proj_a2"]).await;
+    mount_project(
+        &server,
+        KEY_A,
+        "proj_a1",
+        shared_cost_cap(10.0),
+        spend_state(0.0),
+    )
+    .await;
+    // Anything else presenting itself at the identity endpoint is rejected,
+    // exactly as the platform rejects an unknown, expired or revoked key.
+    Mock::given(method("GET"))
+        .and(match_path("/api/v1/projects"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(
+            json!({"success":false,"error":{"code":"INVALID_API_KEY","message":"invalid"}}),
+        ))
+        .mount(&server)
+        .await;
+
+    let (app, shared) = shared_stack(&server.uri());
+
+    // No credential at all.
+    let resp = app
+        .clone()
+        .oneshot(tenant_request(None, None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_string(resp).await;
+    assert!(body.contains("missing_noveum_credential"), "{body}");
+
+    // A present-but-empty header is not a credential either.
+    let resp = app
+        .clone()
+        .oneshot(tenant_request(Some("   "), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // An expired/revoked key. Note it also names an entitled-looking project:
+    // the routing header must not rescue an unauthenticated caller.
+    let resp = app
+        .clone()
+        .oneshot(tenant_request(Some("nv_expired"), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_string(resp).await;
+    assert!(body.contains("invalid_noveum_credential"), "{body}");
+
+    // Nothing was warmed and nothing was fetched under the bad credential —
+    // in particular there is no default tenant to have fallen through to.
+    assert_eq!(shared.warm_tenants(), 0);
+    let leaked = paths_for_key(&server, "nv_expired").await;
+    assert!(
+        leaked.iter().all(|p| !p.contains("/policies/")),
+        "an unauthenticated caller reached a project: {leaked:?}"
+    );
+
+    // The valid tenant still works, so the refusals above are not a blanket outage.
+    let resp = app
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn shared_mode_fails_closed_when_identity_cannot_be_verified() {
+    let server = MockServer::start().await;
+    // The platform is up but broken (5xx). "Unknown" must never mean "allowed",
+    // and must never be cached as a denial either.
+    Mock::given(method("GET"))
+        .and(match_path("/api/v1/projects"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
+        .mount(&server)
+        .await;
+
+    let (app, shared) = shared_stack(&server.uri());
+    let resp = app
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_string(resp).await;
+    assert!(body.contains("tenant_resolution_unavailable"), "{body}");
+    assert_eq!(shared.warm_tenants(), 0);
+}
+
+#[tokio::test]
+async fn shared_mode_fails_closed_when_a_tenants_policies_cannot_be_fetched() {
+    // Identity resolves, but the tenant's own policy set does not. With no
+    // known policy set the request would be forwarded unguarded, so it is
+    // refused — the same rule dedicated startup applies, per tenant.
+    let server = MockServer::start().await;
+    mount_identity(&server, KEY_A, ORG_A, &["proj_a1"]).await;
+    Mock::given(method("GET"))
+        .and(match_path(policies_path("proj_a1")))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    let (app, shared) = shared_stack(&server.uri());
+    let resp = app
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(shared.warm_tenants(), 1, "the slot exists but stays empty");
+}
+
+#[tokio::test]
+async fn shared_mode_never_shares_a_cache_entry_between_tenants() {
+    // The narrow cache-keying claim, isolated: two tenants asking for the SAME
+    // model under a byte-identical policy document. If any cache — policies,
+    // live state, reservations, usage sink — were keyed by the model, the
+    // policy shape, or a request header rather than the derived tenant, the
+    // second caller would inherit the first's verdict.
+    let server = MockServer::start().await;
+    mount_identity(&server, KEY_A, ORG_A, &["proj_a1", "proj_a2"]).await;
+    mount_identity(&server, KEY_B, ORG_B, &["proj_b1", "proj_b2"]).await;
+    // Identical caps; only the spend behind them differs.
+    mount_project(
+        &server,
+        KEY_A,
+        "proj_a1",
+        shared_cost_cap(5.0),
+        spend_state(99.0),
+    )
+    .await;
+    mount_project(
+        &server,
+        KEY_B,
+        "proj_b1",
+        shared_cost_cap(5.0),
+        spend_state(0.0),
+    )
+    .await;
+
+    let (app, _shared) = shared_stack(&server.uri());
+    // Warm A first, so any shared entry would be A's.
+    let a = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert!(blocked(&a));
+    let b = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_B), Some("proj_b1"), None))
+        .await
+        .unwrap();
+    assert!(!blocked(&b), "org B inherited org A's cached live state");
+    // ...and again in the other order, so neither direction leaks.
+    let b = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_B), Some("proj_b1"), None))
+        .await
+        .unwrap();
+    assert!(!blocked(&b));
+    let a = app
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert!(blocked(&a), "org A stopped blocking after org B was served");
+
+    // Both tenants' state endpoints were really consulted — a single shared
+    // entry would show up as one of them never being fetched.
+    let reqs = server.received_requests().await.unwrap_or_default();
+    for project in ["proj_a1", "proj_b1"] {
+        assert!(
+            reqs.iter()
+                .any(|r| r.url.path() == tenant_state_path(project)),
+            "no live-state fetch for {project}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_mode_never_forwards_the_tenant_credential_upstream() {
+    // The credential is a platform secret. It must not reach the model provider,
+    // and nothing downstream of the tenancy layer has any business reading it.
+    let server = MockServer::start().await;
+    mount_identity(&server, KEY_SOLO, ORG_SOLO, &["proj_solo"]).await;
+    mount_project(
+        &server,
+        KEY_SOLO,
+        "proj_solo",
+        shared_cost_cap(10.0),
+        spend_state(0.0),
+    )
+    .await;
+
+    async fn echo_headers(req: Request<Body>) -> Response {
+        let names: Vec<String> = req
+            .headers()
+            .keys()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_vec(&json!({"headers": names})).unwrap(),
+        )
+            .into_response()
+    }
+
+    let cfg = SharedTenancyConfig {
+        base_url: server.uri().trim_end_matches('/').to_string(),
+        resolution_ttl: Duration::from_secs(300),
+        max_tenants: 64,
+    };
+    let shared = Arc::new(SharedTenancy::new(cfg, backed_opts(), None, false));
+    let process_wide = GuardState {
+        engine: Arc::new(PolicyEngine::from_bundle(
+            &noveum_ai_gateway::policy::PolicyBundle::default(),
+            EngineOptions::default(),
+        )),
+        live: None,
+        usage: None,
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+        admission: None,
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_headers))
+        .layer(from_fn_with_state(process_wide, guard_middleware))
+        .layer(from_fn_with_state(shared, tenant_middleware));
+
+    let resp = app
+        .oneshot(tenant_request(Some(KEY_SOLO), None, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(
+        !body.contains(TENANT_CREDENTIAL_HEADER),
+        "the tenant credential header reached the upstream handler: {body}"
+    );
+    assert!(!body.contains(KEY_SOLO), "{body}");
+    // The routing header is still forwarded — it is legitimate attribution
+    // metadata for telemetry, it is just never identity.
+    assert!(body.contains("x-provider"), "{body}");
+}
+
+#[tokio::test]
+async fn shared_mode_leaves_unguarded_paths_open() {
+    // Liveness/readiness probes must not need a tenant credential.
+    let server = MockServer::start().await;
+    let (app, _shared) = shared_stack(&server.uri());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dedicated_mode_is_untouched_by_the_tenancy_layer() {
+    // The regression guard for mode 1: with no tenancy layer wired, the guard
+    // middleware sees the process-wide state and behaves exactly as before —
+    // no credential required, no routing header consulted.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path(state_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(spend_state(25.0)))
+        .mount(&server)
+        .await;
+    mount_usage_ok(&server).await;
+    let c = cfg(&server.uri());
+    let bundle = translate_bundle(&shared_cost_cap(10.0)).unwrap();
+    let gs = GuardState {
+        engine: Arc::new(PolicyEngine::from_bundle(&bundle, backed_opts())),
+        live: Some(Arc::new(RemoteLiveState::new(c.clone()))),
+        usage: Some(UsageReporter::spawn(c)),
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+        admission: None,
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_handler))
+        .layer(from_fn_with_state(gs, guard_middleware));
+
+    // No credential header anywhere, and a wholly bogus routing header: the
+    // dedicated project is enforced regardless, exactly as documented.
+    let resp = app
+        .oneshot(tenant_request(
+            None,
+            Some("some-other-project"),
+            Some("some-other-org"),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        blocked(&resp),
+        "the process-wide project must still be enforced"
+    );
+    let reqs = server.received_requests().await.unwrap_or_default();
+    assert!(
+        reqs.iter().all(|r| r.url.path().contains(PROJECT)),
+        "a routing header changed the project in dedicated mode"
+    );
+}

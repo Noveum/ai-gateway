@@ -92,6 +92,12 @@ pub struct AppState {
     /// strict-mode `cost_cap` policies so a cap holds across replicas instead of
     /// being enforced once per process. `None` when the bridge isn't configured.
     pub admission: Option<Arc<crate::policy::admission::AdmissionClient>>,
+    /// Shared-gateway tenancy. `Some` only when `NOVEUM_GUARD_TENANCY=shared`:
+    /// every `/v1/*` caller is then authenticated and its project +
+    /// organization derived from the credential, and the four fields above are
+    /// *not* used for enforcement (each tenant brings its own). `None` is
+    /// dedicated mode — one process-wide project, exactly as before.
+    pub tenancy: Option<Arc<crate::policy::middleware::SharedTenancy>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,6 +109,7 @@ impl AppState {
         live: Option<Arc<crate::policy::remote::RemoteLiveState>>,
         usage: Option<crate::policy::usage::UsageReporter>,
         admission: Option<Arc<crate::policy::admission::AdmissionClient>>,
+        tenancy: Option<Arc<crate::policy::middleware::SharedTenancy>>,
     ) -> Self {
         Self {
             config,
@@ -111,6 +118,7 @@ impl AppState {
             live,
             usage,
             admission,
+            tenancy,
         }
     }
 }
@@ -127,6 +135,13 @@ impl AppState {
 /// The policy middleware is always wired but becomes a transparent pass-through
 /// when the engine has no active policies, so enabling/disabling guardrails is a
 /// runtime concern, not a routing concern.
+///
+/// In **shared** tenancy mode one more layer sits between telemetry and the
+/// guard: `tenant_middleware` authenticates every `/v1/*` caller, derives its
+/// project + organization from the credential, and replaces the process-wide
+/// `GuardState` with that tenant's own for the rest of the request. It is not
+/// wired at all in dedicated mode, so the dedicated request path is byte-for-
+/// byte what it was.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn build_router(state: AppState) -> Router {
     let cors = tower_http::cors::CorsLayer::new()
@@ -135,7 +150,7 @@ pub fn build_router(state: AppState) -> Router {
         .allow_headers(tower_http::cors::Any)
         .max_age(std::time::Duration::from_secs(3600));
 
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(handlers::health_check))
         .route("/v1/*path", any(handlers::proxy_request))
         // Nova Guard policy enforcement runs closest to the handler so it sees the
@@ -149,7 +164,18 @@ pub fn build_router(state: AppState) -> Router {
                 admission: state.admission.clone(),
             },
             policy::middleware::guard_middleware,
-        ))
+        ));
+
+    // Shared gateway: authenticate the caller and derive its tenant BEFORE the
+    // guard layer, so the guard never sees a request whose tenant is unknown.
+    if let Some(tenancy) = state.tenancy.clone() {
+        router = router.layer(from_fn_with_state(
+            tenancy,
+            policy::middleware::tenant_middleware,
+        ));
+    }
+
+    router
         // Telemetry capture wraps the policy layer so blocked requests are still
         // measured.
         .layer(from_fn_with_state(
