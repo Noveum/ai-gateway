@@ -68,17 +68,36 @@ head_sampling_rate = 1
 #                                   native `nova-guard.json`). Prefer
 #                                   `wrangler secret put NOVEUM_GUARD_POLICIES`
 #                                   when the patterns themselves are sensitive.
+#                                   IGNORED when the platform bridge below is
+#                                   configured (the platform is then the source
+#                                   of truth); the Worker logs a warning.
 #   NOVEUM_GUARD_BLOCK_RESPONSE_MODE  `guard_error` | `provider_error`.
 #
-# NOT supported on this target — the Worker returns an explicit error instead of
-# proxying unenforced traffic if either is set:
+# Platform-managed Nova Guard (the "bridge"). BOTH are required, or neither —
+# exactly one, or either set to an empty string, is a configuration error and
+# the Worker answers `/v1/*` with 503 rather than proxying unenforced traffic:
 #
-#   NOVEUM_API_KEY
-#   NOVEUM_GUARD_PROJECT_ID
+#   NOVEUM_API_KEY          SECRET. `wrangler secret put NOVEUM_API_KEY`.
+#                           Needs `guardrails:read` + `guardrails:ingest`.
+#                           Never put this in [vars] — it would be readable in
+#                           the dashboard and committed to this file.
+#   NOVEUM_GUARD_PROJECT_ID The Noveum project to enforce for. Plain var.
+#   NOVEUM_API_URL          Optional base URL override (default
+#                           https://api.noveum.ai).
+#   NOVEUM_GUARD_ALLOW_UNGUARDED_START
+#                           EMERGENCY ONLY. "true" lets the Worker serve traffic
+#                           when the policy fetch fails, with NO enforcement.
+#                           Leave unset in production.
 #
-# Platform-managed Nova Guard (remote policy fetch, live cost/rate state, usage
-# reporting, admission ledger) is native-only and is not compiled for wasm32.
-# Use an inline `NOVEUM_GUARD_POLICIES` bundle of stateless text policies here,
-# or deploy the native gateway.
+# With the bridge configured the Worker fetches the project's effective policy
+# set, reads the live cost/rate counters, and reserves each request against the
+# platform's atomic admission API — so a cost_cap or rate_limit holds across
+# every PoP, not per isolate. No Cloudflare resource binding is involved: all of
+# it is plain outbound `fetch` to the Noveum API.
+#
+# `cost_cap` / `rate_limit` in an INLINE bundle are still refused (503): an
+# inline bundle has no live-state backend, so they could only ever evaluate to
+# "allow" and `failClosed` would be neutralized along with them. Use the bridge.
 [vars]
-# (no NOVEUM_GUARD_POLICIES → transparent proxy; set it to enable Nova Guard)
+# (no NOVEUM_GUARD_POLICIES and no bridge → transparent proxy)
+# NOVEUM_GUARD_PROJECT_ID = "proj_..."   # + `wrangler secret put NOVEUM_API_KEY`

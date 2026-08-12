@@ -65,6 +65,19 @@ pub mod usage;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod middleware;
 
+/// Cloudflare Worker control-plane client: the `wasm32` counterpart to
+/// [`remote`] + [`admission`], speaking the same wire contract over
+/// `worker::Fetch` instead of `reqwest`.
+///
+/// The module is compiled on BOTH targets on purpose. Only its four `Fetch`
+/// calls are `cfg(target_arch = "wasm32")`; everything that *decides* something
+/// — the credential matrix, URL shaping, `/admit` classification (block is HTTP
+/// 200, 503 is never an allow), the settlement choice and the request-body cap —
+/// is pure and therefore covered by the ordinary `cargo test` run. Gating the
+/// whole module on wasm32 would move exactly that logic into a build this
+/// repository cannot execute.
+pub mod worker_remote;
+
 pub use config::{Policy, PolicyBundle, PolicyType};
 pub use decision::{Phase, PolicyAction, PolicyDecision, PolicyMode, Severity};
 pub use engine::{EngineOptions, EvaluationResult, PolicyEngine};

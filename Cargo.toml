@@ -122,6 +122,13 @@ tiktoken-rs = "0.12"           # token counting (native); wasm uses a char heuri
 async-stream = "0.3"           # SSE tee for post-call streaming policy evaluation
 
 # --- Cloudflare Worker only: WASM runtime + edge fetch ---
+#
+# The Worker's platform bridge (`policy::worker_remote`: effective-policy fetch,
+# live state, admission, settlement) adds NO dependency of its own. It is built
+# entirely from `worker::Fetch` + `worker::Delay` below and the shared
+# `futures`/`futures-util`/`serde_json`/`uuid` already in [dependencies].
+# `reqwest` and Tokio stay strictly native — nothing in the wasm32 graph may
+# reach them.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker = { version = "0.8", features = ["http"] }
 uuid = { version = "1.15.1", features = ["js"] }   # v4 randomness on wasm
