@@ -12,6 +12,9 @@
 //! policy, not to be the system of record for billing.
 
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+use tracing::warn;
 
 /// `(model_id, input_usd_per_1m, output_usd_per_1m)`.
 pub const MODEL_PRICING: &[(&str, f64, f64)] = &[
@@ -192,6 +195,127 @@ pub struct ModelPrice {
     pub output_per_1m: f64,
 }
 
+/// How a call was priced. The unknown-model case is part of the type so it
+/// cannot be mistaken for "priced, and it happened to be free": a model that
+/// matches nothing in the catalog used to fall through to $0, which made its
+/// spend invisible to cost caps and to the usage reports the platform bills
+/// from. Every priced path now yields one of these two variants, and both
+/// carry a non-zero rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ModelPricing {
+    /// Rates published for this model (or the family/alias it resolves to).
+    Catalog(ModelPrice),
+    /// Nothing in the catalog matched. Priced at [`assumed_unknown_price`] so
+    /// the call still advances cost counters; the rate is an assumption, not a
+    /// quote, so anything that reconciles against a provider invoice must treat
+    /// it as an upper bound rather than as truth.
+    UnknownAssumed(ModelPrice),
+}
+
+impl ModelPricing {
+    /// The rates to bill at, whichever variant this is.
+    pub fn price(self) -> ModelPrice {
+        match self {
+            ModelPricing::Catalog(p) | ModelPricing::UnknownAssumed(p) => p,
+        }
+    }
+
+    /// The rates, but only when they came from the catalog — for callers that
+    /// must distinguish "we know what this costs" from "we guessed high".
+    pub fn catalog(self) -> Option<ModelPrice> {
+        match self {
+            ModelPricing::Catalog(p) => Some(p),
+            ModelPricing::UnknownAssumed(_) => None,
+        }
+    }
+
+    /// Whether these rates are the defensive assumption for an unknown model.
+    pub fn is_assumed(self) -> bool {
+        matches!(self, ModelPricing::UnknownAssumed(_))
+    }
+}
+
+/// A priced call: the amount, plus the basis it was priced on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostEstimate {
+    pub usd: f64,
+    pub pricing: ModelPricing,
+}
+
+impl CostEstimate {
+    /// Whether this amount rests on the unknown-model assumption.
+    pub fn is_assumed(self) -> bool {
+        self.pricing.is_assumed()
+    }
+}
+
+/// USD per 1M tokens charged to a model that matches nothing in the catalog.
+///
+/// **Derived from the catalog rather than hard-coded**: the maximum input rate
+/// and the maximum output rate over every published row — base
+/// ([`MODEL_PRICING`]), announced ([`SCHEDULED_PRICING`]) and long-context
+/// ([`LONG_CONTEXT_PRICING`]). Today that is `o1`'s $15.00 / $60.00 per 1M.
+/// Adding a pricier model automatically raises the assumption, so an unknown
+/// model can never be estimated below the most expensive call the gateway
+/// knows how to make (`assumed_rate_bounds_every_catalog_rate` pins this).
+///
+/// Erring high is the intended direction. An unknown id is either a newly
+/// released model — historically priced at or near the top of the market — or
+/// a typo. Over-estimating a typo costs a request that gets blocked slightly
+/// early and an alertable warning; under-estimating a real model leaks spend
+/// past every cost cap silently, which is exactly the bug this replaces.
+///
+/// NOTE: the *number* is a defensive default, not a ratified pricing policy
+/// (see NOV-135). Whether an unknown model should instead be rejected outright
+/// is likewise a policy decision; this function only guarantees it is never $0.
+pub fn assumed_unknown_price() -> ModelPrice {
+    static ASSUMED: OnceLock<ModelPrice> = OnceLock::new();
+    *ASSUMED.get_or_init(|| {
+        let rows = MODEL_PRICING
+            .iter()
+            .map(|&(_, i, o)| (i, o))
+            .chain(SCHEDULED_PRICING.iter().map(|&(_, _, i, o)| (i, o)))
+            .chain(LONG_CONTEXT_PRICING.iter().map(|&(_, _, i, o)| (i, o)));
+        let (input_per_1m, output_per_1m) = rows.fold((0.0_f64, 0.0_f64), |(mi, mo), (i, o)| {
+            (mi.max(i), mo.max(o))
+        });
+        ModelPrice {
+            input_per_1m,
+            output_per_1m,
+        }
+    })
+}
+
+/// Distinct unknown model ids to remember before resetting the warn-dedup set.
+/// Bounded because model ids come from untrusted request bodies: an unbounded
+/// set would grow without limit, and warning on *every* lookup would let one
+/// hot unknown model flood the log. On overflow the set clears, so a persistent
+/// unknown model re-warns periodically instead of going quiet forever.
+const UNKNOWN_MODEL_WARN_CAPACITY: usize = 256;
+
+/// Emit one alertable event per distinct unknown model id.
+fn warn_unknown_model(model: &str, canonical_id: &str, assumed: ModelPrice) {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() >= UNKNOWN_MODEL_WARN_CAPACITY {
+        seen.clear();
+    }
+    if !seen.insert(canonical_id.to_string()) {
+        return;
+    }
+    drop(seen);
+    warn!(
+        model = %model,
+        canonical_model = %canonical_id,
+        assumed_input_usd_per_1m = assumed.input_per_1m,
+        assumed_output_usd_per_1m = assumed.output_per_1m,
+        "Nova Guard: no pricing entry for model; billing at the assumed maximum catalog rate"
+    );
+}
+
 /// Look up pricing for a model id.
 ///
 /// Matching is case-insensitive: an exact match wins; otherwise the input may be
@@ -253,6 +377,37 @@ fn now() -> DateTime<Utc> {
 /// by `at`, then the model's documented long-context tier when `input_tokens`
 /// exceeds its threshold.
 pub fn lookup_at(model: &str, input_tokens: u32, at: DateTime<Utc>) -> Option<ModelPrice> {
+    resolve_at(model, input_tokens, at)
+}
+
+/// Price a model at a given input size and instant, **always** yielding rates:
+/// the catalog's when the id resolves, otherwise [`assumed_unknown_price`] —
+/// tagged as an assumption in the return type. Unlike [`lookup_at`] this never
+/// returns `None`, so no caller can accidentally meter an unpriced call at $0.
+///
+/// Emits one alertable `warn` per distinct unknown model id.
+pub fn price_at(model: &str, input_tokens: u32, at: DateTime<Utc>) -> ModelPricing {
+    match resolve_at(model, input_tokens, at) {
+        Some(p) => ModelPricing::Catalog(p),
+        None => {
+            let assumed = assumed_unknown_price();
+            warn_unknown_model(model, &canonical(model), assumed);
+            ModelPricing::UnknownAssumed(assumed)
+        }
+    }
+}
+
+/// Price a model at a given input size, at the current time. See [`price_at`].
+pub fn price_for_context(model: &str, input_tokens: u32) -> ModelPricing {
+    price_at(model, input_tokens, now())
+}
+
+/// The catalog rates for a model, or `None` when nothing matches. The shared
+/// body of [`lookup_at`] (advisory: "do we know this model?") and [`price_at`]
+/// (billing: "what do we charge?"), so the two can never disagree about which
+/// ids are known. Deliberately silent — [`price_at`] owns the warning, so
+/// advisory lookups don't double-log every priced request.
+fn resolve_at(model: &str, input_tokens: u32, at: DateTime<Utc>) -> Option<ModelPrice> {
     let m = canonical(model);
     let (row_id, base_in, base_out) = match_row(&m)?;
 
@@ -292,9 +447,30 @@ pub fn lookup_for_context(model: &str, input_tokens: u32) -> Option<ModelPrice> 
     lookup_at(model, input_tokens, now())
 }
 
-/// Estimate the USD cost of a call given token counts. Applies long-context
-/// tier rates when the input size qualifies. Unknown models cost 0.0 (the
-/// caller decides whether unknown-model cost should fail open or closed).
+/// Price a completed call, reporting both the amount and the basis it rests on.
+/// Applies long-context tier rates when the input size qualifies. A model with
+/// no catalog entry is priced at [`assumed_unknown_price`] and tagged
+/// [`ModelPricing::UnknownAssumed`] — never $0, so an unmetered call can't be
+/// recorded as a free one.
+pub fn price_call(model: &str, input_tokens: u32, output_tokens: u32) -> CostEstimate {
+    let pricing = price_for_context(model, input_tokens);
+    let p = pricing.price();
+    CostEstimate {
+        usd: (input_tokens as f64 / 1_000_000.0) * p.input_per_1m
+            + (output_tokens as f64 / 1_000_000.0) * p.output_per_1m,
+        pricing,
+    }
+}
+
+/// Estimate the USD cost of a call **from the catalog only**, returning `0.0`
+/// for a model with no entry.
+///
+/// This is the provider extractors' entry point, and they read `0.0` as
+/// "unpriced" (recording `cost: None` rather than a fake zero). The unknown
+/// model is not left free: `telemetry::middleware` backfills [`price_call`]'s
+/// defensive estimate at the metering boundary, before the usage event that
+/// cost caps and billing read. Prefer [`price_call`] in new code — it makes
+/// the unknown case impossible to overlook.
 pub fn estimate_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
     match lookup_for_context(model, input_tokens) {
         Some(p) => {
@@ -334,7 +510,12 @@ pub fn assumed_output_tokens() -> u64 {
 /// plus the request's `max_tokens` (or the configured assumed completion size)
 /// at the model's applicable (context-dependent) rates. `None` when the model
 /// has no pricing entry — the caller decides whether an unmeterable call fails
-/// open or closed.
+/// open or closed (`cost_cap` blocks unknown models when `fail_closed`).
+///
+/// This is the *admission* path and still fails open by returning `None`;
+/// switching it to reserve [`assumed_unknown_price`] instead — i.e. letting an
+/// unknown model consume cap headroom before it runs — is a policy decision
+/// pending NOV-135. The *billing* path ([`price_call`]) is already defensive.
 pub fn estimate_request_cost(
     model: &str,
     input_tokens: u32,
@@ -415,8 +596,111 @@ mod tests {
     }
 
     #[test]
-    fn unknown_model_cost_zero() {
+    fn unknown_model_is_never_free() {
+        // The bug: a model absent from the catalog priced at $0, so its spend
+        // was invisible to cost caps and to the usage reports we bill from.
+        let a = assumed_unknown_price();
+        let e = price_call("nope", 1000, 1000);
+        assert!(e.is_assumed(), "unknown model must be tagged as assumed");
+        assert_eq!(e.pricing, ModelPricing::UnknownAssumed(a));
+        let expected = (1000.0 / 1e6) * a.input_per_1m + (1000.0 / 1e6) * a.output_per_1m;
+        assert!((e.usd - expected).abs() < 1e-12);
+        assert!(e.usd > 0.0, "unknown model must never cost $0");
+        // Zero tokens is the only way to reach $0, and it is honestly free.
+        assert_eq!(price_call("nope", 0, 0).usd, 0.0);
+        // A known model is unaffected by the defensive path.
+        assert_eq!(
+            price_call("gpt-4o", 1000, 500).usd,
+            estimate_cost("gpt-4o", 1000, 500)
+        );
+        // `estimate_cost` stays catalog-only (0.0 = unpriced) for the provider
+        // extractors; the middleware backfills `price_call` before the usage
+        // event, which is where an unknown model stops being free.
         assert_eq!(estimate_cost("nope", 1000, 1000), 0.0);
+    }
+
+    #[test]
+    fn assumed_rate_bounds_every_catalog_rate() {
+        // The assumption is derived from the catalog, so it can't go stale when
+        // a pricier model lands: no published rate may exceed it.
+        let a = assumed_unknown_price();
+        for &(id, i, o) in MODEL_PRICING {
+            assert!(i <= a.input_per_1m, "{id} input {i} > assumed");
+            assert!(o <= a.output_per_1m, "{id} output {o} > assumed");
+        }
+        for &(id, _, i, o) in SCHEDULED_PRICING {
+            assert!(i <= a.input_per_1m, "{id} scheduled input {i} > assumed");
+            assert!(o <= a.output_per_1m, "{id} scheduled output {o} > assumed");
+        }
+        for &(id, _, i, o) in LONG_CONTEXT_PRICING {
+            assert!(i <= a.input_per_1m, "{id} tier input {i} > assumed");
+            assert!(o <= a.output_per_1m, "{id} tier output {o} > assumed");
+        }
+        // Today the ceiling is o1 ($15 / $60 per 1M).
+        assert_eq!((a.input_per_1m, a.output_per_1m), (15.00, 60.00));
+        // An unknown model must cost at least as much as any known one.
+        let unknown = price_call("totally-made-up-model-xyz", 10_000, 10_000).usd;
+        for &(id, _, _) in MODEL_PRICING {
+            assert!(
+                price_call(id, 10_000, 10_000).usd <= unknown + 1e-12,
+                "{id} costs more than the unknown-model assumption"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_hits_are_not_priced_as_assumed() {
+        // Known model, bare alias, and dated snapshot all keep catalog rates —
+        // only genuinely unmatched ids take the defensive path.
+        for (model, expected_input) in [
+            ("gpt-4o", 2.50),                  // exact catalog entry
+            ("gpt-5.6", 5.00),                 // alias -> gpt-5.6-sol
+            ("gpt-4o-2024-11-20", 2.50),       // dated snapshot of a family
+            ("gpt-5.6-luna-2026-05-01", 0.20), // snapshot that must not degrade
+        ] {
+            let pricing = price_for_context(model, 0);
+            assert!(!pricing.is_assumed(), "{model} took the defensive path");
+            assert_eq!(
+                pricing,
+                ModelPricing::Catalog(pricing.price()),
+                "{model} variant"
+            );
+            assert_eq!(pricing.price().input_per_1m, expected_input, "{model} rate");
+            assert_eq!(pricing.catalog(), lookup(model), "{model} vs lookup()");
+        }
+        // A model that is merely a prefix of a table entry is still unknown.
+        assert!(price_for_context("gpt-4", 0).is_assumed());
+        assert!(price_for_context("gpt-4oxyz", 0).is_assumed());
+        // Long-context tiers survive the rewrite.
+        assert_eq!(
+            price_for_context("gpt-5.6-sol", 300_000)
+                .price()
+                .input_per_1m,
+            10.00
+        );
+        // As do scheduled changes, on both sides of the boundary.
+        assert_eq!(
+            price_at("claude-sonnet-5", 0, at("2026-08-11T00:00:00Z")),
+            ModelPricing::Catalog(ModelPrice {
+                input_per_1m: 2.00,
+                output_per_1m: 10.00
+            })
+        );
+        assert_eq!(
+            price_at("claude-sonnet-5", 0, at("2026-09-01T00:00:00Z")),
+            ModelPricing::Catalog(ModelPrice {
+                input_per_1m: 3.00,
+                output_per_1m: 15.00
+            })
+        );
+    }
+
+    #[test]
+    fn lookup_still_reports_unknown_models_as_unpriced() {
+        // `cost_cap`'s fail-closed check keys off `lookup(..).is_none()`, so
+        // the defensive billing rate must NOT make unknown models look known.
+        assert!(lookup("totally-made-up-model-xyz").is_none());
+        assert!(estimate_request_cost("totally-made-up-model-xyz", 10, Some(10)).is_none());
     }
 
     #[test]

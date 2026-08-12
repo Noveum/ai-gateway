@@ -285,6 +285,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extractor_dispatch_is_case_insensitive() {
+        // `x-provider` reaches us exactly as the client typed it, so `Anthropic`
+        // must dispatch to the Anthropic extractor and not fall through to the
+        // OpenAI default. Asserted behaviorally on an Anthropic-shaped SSE
+        // event, whose token counts the OpenAI extractor does not understand.
+        let event = r#"{"type":"message_start","message":{"model":"claude-sonnet-5","usage":{"input_tokens":13,"output_tokens":4}}}"#;
+        let lower = get_metrics_extractor("anthropic").extract_streaming_metrics(event);
+        assert!(
+            lower.as_ref().is_some_and(|m| m.input_tokens == Some(13)),
+            "baseline: lowercase `anthropic` reads the event, got {lower:?}"
+        );
+        for spelling in ["Anthropic", "ANTHROPIC", "aNtHrOpIc"] {
+            let got = get_metrics_extractor(spelling).extract_streaming_metrics(event);
+            assert_eq!(
+                got.map(|m| (m.model, m.input_tokens, m.output_tokens)),
+                lower
+                    .clone()
+                    .map(|m| (m.model, m.input_tokens, m.output_tokens)),
+                "{spelling} must dispatch like `anthropic`"
+            );
+        }
+        // Sanity: the dispatch really is what differentiates — the default
+        // (OpenAI) extractor does not read Anthropic's token shape.
+        let default = get_metrics_extractor("openai").extract_streaming_metrics(event);
+        assert_ne!(
+            default.map(|m| m.input_tokens),
+            Some(Some(13)),
+            "test would pass vacuously if every extractor read this event"
+        );
+    }
+
+    #[test]
     fn merge_streaming_combines_fields_across_chunks() {
         // Anthropic shape: message_start carries model + input tokens, a later
         // message_delta carries output tokens under the placeholder model

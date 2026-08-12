@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 // Constants for safeguards
 const CHANNEL_SIZE: usize = 1000; // Increased buffer for streaming response
@@ -216,6 +216,13 @@ async fn handle_regular_response(
 
     debug!("Extracted provider metrics: {:?}", provider_metrics);
 
+    let cost = backfill_cost(
+        provider_metrics.cost,
+        &provider_metrics.model,
+        provider_metrics.input_tokens,
+        provider_metrics.output_tokens,
+    );
+
     let metrics = RequestMetrics {
         provider,
         path,
@@ -230,7 +237,7 @@ async fn handle_regular_response(
         output_tokens: provider_metrics.output_tokens,
         total_tokens: provider_metrics.total_tokens,
         status_code: parts.status.as_u16(),
-        cost: provider_metrics.cost,
+        cost,
         project_id: project_id.or(provider_metrics.project_id),
         org_id: org_id.or(provider_metrics.organization_id),
         user_id: user_id.or(provider_metrics.user_id),
@@ -378,8 +385,7 @@ async fn handle_streaming_response(
         }
 
         // Track if this is a provider that requires special streaming handling
-        let is_openai_streaming = provider == "openai";
-        let is_groq_streaming = provider == "groq";
+        let (is_openai_streaming, is_groq_streaming) = streaming_metrics_quirks(&provider);
         let needs_special_streaming_handling = is_openai_streaming || is_groq_streaming;
 
         // For providers that don't always include token data in streaming responses,
@@ -458,18 +464,12 @@ async fn handle_streaming_response(
             // counts in another, so cost may not have been computable per-chunk
             // (e.g. Anthropic priced its `message_delta` under the placeholder
             // model "claude" → no cost). Recompute from the merged view.
-            if accumulated_metrics.cost.is_none() {
-                if let (Some(i), Some(o)) = (
-                    accumulated_metrics.input_tokens,
-                    accumulated_metrics.output_tokens,
-                ) {
-                    let cost =
-                        crate::policy::pricing::estimate_cost(&accumulated_metrics.model, i, o);
-                    if cost > 0.0 {
-                        accumulated_metrics.cost = Some(cost);
-                    }
-                }
-            }
+            accumulated_metrics.cost = backfill_cost(
+                accumulated_metrics.cost,
+                &accumulated_metrics.model,
+                accumulated_metrics.input_tokens,
+                accumulated_metrics.output_tokens,
+            );
         }
 
         // Record final metrics if we found them
@@ -614,6 +614,62 @@ fn ingest_stream_payload(
     }
 }
 
+/// The cost to record for a call, given whatever the provider extractor could
+/// work out. This is the metering boundary: the value returned here becomes
+/// `RequestMetrics.cost`, i.e. the `costUsd` of the ALLOWED usage event that
+/// the platform's cost caps and billing read.
+///
+/// A provider extractor leaves `cost: None` when the model is absent from the
+/// pricing catalog (`estimate_cost` reports unpriced as `0.0`), which used to
+/// make the whole call invisible to cost caps. Whenever token counts are known
+/// we therefore price it here via [`crate::policy::pricing::price_call`], which
+/// falls back to the assumed maximum catalog rate for an unknown model and logs
+/// an alertable event. Only a call whose token counts are entirely unknown is
+/// still recorded without a cost — there is nothing to price it from.
+fn backfill_cost(
+    reported: Option<f64>,
+    model: &str,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+) -> Option<f64> {
+    if let Some(c) = reported {
+        return Some(c);
+    }
+    let (i, o) = match (input_tokens, output_tokens) {
+        (None, None) => return None,
+        // One-sided counts still price the side we know, rather than nothing.
+        (i, o) => (i.unwrap_or(0), o.unwrap_or(0)),
+    };
+    let estimate = crate::policy::pricing::price_call(model, i, o);
+    if estimate.is_assumed() {
+        warn!(
+            model = %model,
+            input_tokens = i,
+            output_tokens = o,
+            assumed_cost_usd = estimate.usd,
+            "Nova Guard: unpriced model metered at the assumed rate; verify the pricing catalog"
+        );
+    }
+    Some(estimate.usd)
+}
+
+/// Whether `provider` is one whose streamed responses often omit a `usage`
+/// block, so a stream that ends without provider-reported tokens must fall back
+/// to estimated ones. Returns `(is_openai, is_groq)` — they differ only in the
+/// placeholder model used when no chunk names one.
+///
+/// The `x-provider` header is forwarded verbatim, so this normalizes case the
+/// same way [`get_metrics_extractor`] does. Comparing it as-is (the bug) meant
+/// a client sending `x-provider: OpenAI` skipped the estimation path entirely
+/// and every streamed response it made was billed as $0.
+fn streaming_metrics_quirks(provider: &str) -> (bool, bool) {
+    match provider.to_lowercase().as_str() {
+        "openai" => (true, false),
+        "groq" => (false, true),
+        _ => (false, false),
+    }
+}
+
 /// Estimate output tokens for a stream that ended without provider usage data.
 /// Prefers the actual generated content — `choices[].delta.content` (and
 /// `message.content`) text pulled from the parsed chunks — because estimating
@@ -648,6 +704,60 @@ fn estimate_stream_output_tokens(chunks: &[Value], accumulated_text: &str) -> Op
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unknown_model_is_metered_instead_of_reported_free() {
+        // The bug: a model absent from the pricing catalog left `cost: None`,
+        // so the ALLOWED usage event carried $0 and cost caps never saw it.
+        let assumed = crate::policy::pricing::assumed_unknown_price();
+        let cost = backfill_cost(None, "some-brand-new-model", Some(1000), Some(500)).unwrap();
+        let expected =
+            (1000.0 / 1e6) * assumed.input_per_1m + (500.0 / 1e6) * assumed.output_per_1m;
+        assert!((cost - expected).abs() < 1e-12, "metered {cost}");
+        assert!(cost > 0.0);
+        // A known model prices from the catalog, not from the assumption.
+        let known = backfill_cost(None, "gpt-4o-mini", Some(1000), Some(500)).unwrap();
+        assert!((known - ((1000.0 / 1e6) * 0.15 + (500.0 / 1e6) * 0.60)).abs() < 1e-12);
+        assert!(known < cost);
+        // A cost the provider already worked out is never second-guessed.
+        assert_eq!(
+            backfill_cost(Some(0.5), "made-up", Some(10), Some(10)),
+            Some(0.5)
+        );
+        // One-sided token counts still price the side we know.
+        assert!(backfill_cost(None, "made-up", Some(1000), None).unwrap() > 0.0);
+        // Nothing to price from → no cost, rather than a fabricated one.
+        assert_eq!(backfill_cost(None, "gpt-4o", None, None), None);
+    }
+
+    #[test]
+    fn streaming_quirks_are_case_insensitive() {
+        // `x-provider` is client-supplied and forwarded verbatim. Every casing
+        // must behave exactly like the lowercase form — a case-sensitive
+        // comparison silently dropped billing for the whole stream.
+        let openai = streaming_metrics_quirks("openai");
+        assert_eq!(openai, (true, false));
+        for spelling in ["OpenAI", "OPENAI", "oPeNaI", "openAI", "Openai"] {
+            assert_eq!(
+                streaming_metrics_quirks(spelling),
+                openai,
+                "{spelling} must behave like `openai`"
+            );
+        }
+        let groq = streaming_metrics_quirks("groq");
+        assert_eq!(groq, (false, true));
+        for spelling in ["Groq", "GROQ", "gRoQ"] {
+            assert_eq!(
+                streaming_metrics_quirks(spelling),
+                groq,
+                "{spelling} must behave like `groq`"
+            );
+        }
+        // Unrelated providers keep the generic path, in any casing.
+        for other in ["anthropic", "Anthropic", "bedrock", "", "openai-compatible"] {
+            assert_eq!(streaming_metrics_quirks(other), (false, false), "{other}");
+        }
+    }
 
     #[test]
     fn stream_output_estimate_uses_content_not_sse_envelope() {
