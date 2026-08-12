@@ -24,8 +24,14 @@ RUN mkdir src && \
     cargo build --release --target x86_64-unknown-linux-gnu && \
     rm -rf src
 
-# Now copy the real source code
+# Now copy the real source code, plus the data directories the crate embeds at
+# compile time via include_str! — without them cargo cannot compile the lib:
+#   schema/  -> src/policy/policy_types.generated.rs (policy JSON Schema)
+#   pricing/ -> src/policy/pricing.rs (catalog integrity check; test-only today,
+#               copied anyway so a future non-test embed can't break only Docker)
 COPY src ./src
+COPY schema ./schema
+COPY pricing ./pricing
 
 # Build the application
 RUN RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target x86_64-unknown-linux-gnu && \
