@@ -100,11 +100,11 @@ The bundle format (`nova-guard.json`) is shared with the Nova Guard SDK:
 ## Policy types
 
 The policy contract is one versioned JSON Schema,
-[`schema/novaguard-policy.v1.json`](../schema/novaguard-policy.v1.json). It is the
-single source of truth for the gateway, the Noveum platform and the Python SDK;
-the Rust `PolicyType` enum and the platform's TypeScript module are both
-generated from it by `codegen/generate_policy_types.py`, and CI fails on drift.
-Add a policy type there, never by hand in a consumer.
+[`schema/novaguard-policy.v1.json`](../schema/novaguard-policy.v1.json), embedded
+into the binary and used to validate every policy `config`. The Rust
+`PolicyType` enum in `src/policy/policy_types.rs` and the Noveum platform's
+TypeScript equivalent are maintained alongside it by hand; a new policy type has
+to be added in each place.
 
 Fourteen types are defined. The nine below are **enforced**. The five classifier
 types (`scorer_gate`, `prompt_injection`, `topic_restriction`,

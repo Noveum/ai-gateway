@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.noveum.ai/novaguard/policy.v1.json",
   "title": "NovaGuard policy bundle",
-  "description": "The single source of truth for the NovaGuard policy contract. The gateway (Rust), the Noveum platform (TypeScript/Zod/Prisma) and the Python SDK all derive their policy type set and per-type config validation from THIS file. Do not add a policy type to any of those repos by hand: add it here and re-run codegen/generate_policy_types.py.",
+  "description": "The NovaGuard policy contract. The gateway embeds this file to validate every policy config. The gateway (Rust), the Noveum platform (TypeScript/Zod/Prisma) and the Python SDK each maintain their own policy type list; a new type has to be added here and in each of them.",
   "x-schema-version": "1.0.0",
   "type": "object",
   "required": ["policies"],
@@ -244,7 +244,7 @@
     },
 
     "policyType": {
-      "description": "GENERATED FROM x-policy-types. Keep in sync via codegen/generate_policy_types.py.",
+      "description": "Must list the same types as x-policy-types.",
       "type": "string",
       "enum": [
         "cost_cap",

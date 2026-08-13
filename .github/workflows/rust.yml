@@ -35,21 +35,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # NOV-107: `schema/novaguard-policy.v1.json` is the single source of truth
-      # for the NovaGuard policy contract. Everything derived from it is
-      # generated, and this step fails if a checked-in artifact does not match
-      # what the generator produces — including the case where someone adds a
-      # policy type to `src/policy/policy_types.generated.rs` by hand instead of
-      # to the schema. It runs BEFORE the build so the failure names the real
-      # cause rather than surfacing as a confusing compile error.
-      #
-      # The platform repo is not checked out here, so only the Rust artifact is
-      # verified; the TypeScript side is verified by the platform's own
-      # `schemas.drift.test.ts`, which re-checks the vendored schema's sha256
-      # against the one embedded in its generated module.
-      - name: Policy schema codegen is up to date
-        run: python3 codegen/generate_policy_types.py --check
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 

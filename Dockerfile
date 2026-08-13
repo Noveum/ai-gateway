@@ -26,7 +26,7 @@ RUN mkdir src && \
 
 # Now copy the real source code, plus the data directories the crate embeds at
 # compile time via include_str! — without them cargo cannot compile the lib:
-#   schema/  -> src/policy/policy_types.generated.rs (policy JSON Schema)
+#   schema/  -> src/policy/policy_types.rs (policy JSON Schema)
 #   pricing/ -> src/policy/pricing.rs (catalog integrity check; test-only today,
 #               copied anyway so a future non-test embed can't break only Docker)
 COPY src ./src
