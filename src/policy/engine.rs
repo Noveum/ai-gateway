@@ -18,8 +18,8 @@ use arc_swap::ArcSwap;
 use tracing::{info, warn};
 
 use super::config::{
-    validate_policy, CostCapConfig, CostEnforcementMode, CostWindow, Policy, PolicyBundle,
-    PolicyRejection, PolicyType, RateLimitConfig,
+    resolve_strict, validate_policy, CostCapConfig, CostEnforcementMode, CostWindow, Policy,
+    PolicyBundle, PolicyRejection, PolicyType, RateLimitConfig,
 };
 use super::decision::{Phase, PolicyAction, PolicyDecision, PolicyMode, Severity};
 use super::rules::{compile_rule, EvalContext, LiveState, PolicyRule, RuleOutcome};
@@ -375,7 +375,7 @@ impl PolicyEngine {
                         }),
                         // The schema accepted this config, so a parse failure
                         // here means the Rust struct and the schema disagree —
-                        // a codegen/contract bug, not bad operator input.
+                        // a contract bug, not bad operator input.
                         Err(e) => reject(
                             p,
                             PolicyRejection::InvalidConfig {
@@ -514,22 +514,44 @@ impl PolicyEngine {
 
     /// The decision to apply when platform **admission** could not be evaluated.
     ///
-    /// Deliberately reuses the same fail-closed/fail-open computation as an
-    /// unavailable `/state` ([`PolicyEngine::unavailable_state_decision`]) so an
-    /// admission outage and a state outage behave identically: a `failClosed`
-    /// policy blocks, everything else allows with the explicit reason recorded.
+    /// Considers **exactly the caps that were routed through admission**, by
+    /// re-running the routing predicate itself ([`resolve_strict`]) per cap,
+    /// with the deployment-wide `NOVEUM_GUARD_COST_ENFORCEMENT` override the
+    /// caller routed with:
     ///
-    /// Returns the blocking decision if any strict cap fails closed, else the
-    /// first fail-open decision (whose `reason` names the outage), else `None`
-    /// when no strict cap is active at all.
-    pub fn admission_unavailable_decision(&self, reason: &str) -> Option<PolicyDecision> {
+    /// * `Some(Strict)` — every active `cost_cap` went through admission, so
+    ///   every one is considered here, whatever its own `enforcementMode`;
+    /// * `Some(Advisory)` — admission is never called, so this branch is
+    ///   unreachable and nothing is considered;
+    /// * `None` — only the caps that themselves declare
+    ///   `enforcementMode: strict`.
+    ///
+    /// Filtering on `enforcement_mode == Strict` alone would be wrong in the
+    /// first case, letting an override-routed advisory cap fail **open**;
+    /// dropping the filter would be wrong in the third, over-blocking a
+    /// genuinely advisory cap that never touched admission.
+    ///
+    /// Per considered cap the fail-closed/fail-open computation is the one an
+    /// unavailable `/state` uses
+    /// ([`PolicyEngine::unavailable_state_decision`]): a `failClosed` policy
+    /// blocks, everything else allows with the explicit reason recorded.
+    ///
+    /// Returns the blocking decision if any considered cap fails closed, else
+    /// the first fail-open decision (whose `reason` names the outage), else
+    /// `None` when no cap was routed through admission at all.
+    pub fn admission_unavailable_decision(
+        &self,
+        reason: &str,
+        override_mode: Option<CostEnforcementMode>,
+    ) -> Option<PolicyDecision> {
         let state = self.state.load();
         let mut fail_open: Option<PolicyDecision> = None;
-        for cc in state
-            .cost_caps
-            .iter()
-            .filter(|cc| cc.config.enforcement_mode == CostEnforcementMode::Strict)
-        {
+        for cc in state.cost_caps.iter().filter(|cc| {
+            resolve_strict(
+                override_mode,
+                cc.config.enforcement_mode == CostEnforcementMode::Strict,
+            )
+        }) {
             let d = self.unavailable_decision_with_reason(
                 &cc.meta,
                 "cost_cap",
@@ -1150,6 +1172,91 @@ mod tests {
         );
         assert_eq!(mixed.active_policy_count(), 3);
         assert_eq!(mixed.stateful_policy_count(), 2);
+    }
+
+    /// Regression: a `failClosed` cap with an UNSET (therefore `advisory`)
+    /// `enforcementMode` used to fail **open** when `/admit` was unavailable.
+    ///
+    /// `NOVEUM_GUARD_COST_ENFORCEMENT=strict` routes every cap through
+    /// admission, but the fail-closed branch filtered on
+    /// `enforcement_mode == Strict` and so saw none of them — the gateway
+    /// forwarded the request to the provider unguarded. The platform's cost-cap
+    /// schema leaves `enforcementMode` optional, so this was the *normal*
+    /// configuration, not a corner case.
+    #[test]
+    fn admission_unavailable_considers_exactly_the_caps_admission_routed() {
+        let unset_mode_fail_closed = backed_engine(
+            r#"{"policies":[{"name":"fix-cap","type":"cost_cap","mode":"enforce","failClosed":true,
+            "config":{"window":"30d_rolling","maxUsd":100000.0,"action":"block"}}]}"#,
+        );
+        assert!(
+            !unset_mode_fail_closed.has_strict_cost_cap(),
+            "the cap must be advisory for this test to reproduce the bug"
+        );
+
+        let forced = unset_mode_fail_closed
+            .admission_unavailable_decision("503", Some(CostEnforcementMode::Strict))
+            .expect("a cap routed through admission by the override must be considered");
+        assert!(
+            forced.is_blocking(),
+            "failClosed cap must block, got {forced:?}"
+        );
+        assert_eq!(forced.policy_id, "fix-cap");
+        assert!(
+            forced.reason.contains("failing closed"),
+            "{}",
+            forced.reason
+        );
+
+        assert!(
+            unset_mode_fail_closed
+                .admission_unavailable_decision("503", Some(CostEnforcementMode::Advisory))
+                .is_none(),
+            "an advisory override never calls admission, so nothing is considered"
+        );
+
+        assert!(
+            unset_mode_fail_closed
+                .admission_unavailable_decision("503", None)
+                .is_none(),
+            "with no override an advisory cap never reached admission; blocking it \
+             would over-block"
+        );
+
+        let self_declared_strict = backed_engine(
+            r#"{"policies":[{"name":"strict-cap","type":"cost_cap","mode":"enforce","failClosed":true,
+            "config":{"window":"30d_rolling","maxUsd":100000.0,"action":"block","enforcementMode":"strict"}}]}"#,
+        );
+        assert!(self_declared_strict.has_strict_cost_cap());
+        let by_policy = self_declared_strict
+            .admission_unavailable_decision("503", None)
+            .expect("a self-declared strict cap is considered with no override");
+        assert!(by_policy.is_blocking());
+        assert_eq!(by_policy.policy_id, "strict-cap");
+    }
+
+    /// The override widens *which* caps are considered, not what each one
+    /// decides: a cap that is not `failClosed` still fails open, with the
+    /// outage named in the reason.
+    #[test]
+    fn admission_unavailable_keeps_fail_open_for_a_non_fail_closed_cap() {
+        let e = backed_engine(
+            r#"{"policies":[{"name":"open-cap","type":"cost_cap","mode":"enforce",
+            "config":{"window":"30d_rolling","maxUsd":100000.0,"action":"block"}}]}"#,
+        );
+        let d = e
+            .admission_unavailable_decision(
+                "admission unavailable (503)",
+                Some(CostEnforcementMode::Strict),
+            )
+            .expect("considered under the strict override");
+        assert!(!d.is_blocking(), "not failClosed, so it must fail open");
+        assert!(
+            d.reason.contains("platform admission unavailable"),
+            "{}",
+            d.reason
+        );
+        assert!(d.reason.contains("failing open"), "{}", d.reason);
     }
 
     #[test]

@@ -525,7 +525,7 @@
       "properties": {
         "phase": { "$ref": "#/$defs/phase", "default": "both" },
         "detectors": {
-          "description": "Detector ids, e.g. aws_access_key, openai_sk. Empty means all known.",
+          "description": "Detector ids, e.g. aws_access_key, openai_key. Empty means all known. An unsupported id is rejected, not ignored.",
           "type": "array",
           "items": { "type": "string" }
         },

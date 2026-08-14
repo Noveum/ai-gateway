@@ -75,20 +75,11 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Decide whether a request uses platform-atomic admission.
-///
-/// * an explicit `NOVEUM_GUARD_COST_ENFORCEMENT` overrides every policy (a
-///   deployment-wide kill switch, and a way to force strict without editing
-///   policies);
-/// * otherwise the active policy set decides — strict when any active
-///   `cost_cap` declares `enforcementMode: strict`.
-pub fn resolve_strict(override_mode: Option<CostEnforcementMode>, policy_strict: bool) -> bool {
-    match override_mode {
-        Some(CostEnforcementMode::Strict) => true,
-        Some(CostEnforcementMode::Advisory) => false,
-        None => policy_strict,
-    }
-}
+/// The routing predicate, defined in [`crate::policy::config`] so that the
+/// fail-closed branch in [`crate::policy::engine`] — which is also compiled for
+/// the wasm32 Worker, where this module is not — can select exactly the caps
+/// this function routed through admission.
+pub use crate::policy::config::resolve_strict;
 
 /// Parse the `NOVEUM_GUARD_COST_ENFORCEMENT` value.
 ///
@@ -171,6 +162,16 @@ impl AdmissionClient {
     /// whether the active policy set contains a strict `cost_cap`.
     pub fn strict_for(&self, policy_strict: bool) -> bool {
         resolve_strict(self.mode_override, policy_strict)
+    }
+
+    /// The deployment-wide `NOVEUM_GUARD_COST_ENFORCEMENT` override this client
+    /// routes with, resolved once at startup.
+    ///
+    /// Exposed so the fail-closed branch taken when `/admit` is unavailable can
+    /// select the same caps [`AdmissionClient::strict_for`] routed *into*
+    /// admission, without re-reading the environment per request.
+    pub fn mode_override(&self) -> Option<CostEnforcementMode> {
+        self.mode_override
     }
 
     fn admit_url(&self) -> String {

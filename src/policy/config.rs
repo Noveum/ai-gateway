@@ -456,6 +456,26 @@ pub enum CostEnforcementMode {
     Strict,
 }
 
+/// Decide whether a request uses platform-atomic admission.
+///
+/// * an explicit `NOVEUM_GUARD_COST_ENFORCEMENT` overrides every policy (a
+///   deployment-wide kill switch, and a way to force strict without editing
+///   policies);
+/// * otherwise the policy decides — strict when the `cost_cap` under
+///   consideration declares `enforcementMode: strict`.
+///
+/// Lives here rather than in [`crate::policy::admission`] (which re-exports it)
+/// because both sides of the admission decision must agree, and one of those
+/// sides — [`PolicyEngine::admission_unavailable_decision`](crate::policy::engine::PolicyEngine::admission_unavailable_decision)
+/// — is compiled for the wasm32 Worker, where the native admission client is not.
+pub fn resolve_strict(override_mode: Option<CostEnforcementMode>, policy_strict: bool) -> bool {
+    match override_mode {
+        Some(CostEnforcementMode::Strict) => true,
+        Some(CostEnforcementMode::Advisory) => false,
+        None => policy_strict,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateWindow {
@@ -495,7 +515,8 @@ pub struct PiiDetectionConfig {
 pub struct SecretsDetectionConfig {
     #[serde(default = "default_phase_both")]
     pub phase: Phase,
-    /// Detector ids, e.g. `["aws_access_key", "openai_sk"]`. Empty = all known.
+    /// Detector ids, e.g. `["aws_access_key", "openai_key"]`. Empty = all known.
+    /// `SecretsRule::parse` rejects an id outside the supported set.
     #[serde(default)]
     pub detectors: Vec<String>,
     #[serde(default = "block_action")]
@@ -570,10 +591,11 @@ mod tests {
     }
 
     #[test]
-    fn every_contract_type_round_trips_through_the_generated_tables() {
-        // The generated enum, the wire names, the platform spellings and the
-        // schema's own enum must all describe the same set. If codegen and the
-        // schema ever disagree this fails before any drift reaches a consumer.
+    fn every_contract_type_round_trips_through_the_policy_type_tables() {
+        // The PolicyType enum, the wire names, the platform spellings and the
+        // schema's own enum must all describe the same set. If the Rust tables
+        // and the schema ever disagree this fails before any drift reaches a
+        // consumer.
         let schema: serde_json::Value = serde_json::from_str(POLICY_SCHEMA_JSON).unwrap();
         let schema_enum: Vec<&str> = schema["$defs"]["policyType"]["enum"]
             .as_array()
@@ -581,8 +603,8 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        let generated: Vec<&str> = PolicyType::ALL.iter().map(|t| t.as_str()).collect();
-        assert_eq!(generated, schema_enum);
+        let wire_names: Vec<&str> = PolicyType::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(wire_names, schema_enum);
         assert_eq!(POLICY_TYPE_NAMES.to_vec(), schema_enum);
 
         for ty in PolicyType::ALL {

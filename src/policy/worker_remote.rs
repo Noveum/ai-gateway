@@ -280,8 +280,14 @@ pub enum StreamOutcome {
 pub fn settlement_for(outcome: StreamOutcome, model: &str, event_id: Option<String>) -> Settlement {
     match outcome {
         StreamOutcome::Usage(u) => {
-            let cost =
-                crate::policy::pricing::estimate_cost(model, u.input_tokens, u.output_tokens);
+            let cost = crate::policy::pricing::price_usage(
+                model,
+                &crate::policy::pricing::BillableUsage::from_tokens(
+                    u.input_tokens,
+                    u.output_tokens,
+                ),
+            )
+            .total_usd;
             Settlement::Complete(Box::new(SettlementUsage {
                 model: Some(model.to_string()),
                 input_tokens: u64::from(u.input_tokens),
@@ -1108,6 +1114,29 @@ mod tests {
         assert_eq!(u.request_count, 1);
         assert_eq!(u.model.as_deref(), Some("gpt-4o"));
         assert!(u.cost_usd > 0.0, "a priced model must yield a real cost");
+    }
+
+    #[test]
+    fn an_unknown_model_settles_at_the_same_assumption_it_reserved_at() {
+        let model = "qq-unknown-strict-probe";
+        let s = settlement_for(
+            StreamOutcome::Usage(ActualUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+            }),
+            model,
+            None,
+        );
+        let Settlement::Complete(u) = &s else {
+            panic!("authoritative usage must complete, got {s:?}");
+        };
+        let reserved = crate::policy::pricing::reserve_request_cost(model, 1000, Some(500));
+        assert!(reserved > 0.0, "an unknown model must reserve non-zero");
+        assert!(
+            (u.cost_usd - reserved).abs() < 1e-12,
+            "unknown model reserved {reserved} but settled {}",
+            u.cost_usd
+        );
     }
 
     /// A settled cost without the catalog behind it cannot be reproduced once

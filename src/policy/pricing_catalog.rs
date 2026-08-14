@@ -1,9 +1,8 @@
-// GENERATED FILE - DO NOT EDIT.
-// Source of truth: pricing/catalog.json in the noveum/ai-gateway repo.
-// Regenerate with: scripts/gen_pricing.py
-// CI fails on drift (scripts/gen_pricing.py --check).
-
-//! Published LLM rates, generated from the versioned pricing catalog.
+//! Hand-maintained. The platform's
+//! `packages/telemetry/src/pricing/generated/index.ts` holds the same rates and
+//! must be updated alongside any change here.
+//!
+//! Published LLM rates.
 //!
 //! Every rate is USD per 1,000,000 tokens. `cached_input_per_1m` prices a
 //! prompt-cache HIT and `cache_write_per_1m` prices tokens written INTO the
@@ -13,16 +12,12 @@
 //! documents that the dimension is genuinely free.
 //!
 //! Rows are limited to models the gateway can actually route to. The catalog
-//! also carries the platform's historical rows; those render only into the
-//! TypeScript artifact (see `targets` in the catalog).
+//! also carries the platform's historical rows; those belong only in the
+//! TypeScript table (see `targets` in the catalog).
 
 /// The rate card these rows came from. Recorded on every usage and
 /// reservation record so a billed amount can be traced back to it.
 pub const CATALOG_VERSION: &str = "2026.08.12";
-
-/// SHA-256 of `pricing/catalog.json`. Pins this artifact to the exact bytes
-/// it was rendered from; a test re-hashes the catalog and fails on a mismatch.
-pub const CATALOG_SHA256: &str = "c641085bd81728926f5ed9551bde9fea44923d7dbee0e28f9f93da7f7694c415";
 
 /// One model's published rates.
 #[derive(Debug, Clone, Copy, PartialEq)]

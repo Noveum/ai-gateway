@@ -2,7 +2,7 @@
 	"version": "2026.08.12",
 	"units": "USD per 1,000,000 tokens",
 	"notes": [
-		"SINGLE SOURCE OF TRUTH for LLM rates. Both the gateway Rust table and the platform TypeScript table are generated from this file by scripts/gen_pricing.py. Edit here, regenerate, commit both artifacts.",
+		"SINGLE SOURCE OF TRUTH for LLM rates. The gateway's Rust table (src/policy/pricing_catalog.rs) and the platform's TypeScript table (packages/telemetry/src/pricing/generated/index.ts) are hand-maintained copies of these rows. Edit this file first, then mirror the same change into both tables by hand.",
 		"cachedInputPer1m is the rate for a prompt-cache HIT (input tokens served from cache). null means the provider publishes no cached rate for this model, which the cost engine reports as a MISSING DIMENSION rather than pricing at zero.",
 		"cacheWritePer1m is the rate for tokens written to the cache at the provider's DEFAULT TTL. 0.0 means the provider documents no cache-write charge. null means unknown.",
 		"cacheWrite1hPer1m is Anthropic's 1-hour-TTL cache write (2x base). null when the provider has a single write rate.",

@@ -1,10 +1,9 @@
 //! Provider-aware cost model: rate lookup plus a billing-complete
 //! [`CostBreakdown`].
 //!
-//! Rates come from the generated [`crate::policy::pricing_catalog`], which is
-//! rendered from `pricing/catalog.json` — the single versioned catalog that also
-//! produces the platform's TypeScript table. Never edit the generated module;
-//! edit the catalog and run `scripts/gen_pricing.py` (CI fails on drift).
+//! Rates come from [`crate::policy::pricing_catalog`], a hand-maintained table
+//! matching `pricing/catalog.json`. The platform's TypeScript table carries the
+//! same rates and has to be kept in step with it by hand.
 //!
 //! # Why a breakdown and not one number
 //!
@@ -40,7 +39,7 @@ use tracing::warn;
 
 use crate::policy::pricing_catalog as catalog;
 
-pub use crate::policy::pricing_catalog::{CATALOG_SHA256, CATALOG_VERSION};
+pub use crate::policy::pricing_catalog::CATALOG_VERSION;
 
 /// Current wall-clock time as unix seconds, on both build targets.
 /// `chrono::Utc::now()` is unavailable under wasm32, where the Worker runtime
@@ -1645,96 +1644,227 @@ mod tests {
     // -- catalog integrity ------------------------------------------------
 
     #[test]
-    fn generated_rows_match_the_committed_catalog() {
-        // The generated module pins the SHA-256 of `pricing/catalog.json`. If
-        // someone edits the catalog without regenerating (or hand-edits the
-        // generated file), these disagree and the build fails here as well as
-        // in the CI drift check.
+    fn rate_rows_match_the_committed_catalog() {
+        const RATE_EPSILON: f64 = 1e-9;
+
+        fn field<'a>(entry: &'a Value, id: &str, key: &str) -> &'a Value {
+            entry
+                .get(key)
+                .unwrap_or_else(|| panic!("{id}: catalog entry has no field `{key}`"))
+        }
+
+        fn required_rate(entry: &Value, id: &str, key: &str) -> f64 {
+            field(entry, id, key)
+                .as_f64()
+                .unwrap_or_else(|| panic!("{id}: catalog field `{key}` is not a number"))
+        }
+
+        fn optional_rate(entry: &Value, id: &str, key: &str) -> Option<f64> {
+            let value = field(entry, id, key);
+            if value.is_null() {
+                return None;
+            }
+            Some(
+                value.as_f64().unwrap_or_else(|| {
+                    panic!("{id}: catalog field `{key}` is not a number or null")
+                }),
+            )
+        }
+
+        fn assert_rate_eq(id: &str, key: &str, from_catalog: f64, from_rust: f64) {
+            assert!(
+                (from_catalog - from_rust).abs() < RATE_EPSILON,
+                "{id}: field `{key}` disagrees — pricing/catalog.json has {from_catalog}, \
+                 the Rust table has {from_rust}"
+            );
+        }
+
+        fn assert_optional_rate_eq(
+            id: &str,
+            key: &str,
+            from_catalog: Option<f64>,
+            from_rust: Option<f64>,
+        ) {
+            match (from_catalog, from_rust) {
+                (None, None) => {}
+                (Some(c), Some(r)) => assert_rate_eq(id, key, c, r),
+                (c, r) => panic!(
+                    "{id}: field `{key}` disagrees on whether the dimension is published — \
+                     pricing/catalog.json has {c:?}, the Rust table has {r:?}; a missing \
+                     dimension is not the same as a zero rate"
+                ),
+            }
+        }
+
         let catalog_json = include_str!("../../pricing/catalog.json");
-        let digest = sha256_hex(catalog_json.as_bytes());
-        assert_eq!(
-            digest, CATALOG_SHA256,
-            "pricing/catalog.json has changed without regenerating \
-             src/policy/pricing_catalog.rs (run scripts/gen_pricing.py)"
-        );
         let parsed: Value = serde_json::from_str(catalog_json).unwrap();
         assert_eq!(parsed["version"].as_str().unwrap(), CATALOG_VERSION);
-        let rust_rows = parsed["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|m| m["targets"].as_array().unwrap().iter().any(|t| t == "rust"))
-            .count();
-        assert_eq!(rust_rows, catalog::MODEL_ROWS.len());
-    }
 
-    /// Minimal SHA-256, so catalog integrity does not add a dependency for a
-    /// single test. Standard FIPS 180-4.
-    fn sha256_hex(data: &[u8]) -> String {
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-            0xc67178f2,
-        ];
-        let mut h: [u32; 8] = [
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-            0x5be0cd19,
-        ];
-        let mut msg = data.to_vec();
-        let bit_len = (data.len() as u64) * 8;
-        msg.push(0x80);
-        while msg.len() % 64 != 56 {
-            msg.push(0);
+        let rust_entries: Vec<&Value> = parsed["models"]
+            .as_array()
+            .expect("catalog `models` is not an array")
+            .iter()
+            .filter(|m| {
+                m["targets"]
+                    .as_array()
+                    .expect("catalog model entry has no `targets` array")
+                    .iter()
+                    .any(|t| t == "rust")
+            })
+            .collect();
+
+        for entry in &rust_entries {
+            let id = entry["id"]
+                .as_str()
+                .expect("catalog model entry has no `id`");
+            let row = catalog::MODEL_ROWS
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{id}: pricing/catalog.json targets `rust` but MODEL_ROWS has no row \
+                         with that id"
+                    )
+                });
+
+            let provider = field(entry, id, "provider")
+                .as_str()
+                .unwrap_or_else(|| panic!("{id}: catalog field `provider` is not a string"));
+            assert_eq!(
+                provider, row.provider,
+                "{id}: field `provider` disagrees — pricing/catalog.json has {provider}, \
+                 the Rust table has {}",
+                row.provider
+            );
+
+            assert_rate_eq(
+                id,
+                "inputPer1m",
+                required_rate(entry, id, "inputPer1m"),
+                row.input_per_1m,
+            );
+            assert_rate_eq(
+                id,
+                "outputPer1m",
+                required_rate(entry, id, "outputPer1m"),
+                row.output_per_1m,
+            );
+            assert_optional_rate_eq(
+                id,
+                "cachedInputPer1m",
+                optional_rate(entry, id, "cachedInputPer1m"),
+                row.cached_input_per_1m,
+            );
+            assert_optional_rate_eq(
+                id,
+                "cacheWritePer1m",
+                optional_rate(entry, id, "cacheWritePer1m"),
+                row.cache_write_per_1m,
+            );
+            assert_optional_rate_eq(
+                id,
+                "cacheWrite1hPer1m",
+                optional_rate(entry, id, "cacheWrite1hPer1m"),
+                row.cache_write_1h_per_1m,
+            );
         }
-        msg.extend_from_slice(&bit_len.to_be_bytes());
-        for block in msg.chunks(64) {
-            let mut w = [0u32; 64];
-            for (i, word) in w.iter_mut().enumerate().take(16) {
-                let b = &block[i * 4..i * 4 + 4];
-                *word = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-            }
-            for i in 16..64 {
-                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-                w[i] = w[i - 16]
-                    .wrapping_add(s0)
-                    .wrapping_add(w[i - 7])
-                    .wrapping_add(s1);
-            }
-            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-                (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-            for i in 0..64 {
-                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-                let ch = (e & f) ^ ((!e) & g);
-                let t1 = hh
-                    .wrapping_add(s1)
-                    .wrapping_add(ch)
-                    .wrapping_add(K[i])
-                    .wrapping_add(w[i]);
-                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-                let maj = (a & b) ^ (a & c) ^ (b & c);
-                let t2 = s0.wrapping_add(maj);
-                hh = g;
-                g = f;
-                f = e;
-                e = d.wrapping_add(t1);
-                d = c;
-                c = b;
-                b = a;
-                a = t1.wrapping_add(t2);
-            }
-            for (slot, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-                *slot = slot.wrapping_add(v);
-            }
+
+        for row in catalog::MODEL_ROWS {
+            let matches = rust_entries
+                .iter()
+                .filter(|e| e["id"].as_str() == Some(row.id))
+                .count();
+            assert_eq!(
+                matches, 1,
+                "{}: MODEL_ROWS carries this model but pricing/catalog.json has {matches} \
+                 `rust`-targeted entries for it",
+                row.id
+            );
         }
-        h.iter().map(|w| format!("{w:08x}")).collect()
+        assert_eq!(
+            rust_entries.len(),
+            catalog::MODEL_ROWS.len(),
+            "pricing/catalog.json has {} `rust`-targeted entries but MODEL_ROWS has {} rows",
+            rust_entries.len(),
+            catalog::MODEL_ROWS.len()
+        );
+
+        let long_context_entries = parsed["longContext"]
+            .as_array()
+            .expect("catalog `longContext` is not an array");
+
+        for entry in long_context_entries {
+            let id = entry["id"]
+                .as_str()
+                .expect("catalog longContext entry has no `id`");
+            let row = catalog::LONG_CONTEXT_ROWS
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{id}: pricing/catalog.json declares a long-context tier but \
+                         LONG_CONTEXT_ROWS has no row with that id"
+                    )
+                });
+
+            let threshold = field(entry, id, "thresholdInputTokens")
+                .as_u64()
+                .unwrap_or_else(|| {
+                    panic!("{id}: catalog field `thresholdInputTokens` is not an unsigned integer")
+                });
+            assert_eq!(
+                threshold,
+                u64::from(row.threshold_input_tokens),
+                "{id}: field `thresholdInputTokens` disagrees — pricing/catalog.json has \
+                 {threshold}, the Rust table has {}",
+                row.threshold_input_tokens
+            );
+
+            assert_rate_eq(
+                id,
+                "longContext.inputPer1m",
+                required_rate(entry, id, "inputPer1m"),
+                row.input_per_1m,
+            );
+            assert_rate_eq(
+                id,
+                "longContext.outputPer1m",
+                required_rate(entry, id, "outputPer1m"),
+                row.output_per_1m,
+            );
+            assert_optional_rate_eq(
+                id,
+                "longContext.cachedInputPer1m",
+                optional_rate(entry, id, "cachedInputPer1m"),
+                row.cached_input_per_1m,
+            );
+            assert_optional_rate_eq(
+                id,
+                "longContext.cacheWritePer1m",
+                optional_rate(entry, id, "cacheWritePer1m"),
+                row.cache_write_per_1m,
+            );
+        }
+
+        for row in catalog::LONG_CONTEXT_ROWS {
+            let matches = long_context_entries
+                .iter()
+                .filter(|e| e["id"].as_str() == Some(row.id))
+                .count();
+            assert_eq!(
+                matches, 1,
+                "{}: LONG_CONTEXT_ROWS carries this tier but pricing/catalog.json has {matches} \
+                 `longContext` entries for it",
+                row.id
+            );
+        }
+        assert_eq!(
+            long_context_entries.len(),
+            catalog::LONG_CONTEXT_ROWS.len(),
+            "pricing/catalog.json has {} `longContext` entries but LONG_CONTEXT_ROWS has {} rows",
+            long_context_entries.len(),
+            catalog::LONG_CONTEXT_ROWS.len()
+        );
     }
 
     #[test]

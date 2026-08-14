@@ -770,8 +770,15 @@ async fn proxy(
                 }
                 Admission::Unavailable(reason) => {
                     // Never an implicit allow: apply `failClosed` exactly as an
-                    // unavailable `/state` would.
-                    match engine.admission_unavailable_decision(&reason) {
+                    // unavailable `/state` would. This runtime routes EVERY
+                    // stateful policy through admission -- it has no in-process
+                    // ledger to fall back to -- so the fail-closed branch must
+                    // consider every cost cap, which is what a forced strict
+                    // override selects.
+                    match engine.admission_unavailable_decision(
+                        &reason,
+                        Some(crate::policy::config::CostEnforcementMode::Strict),
+                    ) {
                         Some(d) if d.is_blocking() => {
                             console_warn!(
                                 "Nova Guard: platform admission unavailable ({reason}); failing closed"
@@ -782,8 +789,8 @@ async fn proxy(
                             "Nova Guard: platform admission unavailable ({reason}); failing open"
                         ),
                         None => console_warn!(
-                            "Nova Guard: platform admission unavailable ({reason}) and no strict \
-                             cap is active"
+                            "Nova Guard: platform admission unavailable ({reason}) and no cost \
+                             cap was routed through admission"
                         ),
                     }
                 }

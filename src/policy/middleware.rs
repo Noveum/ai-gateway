@@ -285,7 +285,7 @@ pub async fn guard_middleware(
                 crate::policy::admission::Admission::Unavailable(reason) => {
                     // Never an implicit allow. Apply `failClosed` exactly as an
                     // unavailable `/state` would.
-                    match engine.admission_unavailable_decision(&reason) {
+                    match engine.admission_unavailable_decision(&reason, client.mode_override()) {
                         Some(d) if d.is_blocking() => {
                             warn!(
                                 provider = %provider, model = %model, policy = %d.policy_id,
@@ -301,7 +301,7 @@ pub async fn guard_middleware(
                         ),
                         None => warn!(
                             provider = %provider, model = %model, reason = %reason,
-                            "Nova Guard: platform admission unavailable and no strict cap is active"
+                            "Nova Guard: platform admission unavailable and no cost cap was routed through admission"
                         ),
                     }
                 }
@@ -486,8 +486,14 @@ pub async fn guard_middleware(
         }
         return match actual_usage {
             Some(u) => {
-                let cost =
-                    crate::policy::pricing::estimate_cost(&model, u.input_tokens, u.output_tokens);
+                let cost = crate::policy::pricing::price_usage(
+                    &model,
+                    &crate::policy::pricing::BillableUsage::from_tokens(
+                        u.input_tokens,
+                        u.output_tokens,
+                    ),
+                )
+                .total_usd;
                 debug!(
                     reservation = %guard.reservation_id(), model = %model,
                     input_tokens = u.input_tokens, output_tokens = u.output_tokens, cost,
@@ -660,11 +666,14 @@ impl Drop for StreamSettler {
         self.scanner.finish();
         match self.scanner.usage() {
             Some(u) => {
-                let cost = crate::policy::pricing::estimate_cost(
+                let cost = crate::policy::pricing::price_usage(
                     &self.model,
-                    u.input_tokens,
-                    u.output_tokens,
-                );
+                    &crate::policy::pricing::BillableUsage::from_tokens(
+                        u.input_tokens,
+                        u.output_tokens,
+                    ),
+                )
+                .total_usd;
                 debug!(
                     reservation = %guard.reservation_id(), model = %self.model,
                     input_tokens = u.input_tokens, output_tokens = u.output_tokens, cost,
@@ -756,7 +765,14 @@ impl Drop for StreamMeter {
             Some(u) => (
                 u.input_tokens,
                 u.output_tokens,
-                crate::policy::pricing::estimate_cost(&self.model, u.input_tokens, u.output_tokens),
+                crate::policy::pricing::price_usage(
+                    &self.model,
+                    &crate::policy::pricing::BillableUsage::from_tokens(
+                        u.input_tokens,
+                        u.output_tokens,
+                    ),
+                )
+                .total_usd,
             ),
             None => match self.estimate {
                 Some(e) => (e.input_tokens, e.output_tokens, e.cost_usd),
@@ -825,7 +841,14 @@ fn report_unreserved_usage(
         (Some(u), _) => (
             u.input_tokens,
             u.output_tokens,
-            crate::policy::pricing::estimate_cost(model, u.input_tokens, u.output_tokens),
+            crate::policy::pricing::price_usage(
+                model,
+                &crate::policy::pricing::BillableUsage::from_tokens(
+                    u.input_tokens,
+                    u.output_tokens,
+                ),
+            )
+            .total_usd,
         ),
         (None, Some(e)) => (e.input_tokens, e.output_tokens, e.cost_usd),
         // No usage and no estimate: nothing honest to report.

@@ -1017,20 +1017,19 @@ pub async fn fetch_bundle_conditional(
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    // Check the status BEFORE parsing: error bodies are often not JSON at all
-    // (a CDN/WAF 403 serves HTML), and "invalid JSON" would mask the real
-    // failure. Preserve the raw body in the error instead.
+    // Read the body as TEXT, then decide: it is often not JSON at all (a CDN/WAF
+    // serves HTML for a 403, and an edge login/challenge page can come back with
+    // a 200), so a bare "invalid JSON" would mask the real failure. Both the
+    // non-2xx and the unparseable-2xx error carry the raw body, truncated.
+    let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
         return Err(format!(
             "policies fetch returned {status}: {}",
             truncate_body(&body)
         ));
     }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("invalid JSON ({status}): {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("invalid JSON ({status}): {e}: {}", truncate_body(&body)))?;
     let bundle = platform::translate_bundle(&json)?;
     Ok(PolicyFetch::Modified { bundle, etag })
 }
@@ -1560,18 +1559,17 @@ async fn fetch_state_conditional(
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    // Status first — error bodies may be non-JSON (see fetch_bundle_conditional).
+    // Text first, then parse — a body may be non-JSON at any status (see
+    // fetch_bundle_conditional).
+    let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
         return Err(format!(
             "state fetch returned {status}: {}",
             truncate_body(&body)
         ));
     }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("invalid JSON ({status}): {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("invalid JSON ({status}): {e}: {}", truncate_body(&body)))?;
     let stale = json.get("stale").and_then(|s| s.as_bool()).unwrap_or(false);
     Ok(StateFetch::Modified {
         state: Box::new(platform::state_to_live_state(&json)),
@@ -2145,6 +2143,94 @@ mod tests {
         assert!(cfg.policies_url().contains("/projects/proj_a1/"));
         assert!(cfg.state_url().contains("/projects/proj_a1/"));
         assert!(cfg.usage_url().contains("/projects/proj_a1/"));
+    }
+
+    /// An edge/proxy that answers a policy fetch with an HTML login or challenge
+    /// page and a `200` is the same opacity problem as the `403` HTML body: the
+    /// parse error alone ("expected value at line 1") names neither the status
+    /// nor what actually came back. Both must survive into the error.
+    #[tokio::test]
+    async fn a_200_with_a_non_json_body_surfaces_the_status_and_the_body() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let html = "<html><body>Sign in to continue</body></html>";
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/policies/effective$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(html.as_bytes().to_vec(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = RemoteConfig::for_tenant(&server.uri(), "nv_key", "proj_1");
+        let err = match fetch_bundle_conditional(&cfg, None).await {
+            Err(e) => e,
+            Ok(_) => panic!("a 200 carrying HTML is not a usable policy bundle"),
+        };
+
+        assert!(err.contains("200"), "status missing from {err}");
+        assert!(
+            err.contains("Sign in to continue"),
+            "raw body missing from {err}"
+        );
+    }
+
+    /// The same 200-with-HTML shape on the *state* endpoint.
+    #[tokio::test]
+    async fn a_200_state_fetch_with_a_non_json_body_surfaces_the_body_too() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/policies/state$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"<html>challenge</html>".to_vec(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = RemoteConfig::for_tenant(&server.uri(), "nv_key", "proj_1");
+        let err = match fetch_state_conditional(&cfg, None).await {
+            Err(e) => e,
+            Ok(_) => panic!("a 200 carrying HTML is not a usable state document"),
+        };
+
+        assert!(err.contains("200"), "status missing from {err}");
+        assert!(err.contains("challenge"), "raw body missing from {err}");
+    }
+
+    /// A body longer than `truncate_body`'s 512-byte bound is capped, not dumped
+    /// whole, and the cap is announced with the real length.
+    #[tokio::test]
+    async fn a_huge_non_json_200_body_is_truncated_in_the_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let huge = "x".repeat(5000);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(huge.as_bytes().to_vec(), "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = RemoteConfig::for_tenant(&server.uri(), "nv_key", "proj_1");
+        let err = match fetch_bundle_conditional(&cfg, None).await {
+            Err(e) => e,
+            Ok(_) => panic!("a 200 carrying 5 KB of HTML is not a policy bundle"),
+        };
+
+        assert!(err.contains("(5000 bytes)"), "no length note in {err}");
+        assert!(
+            err.len() < 1024,
+            "error was not truncated: {} bytes",
+            err.len()
+        );
     }
 
     #[test]

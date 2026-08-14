@@ -33,8 +33,7 @@ pub mod metering;
 // shared; the native HTTP fetch is in `crate::policy::remote`.
 pub mod platform;
 pub mod pricing;
-/// Generated rate rows. Rendered from `pricing/catalog.json` by
-/// `scripts/gen_pricing.py`; never edited by hand (CI fails on drift).
+/// Hand-maintained rate rows, matching `pricing/catalog.json`.
 pub mod pricing_catalog;
 pub mod rules;
 pub mod synthetic;
