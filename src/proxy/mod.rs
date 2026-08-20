@@ -139,7 +139,7 @@ async fn process_response(
         })
     {
         let body = response.bytes().await?;
-        return Ok(response_builder.body(Body::from(body)).unwrap());
+        return Ok(response_builder.body(Body::from(body))?);
     }
 
     // Optimized streaming response handling
@@ -161,5 +161,5 @@ async fn process_response(
         .header("transfer-encoding", "chunked")
         .header("x-accel-buffering", "no");
 
-    Ok(response_builder.body(Body::from_stream(stream)).unwrap())
+    Ok(response_builder.body(Body::from_stream(stream))?)
 }

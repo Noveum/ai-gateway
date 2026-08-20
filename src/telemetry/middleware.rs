@@ -90,39 +90,30 @@ pub async fn metrics_middleware(
     // Get metrics extractor for this provider
     let metrics_extractor = get_metrics_extractor(&provider);
 
-    // Store original values before consuming request
-    let original_method = req.method().clone();
-    let original_uri = req.uri().clone();
-    let original_headers = req.headers().clone();
+    // Split the request so the body can be buffered and the head reused
+    // verbatim. Rebuilding through `Request::builder()` re-parses the method and
+    // URI (fallible, and previously `.unwrap()`ed) and silently drops
+    // `extensions` and `version`; `from_parts` is infallible and keeps both.
+    let (req_parts, req_body_in) = req.into_parts();
 
-    // Extract and store the original request body
     let (req_size, req_body, body) = {
-        let bytes = to_bytes(req.into_body(), usize::MAX)
-            .await
-            .unwrap_or_default();
+        let bytes = to_bytes(req_body_in, usize::MAX).await.unwrap_or_default();
         let size = bytes.len();
         let req_body = serde_json::from_slice(&bytes).ok();
         debug!("Request body size: {} bytes", size);
         (size, req_body, Body::from(bytes))
     };
 
-    // Reconstruct request with original values
-    let mut new_req = Request::builder()
-        .method(original_method)
-        .uri(original_uri)
-        .body(body)
-        .unwrap();
-    *new_req.headers_mut() = original_headers;
+    let new_req = Request::from_parts(req_parts, body);
 
     // Process the response with a timeout
     let response = tokio::time::timeout(Duration::from_secs(30), next.run(new_req))
         .await
         .unwrap_or_else(|_| {
             debug!("Request timed out after 30 seconds");
-            Response::builder()
-                .status(http::StatusCode::GATEWAY_TIMEOUT)
-                .body(Body::from("Request timed out after 30 seconds"))
-                .unwrap()
+            let mut timed_out = Response::new(Body::from("Request timed out after 30 seconds"));
+            *timed_out.status_mut() = http::StatusCode::GATEWAY_TIMEOUT;
+            timed_out
         });
 
     let is_streaming = response
