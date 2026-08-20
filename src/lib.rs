@@ -144,6 +144,9 @@ impl AppState {
 /// byte what it was.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn build_router(state: AppState) -> Router {
+    // Before the listener binds, not on the first proxied request.
+    proxy::warm_http_clients();
+
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)

@@ -84,6 +84,16 @@ fn is_bedrock_runtime_host(host: &str) -> bool {
         .is_some_and(|rest| rest.ends_with(".amazonaws.com"))
 }
 
+/// Build both clients now, so a broken TLS backend or an unreadable root
+/// certificate store aborts the process at startup instead of on the first
+/// proxied request. Both are `Lazy`, and their builders `.expect(..)`; under
+/// `panic = "abort"` a first-request failure would kill the replica after it had
+/// already passed its readiness probe.
+pub fn warm() {
+    Lazy::force(&CLIENT);
+    Lazy::force(&NEGOTIATING_CLIENT);
+}
+
 /// Pick the right client for an upstream URL: h2-prior-knowledge for the known
 /// first-party provider hosts, a normally-negotiating client for everything
 /// else (cleartext mocks, custom/overridden endpoints, non-Bedrock AWS hosts).

@@ -1069,8 +1069,8 @@ use std::time::Instant;
 
 use crate::policy::remote::{
     select_tenant, GuardTenancy, RemoteConfig, SharedTenancyConfig, TenantId, TenantRejection,
-    TenantResolver, ROUTING_ORG_HEADERS, ROUTING_PROJECT_HEADER, TENANT_CREDENTIAL_HEADER,
-    TENANT_IDLE_TTL,
+    TenantResolver, PLATFORM_CLIENT, ROUTING_ORG_HEADERS, ROUTING_PROJECT_HEADER,
+    TENANT_CREDENTIAL_HEADER, TENANT_IDLE_TTL,
 };
 
 /// One tenant's complete, isolated enforcement runtime.
@@ -1116,6 +1116,12 @@ impl SharedTenancy {
         cost_mode: Option<crate::policy::config::CostEnforcementMode>,
         allow_unguarded_start: bool,
     ) -> Self {
+        // Shared mode fetches nothing at startup, so without this the first
+        // deref of the platform client would be inside `fetch_identity`, on the
+        // first `/v1/*` request. Forcing it here turns a TLS/root-store failure
+        // into a boot abort in shared mode as it already is in dedicated mode,
+        // and does so for library embedders too, not just `main`.
+        once_cell::sync::Lazy::force(&PLATFORM_CLIENT);
         let resolver =
             TenantResolver::new(&cfg.base_url, cfg.resolution_ttl, cfg.max_tenants.max(64));
         Self {

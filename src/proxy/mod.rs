@@ -12,6 +12,7 @@ use tracing::{debug, error};
 use crate::{config::AppConfig, error::AppError, providers::create_provider};
 
 mod client;
+pub use client::warm as warm_http_clients;
 pub use client::CLIENT;
 mod signing;
 
