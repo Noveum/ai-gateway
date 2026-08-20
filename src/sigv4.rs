@@ -16,6 +16,10 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[allow(
+    clippy::expect_used,
+    reason = "HMAC accepts any key length; InvalidLength is unreachable for this MAC"
+)]
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);

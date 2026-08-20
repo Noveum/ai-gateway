@@ -69,6 +69,10 @@ fn resolve_max_output_tokens(body_json: &Value) -> Result<Option<u64>, &'static 
 }
 
 /// Provider-shaped 400 for an unusable output limit.
+#[allow(
+    clippy::expect_used,
+    reason = "constant status and &'static str headers only, so the builder cannot fail"
+)]
 fn invalid_output_limit_response(key: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -906,6 +910,10 @@ pub use crate::routing::{
 /// response plus the provider's authoritative token counts when the body was
 /// buffered and carried them. `None` usage means the caller must not claim to
 /// know what this call consumed.
+#[allow(
+    clippy::expect_used,
+    reason = "the 502 envelope uses a constant status and &'static str headers only"
+)]
 async fn enforce_output(
     engine: &PolicyEngine,
     provider: &str,
@@ -1278,10 +1286,7 @@ impl SharedTenancy {
 
     /// How many tenants are currently warm (diagnostics/tests).
     pub fn warm_tenants(&self) -> usize {
-        self.slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -1340,6 +1345,10 @@ pub async fn tenant_middleware(
 }
 
 /// Provider-shaped error envelope for a tenancy refusal.
+#[allow(
+    clippy::expect_used,
+    reason = "status goes through from_u16(..).unwrap_or(..) and headers are &'static str, so the builder cannot fail"
+)]
 pub fn tenant_rejection_response(rejection: &TenantRejection) -> Response {
     let body = serde_json::json!({
         "error": {

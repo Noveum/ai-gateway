@@ -19,6 +19,10 @@ fn base_builder(config: &AppConfig) -> reqwest::ClientBuilder {
         .brotli(true)
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "startup: warm() forces this before the listener binds, so a broken TLS stack fails the rollout"
+)]
 pub fn create_client(config: &AppConfig) -> reqwest::Client {
     info!("Creating HTTP client with optimized settings");
 
@@ -42,6 +46,10 @@ pub static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 /// `http://` upstream (local mock provider, self-hosted gateway) or a custom
 /// HTTPS endpoint behind an HTTP/1.1-only proxy would fail with an opaque h2
 /// error before the request ever reached the provider.
+#[allow(
+    clippy::expect_used,
+    reason = "startup: warm() forces this before the listener binds, so a broken TLS stack fails the rollout"
+)]
 pub static NEGOTIATING_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     let config = AppConfig::new();
     base_builder(&config)

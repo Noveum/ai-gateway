@@ -24,6 +24,10 @@ use crate::policy::rules::LiveState;
 /// (which forces HTTP/2 prior knowledge for HTTPS provider calls), this
 /// negotiates the HTTP version normally so it works against a plain HTTP/1.1
 /// control plane (e.g. a local `http://localhost:3000`) as well as HTTPS.
+#[allow(
+    clippy::expect_used,
+    reason = "startup: forced by bootstrap_engine (dedicated) and SharedTenancy::new (shared)"
+)]
 pub(crate) static PLATFORM_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .use_rustls_tls()

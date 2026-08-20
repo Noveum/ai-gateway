@@ -14,6 +14,15 @@
 // of scope for the Nova Guard change. The new Nova Guard modules are clippy-clean
 // under `-D warnings`; allowing these crate-wide avoids churning untouched,
 // logic-heavy pre-existing functions.
+// NOV-132: the crate ships with `panic = "abort"`, so a panic on a request path
+// does not fail one request, it kills the process and drops every in-flight
+// request on that replica. Deny the two ways that happens by accident; each
+// remaining site carries an `#[allow]` with the reason it is safe, so the
+// argument is re-checked on every build instead of living in a comment.
+// `not(test)` keeps the `#[cfg(test)]` modules, where panicking IS the
+// assertion mechanism, unaffected. `src/main.rs` is a separate crate root and
+// is deliberately not covered: startup is where an abort is correct.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::borrowed_box)]

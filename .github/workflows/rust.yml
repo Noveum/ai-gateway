@@ -32,6 +32,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
@@ -40,6 +41,13 @@ jobs:
 
       - name: Clippy (warnings are errors)
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # src/worker_rt.rs is cfg(target_arch = "wasm32"), so the native run above
+      # never compiles it. Without this step the crate-level
+      # deny(clippy::unwrap_used, clippy::expect_used) does not reach the Worker
+      # runtime at all.
+      - name: Clippy on the Worker target
+        run: cargo clippy --target wasm32-unknown-unknown --lib --all-features -- -D warnings
 
       - name: Build
         run: cargo build --verbose

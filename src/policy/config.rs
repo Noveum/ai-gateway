@@ -266,6 +266,7 @@ fn config_validators() -> &'static HashMap<&'static str, Validator> {
     VALIDATORS.get_or_init(|| {
         // The schema is checked in and covered by `schema_document_is_valid`, so a
         // parse failure here is a build-time bug, not a runtime input problem.
+        #[allow(clippy::expect_used, reason = "compile-time constant: the schema is include_str! and covered by schema_document_is_valid")]
         let schema: serde_json::Value = serde_json::from_str(POLICY_SCHEMA_JSON)
             .expect("embedded novaguard schema is not valid JSON");
         let defs = schema.get("$defs").cloned().unwrap_or_default();
