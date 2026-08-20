@@ -24,6 +24,10 @@ use crate::policy::rules::LiveState;
 /// (which forces HTTP/2 prior knowledge for HTTPS provider calls), this
 /// negotiates the HTTP version normally so it works against a plain HTTP/1.1
 /// control plane (e.g. a local `http://localhost:3000`) as well as HTTPS.
+#[allow(
+    clippy::expect_used,
+    reason = "startup: forced by bootstrap_engine (dedicated) and SharedTenancy::new (shared)"
+)]
 pub(crate) static PLATFORM_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .use_rustls_tls()
@@ -906,7 +910,7 @@ impl TenantResolver {
     }
 
     fn slot(&self, fingerprint: &str) -> Arc<ResolverSlot> {
-        let mut slots = self.slots.lock().expect("tenant resolver lock poisoned");
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = slots.get(fingerprint) {
             return slot.clone();
         }
@@ -1368,13 +1372,15 @@ impl PendingInner {
     }
 
     fn prune(&mut self) {
-        while let Some(front) = self.completed.front() {
-            if front.at.elapsed() >= PENDING_SPEND_TTL {
-                let e = self.completed.pop_front().expect("front just checked");
-                Self::subtract(&mut self.totals, &e);
-            } else {
+        while self
+            .completed
+            .front()
+            .is_some_and(|front| front.at.elapsed() >= PENDING_SPEND_TTL)
+        {
+            let Some(e) = self.completed.pop_front() else {
                 break;
-            }
+            };
+            Self::subtract(&mut self.totals, &e);
         }
         // Backstop: reap active entries whose guard never fired. `active` is
         // bounded by in-flight concurrency, so the scan is cheap.
@@ -1407,7 +1413,7 @@ impl PendingSpend {
     /// the totals of every *other* un-expired reservation, to be folded into
     /// the counters the policy engine evaluates.
     pub fn reserve(&self, cost_usd: f64, tokens: u64) -> (u64, PendingTotals) {
-        let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.prune();
         let others = inner.totals;
         let id = inner.next_id;
@@ -1427,7 +1433,7 @@ impl PendingSpend {
     /// Release a reservation whose request was NOT forwarded (blocked): it
     /// will consume nothing, so it must stop counting immediately.
     pub fn release(&self, reservation: u64) {
-        let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(idx) = inner.active.iter().position(|e| e.id == reservation) {
             let e = inner.active.swap_remove(idx);
             let mut t = inner.totals;
@@ -1443,7 +1449,7 @@ impl PendingSpend {
     /// for [`PENDING_SPEND_TTL`] from NOW (covering the usage-report + state
     /// ingestion lag), then expires.
     pub fn complete(&self, reservation: u64) {
-        let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(idx) = inner.active.iter().position(|e| e.id == reservation) {
             let mut e = inner.active.swap_remove(idx);
             e.at = Instant::now();
@@ -1457,13 +1463,13 @@ impl PendingSpend {
     /// cancellation tests assert on this rather than on the totals (a
     /// *completed* entry legitimately keeps counting for its short TTL).
     pub fn active_count(&self) -> usize {
-        let inner = self.inner.lock().expect("pending-spend lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.active.len()
     }
 
     /// Current un-expired pending totals (prunes expired entries).
     pub fn sum(&self) -> PendingTotals {
-        let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.prune();
         inner.totals
     }

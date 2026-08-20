@@ -68,6 +68,9 @@ pub enum AppError {
     #[error("HTTP error: {0}")]
     HttpError(String),
 
+    #[error("Failed to build HTTP response: {0}")]
+    HttpBuildError(#[from] http::Error),
+
     #[error("JSON parse error: {0}")]
     JsonParseError(String),
 
@@ -141,6 +144,10 @@ impl IntoResponse for AppError {
             AppError::HttpError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("HTTP error: {}", e),
+            ),
+            AppError::HttpBuildError(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build HTTP response: {}", e),
             ),
             AppError::JsonParseError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

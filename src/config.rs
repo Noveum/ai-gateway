@@ -28,6 +28,10 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    #[allow(
+        clippy::expect_used,
+        reason = "startup: a non-numeric PORT must abort the boot, not serve on a surprise port"
+    )]
     pub fn new() -> Self {
         info!("Loading environment configuration");
         dotenv::dotenv().ok();

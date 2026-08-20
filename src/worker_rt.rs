@@ -913,7 +913,12 @@ async fn proxy(
         url = "https://api.anthropic.com/v1/messages".to_string();
         forward_bytes = forward_body_bytes(body_rewritten, &body_json, &body_bytes);
     } else {
-        let route = route.expect("checked above");
+        // Guarded at the top of the handler, which 400s unless one of
+        // `route`/`is_anthropic`/`is_bedrock` holds. Binding it here makes that
+        // structural instead of an argument a future edit could invalidate.
+        let Some(route) = route else {
+            return Response::error("Unsupported or not-yet-ported provider on edge", 400);
+        };
         out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
         // `OPENAI_BASE_URL` targets a compatible upstream, the same override the
         // native gateway honors. Scoped to `x-provider: openai` for the same

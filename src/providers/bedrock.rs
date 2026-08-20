@@ -560,7 +560,7 @@ impl Provider for BedrockProvider {
                 builder = builder.header("x-request-id", id);
             }
 
-            Ok(builder.body(Body::from_stream(stream)).unwrap())
+            Ok(builder.body(Body::from_stream(stream))?)
         } else {
             // For non-streaming responses, transform the body to OpenAI format
             debug!("Processing Bedrock non-streaming response");

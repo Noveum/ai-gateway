@@ -39,9 +39,8 @@ fn map_action(_action: &str) -> &'static str {
 /// Lowercase the `action` enum(s) inside a platform policy config so it parses as
 /// the gateway's `PolicyAction`. All other fields already line up.
 fn normalize_config(policy_type: &str, mut config: Value) -> Value {
-    if config.get("action").and_then(|a| a.as_str()).is_some() {
-        let a = config["action"].as_str().unwrap();
-        config["action"] = json!(map_action(a));
+    if let Some(action) = config.get("action").and_then(|a| a.as_str()) {
+        config["action"] = json!(map_action(action));
     }
     if policy_type == "cost_cap" {
         // `enforcementMode` selects platform-atomic admission (`strict`) over the

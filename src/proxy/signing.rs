@@ -53,8 +53,7 @@ pub async fn sign_aws_request(
         .method(method)
         .uri(url)
         .header("Content-Type", "application/json")
-        .body(())
-        .unwrap();
+        .body(())?;
 
     // Apply signing instructions
     signing_instructions.apply_to_request_http1x(&mut temp_request);

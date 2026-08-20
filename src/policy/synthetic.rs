@@ -25,8 +25,8 @@ use uuid::Uuid;
 #[cfg(not(target_arch = "wasm32"))]
 use axum::{
     body::Body,
-    http::{header, StatusCode},
-    response::Response,
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
 };
 
 /// How a block should be surfaced to the caller.
@@ -110,15 +110,22 @@ pub fn block_response(
     let body = block_body(provider, model, decision, mode);
     let status =
         StatusCode::from_u16(block_status(mode)).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let policy_header = policy_header_token(&decision.policy_id);
-
-    Response::builder()
+    let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-noveum-guard-blocked", "true")
-        .header("x-noveum-guard-policy", policy_header)
         .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
-        .expect("synthetic response with sanitized header is always valid")
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+
+    // `policy_id` is arbitrary platform JSON. `policy_header_token` sanitizes it
+    // to ASCII-graphic, but that invariant lives sixty lines away with no
+    // compiler-visible link to this call. Going through `HeaderValue` means a
+    // future edit to the sanitizer drops the header instead of aborting the
+    // process on the blocked-request path.
+    if let Ok(v) = HeaderValue::from_str(&policy_header_token(&decision.policy_id)) {
+        response.headers_mut().insert("x-noveum-guard-policy", v);
+    }
+    response
 }
 
 fn reason_text(decision: &PolicyDecision) -> String {
@@ -297,6 +304,37 @@ mod tests {
         );
         let b = body_json(resp).await;
         assert_eq!(b["error"]["type"], "permission_error");
+    }
+
+    /// A hostile `policy_id` must never abort the process. Under
+    /// `panic = "abort"` a bad header value here would kill the replica on the
+    /// blocked-request path, which is exactly when a misconfigured or hostile
+    /// tenant is most active.
+    #[tokio::test]
+    async fn a_hostile_policy_id_never_panics_and_yields_a_valid_header() {
+        for hostile in [
+            "pol\r\nX-Injected: yes",
+            "pol\u{0}nul",
+            "policy\u{7f}del",
+            "\u{1f4a5}\u{1f4a5}",
+            "",
+            &"x".repeat(4096),
+        ] {
+            let mut d = decision();
+            d.policy_id = hostile.to_string();
+            let resp = block_response("openai", "gpt-4o", &d, BlockResponseMode::SyntheticSuccess);
+            assert_eq!(resp.status(), StatusCode::OK);
+            if let Some(v) = resp.headers().get("x-noveum-guard-policy") {
+                assert!(
+                    v.to_str().is_ok(),
+                    "emitted header must be representable: {hostile:?}"
+                );
+                assert!(
+                    !v.as_bytes().iter().any(|b| *b < 0x21 || *b > 0x7e),
+                    "emitted header must stay ASCII-graphic: {hostile:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

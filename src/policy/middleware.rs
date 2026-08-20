@@ -69,6 +69,10 @@ fn resolve_max_output_tokens(body_json: &Value) -> Result<Option<u64>, &'static 
 }
 
 /// Provider-shaped 400 for an unusable output limit.
+#[allow(
+    clippy::expect_used,
+    reason = "constant status and &'static str headers only, so the builder cannot fail"
+)]
 fn invalid_output_limit_response(key: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -150,10 +154,10 @@ pub async fn guard_middleware(
             // Body too large or unreadable; we cannot inspect it. Fail open by
             // forwarding the original (already-consumed) request is impossible,
             // so respond with a clear error rather than silently dropping.
-            return Response::builder()
-                .status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
-                .body(Body::from("request body exceeds gateway inspection limit"))
-                .unwrap();
+            let mut too_large =
+                Response::new(Body::from("request body exceeds gateway inspection limit"));
+            *too_large.status_mut() = axum::http::StatusCode::PAYLOAD_TOO_LARGE;
+            return too_large;
         }
     };
 
@@ -906,6 +910,10 @@ pub use crate::routing::{
 /// response plus the provider's authoritative token counts when the body was
 /// buffered and carried them. `None` usage means the caller must not claim to
 /// know what this call consumed.
+#[allow(
+    clippy::expect_used,
+    reason = "the 502 envelope uses a constant status and &'static str headers only"
+)]
 async fn enforce_output(
     engine: &PolicyEngine,
     provider: &str,
@@ -1069,8 +1077,8 @@ use std::time::Instant;
 
 use crate::policy::remote::{
     select_tenant, GuardTenancy, RemoteConfig, SharedTenancyConfig, TenantId, TenantRejection,
-    TenantResolver, ROUTING_ORG_HEADERS, ROUTING_PROJECT_HEADER, TENANT_CREDENTIAL_HEADER,
-    TENANT_IDLE_TTL,
+    TenantResolver, PLATFORM_CLIENT, ROUTING_ORG_HEADERS, ROUTING_PROJECT_HEADER,
+    TENANT_CREDENTIAL_HEADER, TENANT_IDLE_TTL,
 };
 
 /// One tenant's complete, isolated enforcement runtime.
@@ -1116,6 +1124,12 @@ impl SharedTenancy {
         cost_mode: Option<crate::policy::config::CostEnforcementMode>,
         allow_unguarded_start: bool,
     ) -> Self {
+        // Shared mode fetches nothing at startup, so without this the first
+        // deref of the platform client would be inside `fetch_identity`, on the
+        // first `/v1/*` request. Forcing it here turns a TLS/root-store failure
+        // into a boot abort in shared mode as it already is in dedicated mode,
+        // and does so for library embedders too, not just `main`.
+        once_cell::sync::Lazy::force(&PLATFORM_CLIENT);
         let resolver =
             TenantResolver::new(&cfg.base_url, cfg.resolution_ttl, cfg.max_tenants.max(64));
         Self {
@@ -1226,7 +1240,7 @@ impl SharedTenancy {
     }
 
     fn slot(&self, tenant: &TenantId) -> Arc<TenantSlot> {
-        let mut slots = self.slots.lock().expect("tenant registry lock poisoned");
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = slots.get(tenant) {
             return slot.clone();
         }
@@ -1247,7 +1261,7 @@ impl SharedTenancy {
         // Collect the drop set under the lock, then release it before dropping
         // the runtimes (each drop touches a queue and a task handle).
         let doomed = {
-            let mut slots = self.slots.lock().expect("tenant registry lock poisoned");
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
             let snapshot: Vec<(TenantId, u64)> = slots
                 .iter()
                 .map(|(t, s)| (t.clone(), s.last_used.load(Ordering::Relaxed)))
@@ -1272,10 +1286,7 @@ impl SharedTenancy {
 
     /// How many tenants are currently warm (diagnostics/tests).
     pub fn warm_tenants(&self) -> usize {
-        self.slots
-            .lock()
-            .expect("tenant registry lock poisoned")
-            .len()
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -1334,6 +1345,10 @@ pub async fn tenant_middleware(
 }
 
 /// Provider-shaped error envelope for a tenancy refusal.
+#[allow(
+    clippy::expect_used,
+    reason = "status goes through from_u16(..).unwrap_or(..) and headers are &'static str, so the builder cannot fail"
+)]
 pub fn tenant_rejection_response(rejection: &TenantRejection) -> Response {
     let body = serde_json::json!({
         "error": {

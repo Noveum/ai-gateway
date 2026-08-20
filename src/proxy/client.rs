@@ -19,6 +19,10 @@ fn base_builder(config: &AppConfig) -> reqwest::ClientBuilder {
         .brotli(true)
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "startup: warm() forces this before the listener binds, so a broken TLS stack fails the rollout"
+)]
 pub fn create_client(config: &AppConfig) -> reqwest::Client {
     info!("Creating HTTP client with optimized settings");
 
@@ -42,6 +46,10 @@ pub static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 /// `http://` upstream (local mock provider, self-hosted gateway) or a custom
 /// HTTPS endpoint behind an HTTP/1.1-only proxy would fail with an opaque h2
 /// error before the request ever reached the provider.
+#[allow(
+    clippy::expect_used,
+    reason = "startup: warm() forces this before the listener binds, so a broken TLS stack fails the rollout"
+)]
 pub static NEGOTIATING_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     let config = AppConfig::new();
     base_builder(&config)
@@ -82,6 +90,16 @@ fn url_host(url: &str) -> Option<&str> {
 fn is_bedrock_runtime_host(host: &str) -> bool {
     host.strip_prefix("bedrock-runtime.")
         .is_some_and(|rest| rest.ends_with(".amazonaws.com"))
+}
+
+/// Build both clients now, so a broken TLS backend or an unreadable root
+/// certificate store aborts the process at startup instead of on the first
+/// proxied request. Both are `Lazy`, and their builders panic on failure; under
+/// `panic = "abort"` a first-request failure would kill the replica after it had
+/// already passed its readiness probe.
+pub fn warm() {
+    Lazy::force(&CLIENT);
+    Lazy::force(&NEGOTIATING_CLIENT);
 }
 
 /// Pick the right client for an upstream URL: h2-prior-knowledge for the known
