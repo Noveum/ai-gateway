@@ -150,10 +150,10 @@ pub async fn guard_middleware(
             // Body too large or unreadable; we cannot inspect it. Fail open by
             // forwarding the original (already-consumed) request is impossible,
             // so respond with a clear error rather than silently dropping.
-            return Response::builder()
-                .status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
-                .body(Body::from("request body exceeds gateway inspection limit"))
-                .unwrap();
+            let mut too_large =
+                Response::new(Body::from("request body exceeds gateway inspection limit"));
+            *too_large.status_mut() = axum::http::StatusCode::PAYLOAD_TOO_LARGE;
+            return too_large;
         }
     };
 

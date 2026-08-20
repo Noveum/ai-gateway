@@ -388,7 +388,7 @@ async fn print_banner() {
     print!("\n    Starting Noveum AI Gateway ");
     for frame in frames.iter().cycle().take(15) {
         print!("\r    Starting Noveum AI Gateway {}  ", frame.bright_cyan());
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
     println!("\r    Starting Noveum AI Gateway ✓  \n");
@@ -422,18 +422,31 @@ async fn print_banner() {
 
 async fn shutdown_signal() {
     info!("Registering shutdown signal handler");
+    // A handler that cannot be installed (fd exhaustion) must not abort the
+    // process: the gateway is already serving traffic by the time this runs.
+    // Degrade to a future that never completes, so the other signal still works
+    // and the operator gets a loud line in the log.
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C signal handler")
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                error!(error = %e, "failed to install the CTRL+C handler; SIGINT will not shut down gracefully");
+                std::future::pending::<()>().await
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "failed to install the SIGTERM handler; SIGTERM will not shut down gracefully");
+                std::future::pending::<()>().await
+            }
+        }
     };
 
     #[cfg(not(unix))]
