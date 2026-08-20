@@ -10,8 +10,13 @@ name: Rust
 on:
   push:
     branches: [ "main" ]
+  # Stacked PRs target the branch below them, not `main`. Without listing those
+  # bases here the gate silently does not run on them at all: the PR shows only
+  # the Docker check and looks green while nothing has been compiled or tested.
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - "main"
+      - "feat/novaguard-platform-bridge"
 
 env:
   CARGO_TERM_COLOR: always
