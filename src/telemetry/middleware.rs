@@ -92,7 +92,7 @@ pub async fn metrics_middleware(
 
     // Split the request so the body can be buffered and the head reused
     // verbatim. Rebuilding through `Request::builder()` re-parses the method and
-    // URI (fallible, and previously `.unwrap()`ed) and silently drops
+    // URI (fallible, and previously unwrapped) and silently drops
     // `extensions` and `version`; `from_parts` is infallible and keeps both.
     let (req_parts, req_body_in) = req.into_parts();
 

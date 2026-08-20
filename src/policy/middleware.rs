@@ -1232,7 +1232,7 @@ impl SharedTenancy {
     }
 
     fn slot(&self, tenant: &TenantId) -> Arc<TenantSlot> {
-        let mut slots = self.slots.lock().expect("tenant registry lock poisoned");
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = slots.get(tenant) {
             return slot.clone();
         }
@@ -1253,7 +1253,7 @@ impl SharedTenancy {
         // Collect the drop set under the lock, then release it before dropping
         // the runtimes (each drop touches a queue and a task handle).
         let doomed = {
-            let mut slots = self.slots.lock().expect("tenant registry lock poisoned");
+            let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
             let snapshot: Vec<(TenantId, u64)> = slots
                 .iter()
                 .map(|(t, s)| (t.clone(), s.last_used.load(Ordering::Relaxed)))
@@ -1280,7 +1280,7 @@ impl SharedTenancy {
     pub fn warm_tenants(&self) -> usize {
         self.slots
             .lock()
-            .expect("tenant registry lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .len()
     }
 }

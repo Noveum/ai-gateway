@@ -86,7 +86,7 @@ fn is_bedrock_runtime_host(host: &str) -> bool {
 
 /// Build both clients now, so a broken TLS backend or an unreadable root
 /// certificate store aborts the process at startup instead of on the first
-/// proxied request. Both are `Lazy`, and their builders `.expect(..)`; under
+/// proxied request. Both are `Lazy`, and their builders panic on failure; under
 /// `panic = "abort"` a first-request failure would kill the replica after it had
 /// already passed its readiness probe.
 pub fn warm() {
