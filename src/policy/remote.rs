@@ -1368,13 +1368,15 @@ impl PendingInner {
     }
 
     fn prune(&mut self) {
-        while let Some(front) = self.completed.front() {
-            if front.at.elapsed() >= PENDING_SPEND_TTL {
-                let e = self.completed.pop_front().expect("front just checked");
-                Self::subtract(&mut self.totals, &e);
-            } else {
+        while self
+            .completed
+            .front()
+            .is_some_and(|front| front.at.elapsed() >= PENDING_SPEND_TTL)
+        {
+            let Some(e) = self.completed.pop_front() else {
                 break;
-            }
+            };
+            Self::subtract(&mut self.totals, &e);
         }
         // Backstop: reap active entries whose guard never fired. `active` is
         // bounded by in-flight concurrency, so the scan is cheap.
