@@ -25,6 +25,11 @@
 pub mod policy;
 pub mod routing;
 pub mod sigv4;
+// The pure Anthropic SSE state machine is shared by the Axum and Cloudflare
+// stream adapters. The source remains beside the native provider adapter, but
+// every target compiles this module so the two runtimes cannot drift.
+#[path = "providers/anthropic_stream.rs"]
+pub mod anthropic_stream;
 
 /// Shared metering primitives — SSE frame reassembly and response/stream usage
 /// parsing — re-exported at the crate root because they are consumed by all

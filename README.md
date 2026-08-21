@@ -30,14 +30,15 @@
   - Together AI — [guide](docs/providers/together.md)
   - Mistral, Cohere, Google Gemini, DeepSeek, xAI (Grok), OpenRouter, Perplexity — [OpenAI-compatible providers guide](docs/providers/openai-compatible.md)
 - 💰 **Per-request cost tracking** across all providers from a built-in,
-  single-sourced model pricing table — see [docs/PRICING.md](docs/PRICING.md).
+  versioned model pricing catalog — see [docs/PRICING.md](docs/PRICING.md).
 - 📡 **Real-time Streaming**: Optimized for minimal latency
 - 🛡️ **Nova Guard policy enforcement**: In-process guardrails — model allow/deny, regex, banned substrings, PII & secrets detection, JSON-schema validation, token caps — that block, redact, or flag requests and responses, loaded from a local policy bundle (file or inline). See [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md).
 - 🛡️ **Production Ready**: Battle-tested in high-load environments
 - 🔍 **Health Checking**: Built-in monitoring
 - 📊 **Telemetry & Metrics**: Per-request token usage and cost tracking with a pluggable `MetricsExporter` trait; ships with a console exporter (set `DEBUG_METRICS=true`) for local debugging. See [docs/telemetry-plugins.md](docs/telemetry-plugins.md).
 - 🌐 **CORS Support**: Configurable cross-origin resource sharing
-- 🛠️ **SDK Compatibility**: Works with any OpenAI-compatible SDK
+- 🛠️ **SDK Compatibility**: Uses the OpenAI Chat Completions contract;
+  provider-specific supported-field subsets are documented in each guide
 - 🌍 **Deploy anywhere — one package, three shapes**: the same crate runs as a
   native binary / **Docker** image, a **Rust library**, **or** a
   **Cloudflare Worker** (WASM, true per‑PoP edge) sharing the same Nova Guard
@@ -149,7 +150,10 @@ PORT=8080 noveum-ai-gateway
 | `NOVEUM_GUARD_TENANT_TTL_SECS` | `300` | Shared mode: how long one credential→tenant resolution is reused. Matches the platform's own API-key cache, so the gateway is never *more* stale than the control plane it mirrors |
 | `NOVEUM_GUARD_TENANT_CACHE_MAX` | `1024` | Shared mode: how many distinct tenants one process keeps warm (compiled policies, counters, reservations). A tenant idle for 10 minutes is dropped, which is also what makes a revoked credential self-heal |
 | `OPENAI_BASE_URL` | `https://api.openai.com` | Send `x-provider: openai` traffic to a compatible upstream. Honored by both the native gateway and the Cloudflare Worker |
-| `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Assumed completion size for cost/rate admission when a request sets no `max_tokens`. Raise it for stricter (earlier-blocking) hard-cap admission of unbounded requests |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Override the Anthropic upstream for `x-provider: anthropic`. Honored by both the native gateway and the Cloudflare Worker; requests still route to `/v1/messages` |
+| `NOVEUM_GUARD_COST_ENFORCEMENT` | policy setting | Native gateway only: `strict` forces every cost cap through platform-atomic admission; `advisory` forces the per-process ledger. Unset lets each policy's `enforcementMode` decide. `strict` without the platform bridge is a startup error |
+| `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Fallback completion estimate for advisory cost caps and rate-only admission when a request has no explicit output limit. It is not used to admit an applicable enforcing/blocking strict cost cap: that request is rejected with HTTP 400 instead |
+| `NOVEUM_GUARD_WORKER_UPSTREAM_TIMEOUT_MS` | `600000` | Cloudflare Worker only: deadline for an admitted provider fetch/body/stream. It may be lowered to a positive value but not raised above 10 minutes, so an active request is abandoned before the platform can reap its 15-minute reservation lease |
 | `NOVEUM_GUARD_ALLOW_UNGUARDED_START` | `false` | **Emergency use only.** Lets the gateway start when the first platform policy fetch fails, serving traffic with *no* enforcement until a later poll succeeds. Without it, that failure aborts startup |
 
 ### Platform-managed Nova Guard: the two deployment modes
@@ -254,38 +258,69 @@ during the rollout.
 
 > **Whether a cap holds across replicas depends on its enforcement mode.**
 >
-> * **Strict** (`enforcementMode: strict` on a `cost_cap`, or
->   `NOVEUM_GUARD_COST_ENFORCEMENT=strict` deployment-wide) — each request is
->   reserved against the platform's atomic admission API before it is dispatched,
->   so one counter is shared by every replica and the cap is a real hard cap. The
->   reservation is settled with the response's true token counts on the way out;
->   a request the platform cannot evaluate is *unavailable*, never an implicit
->   allow.
-> * **Advisory** (the default) — each instance reserves only in its own
->   in-process ledger, against reported spend plus its own in-flight estimate.
->   Usage is reported asynchronously and `/state` is cached, so a cap can be
->   overshot by roughly the cost of the requests admitted in that window *per
->   replica*. With an HPA that multiplies by replica count.
+> | Active policy for this model | Request has a positive explicit output limit | No explicit output limit |
+> |---|---|---|
+> | Enforcing, blocking **strict** `cost_cap` | Reserved against the platform's atomic admission API, then settled with actual usage | **HTTP 400 `missing_output_limit` before admission or provider dispatch** |
+> | **Advisory** `cost_cap` | Heuristic estimate (native: per-process ledger; Worker: stateful platform bridge without promotion to strict semantics) | Allowed using `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS`; this is an estimate, not a hard cap |
+> | `rate_limit` only | Normal rate admission | Allowed using the fallback estimate where token accounting needs one; rate-only policies do not acquire the strict cost-cap requirement |
+> | Strict cap in `shadow` mode, disabled, or outside `scopeToModels` | Does not impose the strict output-limit requirement | Does not impose the strict output-limit requirement |
 >
-> Both modes admit a request with no `max_tokens` against the
-> `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` heuristic rather than its true output
-> size. `rate_limit` follows the same reservation as the cost cap on the strict
-> path and is otherwise per-process.
+> The accepted limit fields are `max_tokens`, `max_completion_tokens`, and
+> `max_output_tokens`; every non-null field must be the same positive integer no
+> greater than 10,000,000 under strict admission. Compatible providers receive
+> one normalized native ceiling, so the amount reserved is the amount enforced
+> upstream. On the native gateway,
+> `NOVEUM_GUARD_COST_ENFORCEMENT=strict` promotes otherwise-advisory caps to the
+> strict row, while `...=advisory` demotes policy-declared strict caps. Unset lets
+> each policy decide. Native advisory enforcement can overshoot by the requests
+> admitted in the refresh window *per replica*. The Worker still sends stateful
+> traffic through its platform bridge, but that transport choice does not turn
+> an advisory policy into a hard cap; only atomic strict admission provides the
+> cross-replica hard-cap contract.
+>
+> Strict admission deliberately supports only bounded JSON
+> `/v1/chat/completions`. It requires `model`, `messages`, and a positive output
+> limit, estimates the post-transform serialized body, and rejects unbounded
+> provider-side work before admission: Responses/conversation state, images,
+> files, audio, remote search (including xAI `search_parameters`), server/MCP
+> tools, conflicting output-limit aliases, multi-choice requests,
+> Perplexity, and OpenRouter. Client function tools remain supported on adapters
+> that translate or transparently pass them; the Bedrock adapter does not yet
+> translate tool use. Strict Bedrock admission currently accepts only
+> catalogued commercial Claude model/profile IDs whose global or geographic
+> price is derivable from the ID; region-priced Nova/Titan models remain
+> available to advisory/pass-through traffic. Direct OpenAI strict calls are
+> pinned to `service_tier: "default"`; advisory policies retain the gateway's broader
+> transparent-proxy surface.
 
-> **An unknown model is priced high, not rejected.** A model id the catalog does
-> not know is estimated at the catalog's *maximum* published rate (today $15/$60
-> per 1M), tagged as an assumption, and logged once per distinct id. It is
-> reserved at that rate too, so it cannot consume cap headroom it will later be
+> **An unknown model is priced high, not rejected.** A model id the compiled
+> Rust pricing table does not know is estimated at that runtime table's maximum
+> input/output rates (today $15/$75 per 1M), tagged as an assumption, and logged
+> once per distinct id. It is reserved at that rate too, so it cannot consume
+> cap headroom it will later be
 > billed for. The gateway does not refuse unrecognized model ids — it is a
 > pass-through proxy, and doing so would break every provider model launch. To
 > refuse calls you cannot meter, set `failClosed: true` on a `cost_cap`: that
 > blocks an unpriceable model, per policy rather than globally.
 
-> **Costs are estimates, not billing.** The pricing table
-> (`src/policy/pricing.rs`) models standard per-token rates and documented
-> long-context tiers. It does **not** model cached input, cache writes, batch
-> discounts, or per-request tool/search fees, so a cap on a cache-heavy or
-> tool-heavy workload will read low. Do not treat these figures as an invoice.
+> **Costs are policy estimates, not billing.** The catalog models uncached
+> input/output, published cache-read and cache-write rates, long-context tiers,
+> known per-request tool fees, and supported Anthropic geo/fast multipliers. A
+> declared Anthropic cache breakpoint reserves the first-write premium; omitted
+> eligible geo reserves the possible 1.1x US premium; Opus 5/4.8 fast mode
+> reserves 2x, or 2.2x with US geo. A usage dimension the provider reports but
+> the catalog cannot price is charged at a conservative bound and marked
+> incomplete. Batch discounts, negotiated rates, taxes, and later provider
+> changes can still differ. OpenAI Fast/Priority and regional-processing
+> premiums are not modeled; strict direct-OpenAI admission pins the default
+> service tier, while advisory traffic can still differ. Bedrock Claude
+> direct/geographic inference uses the documented 1.1x
+> token/cache rate while an explicit `global.` profile uses the global rate.
+> Strict admission rejects other Bedrock model families until `x-aws-region`
+> is carried through reservation and settlement; AWS publishes materially
+> different Nova rates by source Region.
+> Do not treat these figures as an invoice; see the
+> [versioned pricing and accounting guide](docs/PRICING.md).
 
 > **A configured guard never degrades to a silent pass-through.** Half-applied
 > credentials (one of `NOVEUM_API_KEY` / `NOVEUM_GUARD_PROJECT_ID`), empty
@@ -336,7 +371,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "x-provider: groq" \
   -H "Authorization: Bearer your-groq-api-key" \
   -d '{
-    "model": "llama2-70b-4096",
+    "model": "openai/gpt-oss-20b",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true,
     "max_tokens": 300
@@ -351,7 +386,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "x-provider: anthropic" \
   -H "Authorization: Bearer your-anthropic-api-key" \
   -d '{
-    "model": "claude-3-5-sonnet-20241022",
+    "model": "claude-sonnet-5",
     "messages": [{"role": "user", "content": "Write a poem"}],
     "stream": true,
     "max_tokens": 1024
@@ -384,7 +419,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "x-provider: together" \
   -H "Authorization: Bearer your-together-api-key" \
   -d '{
-    "model": "meta-llama/Llama-2-7b-chat-hf",
+    "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     "messages": [{"role": "user", "content": "Write a poem"}],
     "stream": true,
     "max_tokens": 512,
@@ -397,7 +432,14 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ## SDK Compatibility
 
-The Noveum AI Gateway is designed to work seamlessly with popular AI SDKs. You can use the official OpenAI SDK to interact with any supported provider by simply configuring the baseURL and adding the appropriate provider header.
+The gateway exposes an OpenAI Chat Completions interface. You can use an official
+OpenAI SDK with supported providers by changing the base URL, provider header,
+and provider API key. Provider-specific translations are necessarily a subset of
+the OpenAI schema; for Anthropic's exact request, streaming, tool, and error
+contract, read the [Anthropic provider guide](docs/providers/anthropic.md).
+That adapter validates cost-affecting cache, geo, speed, fallback, and
+model-specific sampling fields before Nova Guard admission. It supports client
+function tools, not Anthropic-managed server/MCP tools.
 
 ### Using with OpenAI's Official Node.js SDK
 
@@ -419,7 +461,7 @@ const chatCompletion = await openai.chat.completions.create({
     { role: "system", content: "Write a poem" },
     { role: "user", content: "" }
   ],
-  model: "llama-3.1-8b-instant",
+  model: "openai/gpt-oss-20b",
   temperature: 1,
   max_tokens: 100,
   top_p: 1,
@@ -492,7 +534,7 @@ curl --location 'https://gateway.noveum.ai/v1/chat/completions' \
   --header 'Content-Type: application/json' \
   --header 'x-provider: groq' \
   --data '{
-    "model": "llama-3.1-8b-instant",
+    "model": "openai/gpt-oss-20b",
     "messages": [
         {
             "role": "user",

@@ -135,6 +135,17 @@ struct CostCapPolicy {
     config: CostCapConfig,
 }
 
+/// One canonical scope predicate for both predictive evaluation and the
+/// strict-mode requirement for a provider-enforced output bound.
+fn cost_cap_applies_to_model(cc: &CostCapPolicy, model: &str) -> bool {
+    cc.config.scope_to_models.as_ref().is_none_or(|scope| {
+        scope.is_empty()
+            || scope
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(model))
+    })
+}
+
 /// A rate-limit policy (handled via live-state).
 struct RateLimitPolicy {
     meta: PolicyMeta,
@@ -512,6 +523,49 @@ impl PolicyEngine {
             .any(|cc| cc.config.enforcement_mode == CostEnforcementMode::Strict)
     }
 
+    /// Does this model need an explicit provider-enforced completion budget for
+    /// a cost cap that the supplied deployment override routes through atomic
+    /// admission?
+    ///
+    /// This is deliberately narrower than "does admission run": the Worker
+    /// also routes rate limits through the platform, and a rate-only policy
+    /// must not acquire the strict cost-cap requirement for an explicit output
+    /// budget.  Conversely, a deployment-wide `strict` override routes an
+    /// otherwise advisory cap through admission and must receive the same hard
+    /// cap semantics as a self-declared strict cap.
+    pub fn requires_explicit_output_limit(
+        &self,
+        model: &str,
+        override_mode: Option<CostEnforcementMode>,
+    ) -> bool {
+        let model = model.to_ascii_lowercase();
+        self.state.load().cost_caps.iter().any(|cc| {
+            resolve_strict(
+                override_mode,
+                cc.config.enforcement_mode == CostEnforcementMode::Strict,
+            ) && cc.meta.mode == PolicyMode::Enforce
+                && cc.config.action.is_block()
+                && cost_cap_applies_to_model(cc, &model)
+        })
+    }
+
+    /// Does an enforcing/blocking strict cap require a JSON request whose
+    /// provider-side input can be bounded before admission?
+    ///
+    /// Unlike [`Self::requires_explicit_output_limit`], this cannot filter by
+    /// model scope: a multipart/binary request has no trustworthy parsed model
+    /// with which to prove it is out of scope. Rejecting that opaque shape is
+    /// safer than silently bypassing a cap the operator configured as strict.
+    pub fn requires_bounded_json_input(&self, override_mode: Option<CostEnforcementMode>) -> bool {
+        self.state.load().cost_caps.iter().any(|cc| {
+            resolve_strict(
+                override_mode,
+                cc.config.enforcement_mode == CostEnforcementMode::Strict,
+            ) && cc.meta.mode == PolicyMode::Enforce
+                && cc.config.action.is_block()
+        })
+    }
+
     /// The decision to apply when platform **admission** could not be evaluated.
     ///
     /// Considers **exactly the caps that were routed through admission**, by
@@ -805,16 +859,14 @@ impl PolicyEngine {
         live_state: Option<&LiveState>,
     ) -> PolicyDecision {
         // Out-of-scope models pass.
-        if let Some(scope) = &cc.config.scope_to_models {
-            if !scope.is_empty() && !scope.iter().any(|m| m.to_lowercase() == model) {
-                return PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
-            }
+        if !cost_cap_applies_to_model(cc, model) {
+            return PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
         }
 
-        // A model with no pricing entry can never advance the cost counters (its
-        // usage reports $0), so this cap could never trip on it. For a
-        // fail-closed policy that means "cannot meter" → block; fail-open
-        // policies keep allowing (advisory behavior).
+        // A model with no pricing entry has only the conservative assumed rate,
+        // not a provider-published rate. For a fail-closed policy that means
+        // "cannot meter exactly" → block; fail-open policies keep allowing while
+        // reservation and settlement use the non-zero assumption.
         if cc.meta.fail_closed && crate::policy::pricing::lookup(model).is_none() {
             let mut d = PolicyDecision::allow(&cc.meta.id, &cc.meta.name, "cost_cap", cc.meta.mode);
             d.flagged = true;
@@ -1193,6 +1245,16 @@ mod tests {
             !unset_mode_fail_closed.has_strict_cost_cap(),
             "the cap must be advisory for this test to reproduce the bug"
         );
+        assert!(unset_mode_fail_closed
+            .requires_explicit_output_limit("gpt-4o", Some(CostEnforcementMode::Strict)));
+        assert!(
+            unset_mode_fail_closed.requires_bounded_json_input(Some(CostEnforcementMode::Strict))
+        );
+        assert!(!unset_mode_fail_closed
+            .requires_explicit_output_limit("gpt-4o", Some(CostEnforcementMode::Advisory)));
+        assert!(!unset_mode_fail_closed
+            .requires_bounded_json_input(Some(CostEnforcementMode::Advisory)));
+        assert!(!unset_mode_fail_closed.requires_explicit_output_limit("gpt-4o", None));
 
         let forced = unset_mode_fail_closed
             .admission_unavailable_decision("503", Some(CostEnforcementMode::Strict))
@@ -1228,11 +1290,51 @@ mod tests {
             "config":{"window":"30d_rolling","maxUsd":100000.0,"action":"block","enforcementMode":"strict"}}]}"#,
         );
         assert!(self_declared_strict.has_strict_cost_cap());
+        assert!(self_declared_strict.requires_explicit_output_limit("gpt-4o", None));
+        assert!(self_declared_strict.requires_bounded_json_input(None));
+        assert!(!self_declared_strict
+            .requires_explicit_output_limit("gpt-4o", Some(CostEnforcementMode::Advisory)));
         let by_policy = self_declared_strict
             .admission_unavailable_decision("503", None)
             .expect("a self-declared strict cap is considered with no override");
         assert!(by_policy.is_blocking());
         assert_eq!(by_policy.policy_id, "strict-cap");
+
+        let rate_only = backed_engine(
+            r#"{"policies":[{"name":"rate","type":"rate_limit","mode":"enforce",
+            "config":{"windows":[{"period":"1m","maxRequests":5,"action":"block"}]}}]}"#,
+        );
+        assert!(
+            !rate_only.requires_explicit_output_limit("gpt-4o", Some(CostEnforcementMode::Strict)),
+            "a strict deployment override must not turn a rate-only policy into a cost cap"
+        );
+        assert!(!rate_only.requires_bounded_json_input(Some(CostEnforcementMode::Strict)));
+
+        let scoped = backed_engine(
+            r#"{"policies":[{"name":"scoped","type":"cost_cap","mode":"enforce",
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block",
+            "enforcementMode":"strict","scopeToModels":["GPT-4O"]}}]}"#,
+        );
+        assert!(scoped.requires_explicit_output_limit("gpt-4o", None));
+        assert!(
+            scoped.requires_bounded_json_input(None),
+            "a non-JSON request cannot prove that it falls outside model scope"
+        );
+        assert!(
+            !scoped.requires_explicit_output_limit("claude-sonnet-5", None),
+            "a model outside scope must not be rejected"
+        );
+
+        let shadow = backed_engine(
+            r#"{"policies":[{"name":"shadow","type":"cost_cap","mode":"shadow",
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block",
+            "enforcementMode":"strict"}}]}"#,
+        );
+        assert!(
+            !shadow.requires_explicit_output_limit("gpt-4o", None),
+            "shadow mode must never turn into an active 400"
+        );
+        assert!(!shadow.requires_bounded_json_input(None));
     }
 
     /// The override widens *which* caps are considered, not what each one
@@ -1371,6 +1473,23 @@ mod tests {
             Some(&ls),
         );
         assert!(!r2.is_blocked());
+    }
+
+    #[test]
+    fn cost_cap_fail_closed_accepts_official_daybreak_aliases() {
+        let e = backed_engine(
+            r#"{"policies":[{"name":"budget","type":"cost_cap","mode":"enforce","failClosed":true,
+            "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block"}}]}"#,
+        );
+        let mut ls = LiveState::default();
+        ls.cost_usd_by_window.insert("30d_rolling".into(), 0.0);
+        for model in ["daybreak-blue-latest", "daybreak-red-latest"] {
+            let result = e.evaluate(Phase::Input, model, "hi", None, None, Some(&ls));
+            assert!(
+                !result.is_blocked(),
+                "{model} is an active priced alias and must not hit the unknown-model fail-closed branch"
+            );
+        }
     }
 
     #[test]

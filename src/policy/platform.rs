@@ -6,8 +6,8 @@
 //! [`LiveState`](crate::policy::rules::LiveState). This is the pure, shared
 //! mapping layer; the native HTTP fetch lives in [`crate::policy::remote`].
 //!
-//! Platform Phase 0 ships `COST_CAP` + `RATE_LIMIT` only, with modes
-//! `OFF`/`SHADOW`/`ENFORCE` and action `BLOCK`. The shapes are deliberately close
+//! Platform policy modes are `OFF`/`SHADOW`/`ENFORCE`, and actions use
+//! SCREAMING_SNAKE_CASE. The shapes are deliberately close
 //! to the gateway's: window keys (`1d_rolling`, …) and rate config field names
 //! (`period`/`maxRequests`/`maxTokens`) already match; only the enum *casing*
 //! (`ENFORCE`→`enforce`, `BLOCK`→`block`) differs.
@@ -31,9 +31,12 @@ pub const PROJECT_ID_VAR: &str = "NOVEUM_GUARD_PROJECT_ID";
 /// other's spelling of the variable.
 pub const TENANCY_VAR: &str = "NOVEUM_GUARD_TENANCY";
 
-fn map_action(_action: &str) -> &'static str {
-    // Platform Phase 0 only defines BLOCK; map everything to the gateway's `block`.
-    "block"
+fn map_action(action: &str) -> String {
+    // Preserve the action's semantics. In particular, FLAG_ONLY must never be
+    // promoted to BLOCK: doing so turns an observe-only policy into an outage.
+    // Unknown future values stay unknown after casing normalization, so bundle
+    // parsing rejects them instead of silently granting them BLOCK semantics.
+    action.trim().to_ascii_lowercase()
 }
 
 /// Lowercase the `action` enum(s) inside a platform policy config so it parses as
@@ -270,6 +273,50 @@ mod tests {
         let rejected = engine.rejected_policies();
         assert_eq!(rejected.len(), 1, "{rejected:?}");
         assert!(rejected[0].contains("prompt_injection"), "{rejected:?}");
+    }
+
+    #[test]
+    fn preserves_every_platform_action_instead_of_promoting_it_to_block() {
+        for (platform_action, gateway_action) in [
+            ("ALLOW", "allow"),
+            ("BLOCK", "block"),
+            ("REDACT", "redact"),
+            ("MASK", "mask"),
+            ("HASH", "hash"),
+            ("REPLACE", "replace"),
+            ("FLAG_ONLY", "flag_only"),
+        ] {
+            assert_eq!(
+                map_action(platform_action),
+                gateway_action,
+                "platform action {platform_action} changed semantics during translation"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_flag_only_cost_cap_is_rejected_instead_of_promoted_to_block() {
+        let platform = json!({"policies": [{
+            "policyId": "p",
+            "name": "invalid observe-only cap",
+            "type": "COST_CAP",
+            "mode": "ENFORCE",
+            "enabled": true,
+            "config": {
+                "window": "1d_rolling",
+                "maxUsd": 10.0,
+                "action": "FLAG_ONLY",
+                "enforcementMode": "STRICT"
+            }
+        }]});
+        let bundle =
+            translate_bundle(&platform).expect("the outer policy bundle remains parseable");
+        let engine = PolicyEngine::from_bundle(&bundle, EngineOptions::default());
+
+        assert_eq!(engine.active_policy_count(), 0);
+        let rejected = engine.rejected_policies();
+        assert_eq!(rejected.len(), 1, "{rejected:?}");
+        assert!(rejected[0].contains("invalid config"), "{rejected:?}");
     }
 
     #[test]

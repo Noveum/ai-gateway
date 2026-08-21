@@ -68,7 +68,6 @@ pub trait Provider: Send + Sync {
 
 // Use pub instead of mod to make the modules and their contents public
 pub mod anthropic;
-pub mod anthropic_stream;
 pub mod bedrock;
 pub mod fireworks;
 pub mod groq;

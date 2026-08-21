@@ -7,16 +7,18 @@
 //! from Anthropic's `usage.input_tokens`/`output_tokens` and priced via the
 //! shared table.
 
-use super::anthropic_stream;
 use super::utils::log_tracking_headers;
 use super::Provider;
+use crate::anthropic_stream;
 use crate::error::AppError;
-use crate::routing::transform_anthropic_to_openai_format;
+use crate::routing::{
+    authorization_bearer_token, openai_to_anthropic_messages, transform_anthropic_to_openai_format,
+};
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     http::{HeaderValue, Response},
 };
 use chrono;
@@ -43,9 +45,13 @@ impl Default for AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new() -> Self {
-        Self {
-            base_url: "https://api.anthropic.com".to_string(),
-        }
+        let base_url = crate::routing::normalize_base_url(
+            std::env::var(crate::routing::ANTHROPIC_BASE_URL_VAR)
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+        Self { base_url }
     }
 }
 
@@ -74,6 +80,55 @@ impl Provider for AnthropicProvider {
         // Log tracking headers for observability
         log_tracking_headers(original_headers);
 
+        // Preserve upstream feature flags, tracing, and explicitly supplied
+        // custom headers. Strip transport/auth headers (rebuilt below) and
+        // gateway-internal tenancy/guard metadata so it cannot leak upstream.
+        // RFC 9110 also lets `Connection` name additional hop-by-hop fields;
+        // collect those names before discarding the header itself.
+        let connection_tokens = original_headers
+            .get_all(http::header::CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        for (name, value) in original_headers {
+            let name_str = name.as_str();
+            let skip = matches!(
+                name_str,
+                "host"
+                    | "content-length"
+                    | "content-encoding"
+                    | "accept-encoding"
+                    | "connection"
+                    | "transfer-encoding"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "proxy-connection"
+                    | "te"
+                    | "trailer"
+                    | "upgrade"
+                    | "authorization"
+                    | "x-api-key"
+                    | "content-type"
+                    | "anthropic-version"
+                    | "x-provider"
+                    | "x-project-id"
+                    | "x-organization-id"
+                    | "x-organisation-id"
+                    | "x-user-id"
+                    | "x-experiment-id"
+                    | "cookie"
+            ) || name_str.starts_with("x-noveum-")
+                || name_str.starts_with("x-aws-")
+                || connection_tokens.iter().any(|token| token == name_str);
+            if !skip {
+                headers.append(name.clone(), value.clone());
+            }
+        }
+
         // Add content type
         headers.insert(
             http::header::CONTENT_TYPE,
@@ -86,13 +141,20 @@ impl Provider for AnthropicProvider {
             http::header::HeaderValue::from_static("2023-06-01"),
         );
 
-        // Process authentication
-        if let Some(auth) = original_headers
+        // Accept the OpenAI SDK's Bearer convention and Anthropic's native
+        // x-api-key convention. Never forward an arbitrary Authorization
+        // scheme as an Anthropic key.
+        let bearer_key = original_headers
             .get("authorization")
             .and_then(|h| h.to_str().ok())
-        {
-            debug!("Converting Bearer token to x-api-key format");
-            let api_key = auth.trim_start_matches("Bearer ");
+            .and_then(authorization_bearer_token);
+        let native_key = original_headers
+            .get("x-api-key")
+            .and_then(|h| h.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(api_key) = bearer_key.or(native_key) {
+            debug!("Forwarding Anthropic API key as x-api-key");
             headers.insert(
                 http::header::HeaderName::from_static("x-api-key"),
                 http::header::HeaderValue::from_str(api_key).map_err(|_| {
@@ -106,6 +168,12 @@ impl Provider for AnthropicProvider {
         }
 
         Ok(headers)
+    }
+
+    async fn prepare_request_body(&self, body: Bytes) -> Result<Bytes, AppError> {
+        let request: Value = serde_json::from_slice(&body)?;
+        let request = openai_to_anthropic_messages(request).map_err(AppError::RequestError)?;
+        Ok(Bytes::from(serde_json::to_vec(&request)?))
     }
 
     async fn process_response(&self, response: Response<Body>) -> Result<Response<Body>, AppError> {
@@ -164,6 +232,8 @@ impl Provider for AnthropicProvider {
             // errors / truncation as a visible `event: error` frame instead of a
             // clean EOF that would look like a complete response.
             debug!("Transforming Anthropic event stream to OpenAI chunk format");
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            parts.headers.remove(http::header::CONTENT_ENCODING);
             let body = anthropic_stream::transform_body(body, chrono::Utc::now().timestamp());
             return Ok(Response::from_parts(parts, body));
         }
@@ -255,6 +325,8 @@ impl Provider for AnthropicProvider {
             }
 
             // Return the modified response
+            parts.headers.remove(http::header::CONTENT_LENGTH);
+            parts.headers.remove(http::header::CONTENT_ENCODING);
             return Ok(Response::from_parts(
                 parts,
                 Body::from(serde_json::to_vec(&transformed_response)?),
@@ -281,41 +353,42 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
 
         // Extract usage data
         if let Some(usage) = response_body.get("usage") {
+            let as_u32_saturating = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
             // Check for input tokens (Anthropic uses "prompt_tokens")
             metrics.input_tokens = usage
                 .get("prompt_tokens")
                 .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
+                .map(as_u32_saturating)
                 .or_else(|| {
                     usage
                         .get("input_tokens")
                         .and_then(|v| v.as_u64())
-                        .map(|v| v as u32)
+                        .map(as_u32_saturating)
                 });
 
             // Check for output tokens (Anthropic uses "completion_tokens")
             metrics.output_tokens = usage
                 .get("completion_tokens")
                 .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
+                .map(as_u32_saturating)
                 .or_else(|| {
                     usage
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
-                        .map(|v| v as u32)
+                        .map(as_u32_saturating)
                 });
 
             // Get total tokens directly if available
             metrics.total_tokens = usage
                 .get("total_tokens")
                 .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
+                .map(as_u32_saturating);
 
             // If total_tokens isn't available directly, calculate it from input and output
             if metrics.total_tokens.is_none() {
                 // Calculate total tokens if both input and output tokens are available
                 if let (Some(input), Some(output)) = (metrics.input_tokens, metrics.output_tokens) {
-                    metrics.total_tokens = Some(input + output);
+                    metrics.total_tokens = Some(input.saturating_add(output));
                 }
                 // If only one is available, use that as the total
                 else if metrics.input_tokens.is_some() {
@@ -330,12 +403,21 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
         if let Some(model) = response_body.get("model").and_then(|v| v.as_str()) {
             metrics.model = model.to_string();
 
-            // Cost via the shared dual-rate pricing table.
-            if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
-                let cost = crate::policy::pricing::estimate_cost(&metrics.model, i, o);
-                if cost > 0.0 {
-                    metrics.cost = Some(cost);
-                }
+            // Use the same detailed pricing path as NovaGuard settlement so
+            // cache writes/reads, data residency, server tools, and unbilled
+            // pre-output refusals cannot disagree with telemetry.
+            if let Some(usage) =
+                crate::policy::pricing::parse_usage(&metrics.model, "anthropic", response_body)
+            {
+                metrics.input_tokens = Some(usage.total_input_tokens());
+                metrics.output_tokens = Some(usage.output_tokens);
+                metrics.total_tokens = Some(
+                    usage
+                        .total_input_tokens()
+                        .saturating_add(usage.output_tokens),
+                );
+                metrics.cost =
+                    Some(crate::policy::pricing::price_usage(&metrics.model, &usage).total_usd);
             }
         }
 
@@ -394,7 +476,7 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
                         if let Some(input_tokens) = usage
                             .get("input_tokens")
                             .and_then(|v| v.as_u64())
-                            .map(|v| v as u32)
+                            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
                         {
                             metrics.input_tokens = Some(input_tokens);
 
@@ -415,7 +497,7 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
                     .get("usage")
                     .and_then(|u| u.get("output_tokens"))
                     .and_then(|t| t.as_u64())
-                    .map(|t| t as u32);
+                    .map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
                 if let Some(output) = output_tokens {
                     metrics.output_tokens = Some(output);
@@ -426,7 +508,7 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
 
                     // Calculate total tokens + cost (dual-rate via shared table).
                     let input = input_tokens.unwrap_or(0);
-                    metrics.total_tokens = Some(input + output);
+                    metrics.total_tokens = Some(input.saturating_add(output));
                     let cost = crate::policy::pricing::estimate_cost(&metrics.model, input, output);
                     if cost > 0.0 {
                         metrics.cost = Some(cost);
@@ -435,7 +517,7 @@ impl MetricsExtractor for AnthropicMetricsExtractor {
                         "Final streaming metrics - input: {}, output: {}, total: {}",
                         input,
                         output,
-                        input + output
+                        input.saturating_add(output)
                     );
 
                     return Some(metrics);
@@ -486,12 +568,171 @@ mod tests {
     }
 
     #[test]
+    fn process_headers_accepts_native_anthropic_x_api_key() {
+        let p = AnthropicProvider::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-ant-native".parse().unwrap());
+        let out = p.process_headers(&headers).unwrap();
+        assert_eq!(out.get("x-api-key").unwrap(), "sk-ant-native");
+        assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
+    }
+
+    #[test]
+    fn process_headers_forwards_anthropic_features_and_tracing_without_internal_headers() {
+        let p = AnthropicProvider::new();
+        let mut headers = hdr(Some("Bearer sk-ant-xyz"));
+        headers.insert(
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14".parse().unwrap(),
+        );
+        headers.insert(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-provider", "anthropic".parse().unwrap());
+        headers.insert("x-project-id", "internal-project".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic secret".parse().unwrap());
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("x-noveum-future-internal", "private".parse().unwrap());
+        headers.insert("connection", "x-remove-me".parse().unwrap());
+        headers.insert("x-remove-me", "hop-by-hop".parse().unwrap());
+
+        let out = p.process_headers(&headers).unwrap();
+        assert_eq!(
+            out.get("anthropic-beta").unwrap(),
+            "interleaved-thinking-2025-05-14"
+        );
+        assert!(out.get("traceparent").is_some());
+        assert!(out.get("x-provider").is_none());
+        assert!(out.get("x-project-id").is_none());
+        assert!(out.get("proxy-authorization").is_none());
+        assert!(out.get("upgrade").is_none());
+        assert!(out.get("x-noveum-future-internal").is_none());
+        assert!(out.get("x-remove-me").is_none());
+    }
+
+    #[test]
     fn process_headers_missing_auth_errors() {
         let p = AnthropicProvider::new();
         assert!(matches!(
             p.process_headers(&hdr(None)),
             Err(AppError::MissingApiKey)
         ));
+    }
+
+    #[tokio::test]
+    async fn prepare_request_body_uses_the_shared_anthropic_normalizer() {
+        let p = AnthropicProvider::new();
+        let input = json!({
+            "model": "claude-sonnet-4-5",
+            "max_completion_tokens": 64,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "messages": [
+                {"role": "developer", "content": "Be concise"},
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+
+        let bytes = p
+            .prepare_request_body(axum::body::Bytes::from(serde_json::to_vec(&input).unwrap()))
+            .await
+            .unwrap();
+        let forwarded: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(forwarded["max_tokens"], 64);
+        assert_eq!(forwarded["system"], "Be concise");
+        assert_eq!(
+            forwarded["messages"],
+            json!([{"role": "user", "content": "Hello"}])
+        );
+        assert!(forwarded.get("max_completion_tokens").is_none());
+        assert!(forwarded.get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_request_body_returns_a_stable_client_error_for_invalid_messages() {
+        let p = AnthropicProvider::new();
+        let error = p
+            .prepare_request_body(axum::body::Bytes::from_static(br#"{"messages":42}"#))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::RequestError(message) if message == "messages must be an array"
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_request_body_rejects_mcp_and_server_tools_via_the_shared_preflight() {
+        let p = AnthropicProvider::new();
+        let cases = [
+            (
+                json!({
+                    "model": "claude-sonnet-5",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "mcp_servers": [{"type": "url", "url": "https://mcp.example"}]
+                }),
+                "mcp_servers",
+            ),
+            (
+                json!({
+                    "model": "claude-sonnet-5",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [{
+                        "type": "web_search_20250305",
+                        "name": "web_search",
+                        "input_schema": {"type": "object"}
+                    }]
+                }),
+                "web_search_20250305",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let error = p
+                .prepare_request_body(Bytes::from(serde_json::to_vec(&input).unwrap()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AppError::RequestError(message) if message.contains(expected)),
+                "the native provider hook must surface the shared {expected} rejection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transformed_response_drops_stale_length_and_encoding_headers() {
+        let p = AnthropicProvider::new();
+        let raw = json!({
+            "id": "msg_headers",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-5",
+            "content": [{"type":"text","text":"hello"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 2, "output_tokens": 1}
+        })
+        .to_string();
+        let response = Response::builder()
+            .status(200)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::CONTENT_LENGTH, raw.len().to_string())
+            .header(http::header::CONTENT_ENCODING, "gzip")
+            .body(Body::from(raw))
+            .unwrap();
+
+        let transformed = p.process_response(response).await.unwrap();
+        assert!(transformed
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .is_none());
+        assert!(transformed
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none());
     }
 
     #[test]
@@ -512,6 +753,45 @@ mod tests {
         // claude-sonnet-4-5 family: 3.0 in / 15.0 out per 1M
         let expected = (100.0 / 1e6) * 3.0 + (40.0 / 1e6) * 15.0;
         assert!((m.cost.unwrap() - expected).abs() < 1e-9);
+
+        let huge = AnthropicMetricsExtractor.extract_metrics(&json!({
+            "model": "claude-sonnet-5",
+            "usage": {"input_tokens": u64::MAX, "output_tokens": u64::MAX}
+        }));
+        assert_eq!(huge.input_tokens, Some(u32::MAX));
+        assert_eq!(huge.output_tokens, Some(u32::MAX));
+        assert_eq!(huge.total_tokens, Some(u32::MAX));
+
+        let detailed = json!({
+            "model": "claude-sonnet-5",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 50,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 10,
+                    "ephemeral_1h_input_tokens": 40
+                },
+                "inference_geo": "us"
+            }
+        });
+        let m = AnthropicMetricsExtractor.extract_metrics(&detailed);
+        assert_eq!(m.input_tokens, Some(180), "all disjoint input dimensions");
+        let usage =
+            crate::policy::pricing::parse_usage("claude-sonnet-5", "anthropic", &detailed).unwrap();
+        let expected = crate::policy::pricing::price_usage("claude-sonnet-5", &usage).total_usd;
+        assert!((m.cost.unwrap() - expected).abs() < 1e-12);
+
+        let refusal = AnthropicMetricsExtractor.extract_metrics(&json!({
+            "model": "claude-sonnet-5",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 0,
+                "unbilled_refusal": true
+            }
+        }));
+        assert_eq!(refusal.cost, Some(0.0));
     }
 
     /// The streamed usage must survive the Anthropic→OpenAI translation: the
@@ -520,7 +800,7 @@ mod tests {
     /// transformer emits being readable by the extractor.
     #[test]
     fn streamed_usage_reaches_the_metrics_extractor() {
-        use super::super::anthropic_stream::AnthropicStreamTransformer;
+        use crate::anthropic_stream::AnthropicStreamTransformer;
 
         let upstream = concat!(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_9\",\"model\":\"claude-sonnet-4-5-20250929\",\"usage\":{\"input_tokens\":100}}}\n\n",

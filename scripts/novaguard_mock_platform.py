@@ -22,14 +22,16 @@ Implements the project-scoped endpoints the gateway calls:
   POST /api/v1/projects/{id}/policies/reservations/{rid}/cancel   -> 202,
                                                       releases the hold
 
-plus a mock OpenAI-compatible provider (so the ALLOWED path can be exercised
-hermetically, with the gateway's OPENAI_BASE_URL pointed here):
+plus mock OpenAI and Anthropic providers (so the ALLOWED paths can be exercised
+hermetically, with the gateway's provider base-URL overrides pointed here):
 
   POST /v1/chat/completions                        -> 200 chat completion with a
                                                       configurable usage block,
                                                       or, for `"stream": true`,
                                                       an OpenAI-shaped SSE stream
                                                       ending in a usage frame
+  POST /v1/messages                                -> native Anthropic response
+                                                      or SSE, including tools
 
 Config via env:
   MOCK_PORT              (default 8787)
@@ -58,6 +60,19 @@ Config via env:
   MOCK_STREAM_COMPLETION_TOKENS  usage in the terminal SSE frame (default 4)
   MOCK_STREAM_NO_USAGE   omit the terminal usage frame, so the stream ends
                          without authoritative usage and must ABANDON (default 0)
+  MOCK_NO_POLICIES       return an empty effective policy set (default 0)
+  MOCK_POLICY_MODE       explicit policy mode: ENFORCE | SHADOW | OFF
+                         (default absent/null, which the platform treats as enforce)
+  MOCK_SCOPE_TO_MODELS   comma-separated cost-cap model scope (default absent)
+  MOCK_EXPAND_REDACT_WITH_LEN
+                         when positive, add an input REGEX_MATCH policy that
+                         replaces the literal `x` with this many `Y` bytes;
+                         used to prove admission measures the transformed body
+  MOCK_RESERVATION_LEASE_MS
+                         active-reservation lifetime before the mock admission
+                         service may reap it (default 900000, matching 15m)
+  MOCK_PROVIDER_DELAY_MS hold each mock provider request open for this many ms,
+                         making concurrent-client overlap observable (default 0)
 
 Every request is logged to stderr; received usage events are printed (and, when
 MOCK_EVENTS_FILE is set, appended as JSON lines so a test harness can assert on
@@ -98,6 +113,20 @@ STREAM_DELAY_MS = int(os.environ.get("MOCK_STREAM_DELAY_MS", "40"))
 STREAM_PROMPT_TOKENS = int(os.environ.get("MOCK_STREAM_PROMPT_TOKENS", "11"))
 STREAM_COMPLETION_TOKENS = int(os.environ.get("MOCK_STREAM_COMPLETION_TOKENS", "4"))
 STREAM_NO_USAGE = os.environ.get("MOCK_STREAM_NO_USAGE", "0").lower() in ("1", "true", "yes")
+NO_POLICIES = os.environ.get("MOCK_NO_POLICIES", "0").lower() in ("1", "true", "yes")
+PROVIDER_DELAY_MS = int(os.environ.get("MOCK_PROVIDER_DELAY_MS", "0"))
+POLICY_MODE = os.environ.get("MOCK_POLICY_MODE", "").strip().upper() or None
+SCOPE_TO_MODELS = [
+    model.strip()
+    for model in os.environ.get("MOCK_SCOPE_TO_MODELS", "").split(",")
+    if model.strip()
+]
+EXPAND_REDACT_WITH_LEN = int(os.environ.get("MOCK_EXPAND_REDACT_WITH_LEN", "0"))
+if EXPAND_REDACT_WITH_LEN < 0:
+    raise ValueError("MOCK_EXPAND_REDACT_WITH_LEN must be non-negative")
+RESERVATION_LEASE_MS = int(os.environ.get("MOCK_RESERVATION_LEASE_MS", "900000"))
+if RESERVATION_LEASE_MS <= 0:
+    raise ValueError("MOCK_RESERVATION_LEASE_MS must be positive")
 # cost_cap `enforcementMode`. STRICT selects platform-atomic admission, which is
 # also what makes an unavailable /admit fail CLOSED; unset/ADVISORY leaves the
 # cap on the in-process ledger, where a 503 from /admit is logged and the request
@@ -105,6 +134,32 @@ STREAM_NO_USAGE = os.environ.get("MOCK_STREAM_NO_USAGE", "0").lower() in ("1", "
 ENFORCEMENT_MODE = os.environ.get("MOCK_ENFORCEMENT_MODE", "").strip().upper()
 
 _lock = threading.Lock()
+_stats_lock = threading.Lock()
+
+# Request-level counters are deliberately separate from the mutable spend and
+# reservation state below. The Worker concurrency phase reads these through the
+# hermetic /__mock/stats endpoint after every waitUntil settlement has landed,
+# which lets it assert exact cardinality rather than infer success from one log
+# substring among interleaved request threads.
+_stats = {
+    "admitRequests": 0,
+    "admitNewAllowed": 0,
+    "admitBlocked": 0,
+    "admitReplayed": 0,
+    "reservationReaped": 0,
+    "providerOpenaiBuffered": 0,
+    "providerOpenaiStreaming": 0,
+    "providerAnthropicBuffered": 0,
+    "providerAnthropicStreaming": 0,
+    "providerInFlight": 0,
+    "providerMaxInFlight": 0,
+    "settlementRequests": 0,
+    "settlementCompleted": 0,
+    "settlementAbandoned": 0,
+    "settlementCancelled": 0,
+    "settlementIdempotent": 0,
+    "httpErrors": 0,
+}
 
 def _empty_scope():
     return {
@@ -122,6 +177,12 @@ for w in ("1d_rolling", "7d_rolling", "30d_rolling", "1mo_calendar"):
     _state["cost"][w] = _seed
     _org_state["cost"][w] = _seed + ORG_OTHER_USD
 
+COST_CAP_CONFIG = dict(
+    {"window": WINDOW, "maxUsd": MAX_USD, "action": "BLOCK"},
+    **({"enforcementMode": ENFORCEMENT_MODE} if ENFORCEMENT_MODE else {}),
+    **({"scopeToModels": SCOPE_TO_MODELS} if SCOPE_TO_MODELS else {}),
+)
+
 POLICIES = {
     "policies": [
         {
@@ -130,16 +191,34 @@ POLICIES = {
             "type": "COST_CAP",
             "enabled": True,
             "failClosed": FAIL_CLOSED,
-            "mode": None,  # deprecated/null on the real backend; gateway should still ENFORCE
+            # Deprecated/null on the real backend; gateway should still ENFORCE.
+            # The env switch exists only to exercise explicit SHADOW/OFF payloads.
+            "mode": POLICY_MODE,
             "priority": 10,
             "source": POLICY_SOURCE,
-            "config": dict(
-                {"window": WINDOW, "maxUsd": MAX_USD, "action": "BLOCK"},
-                **({"enforcementMode": ENFORCEMENT_MODE} if ENFORCEMENT_MODE else {}),
-            ),
+            "config": COST_CAP_CONFIG,
         }
     ]
 }
+if EXPAND_REDACT_WITH_LEN:
+    POLICIES["policies"].append({
+        "policyId": "pol_mock_expand_input",
+        "name": "E2E expand input before admission",
+        "type": "REGEX_MATCH",
+        "enabled": True,
+        "failClosed": True,
+        "mode": "ENFORCE",
+        "priority": 5,
+        "source": POLICY_SOURCE,
+        "config": {
+            "phase": "input",
+            "patterns": [{"name": "expand-x", "regex": "x"}],
+            "action": "REDACT",
+            "redactWith": "Y" * EXPAND_REDACT_WITH_LEN,
+        },
+    })
+if NO_POLICIES:
+    POLICIES = {"policies": []}
 # Derived from the policy CONTENT, not a constant. A fixed ETag makes the mock
 # answer 304 after a knob changes the policy set, so a gateway that already
 # fetched once keeps enforcing the previous configuration and the test silently
@@ -169,10 +248,70 @@ _reservation_seq = 0
 _reserved_usd = 0.0
 # Every settlement, in order, so a harness can assert on the sequence.
 _settlements = []
+# Every admission payload, in arrival order. These bodies contain only metering
+# metadata (never provider credentials or prompt text) and let the Worker E2E
+# assert the exact estimate sent across the platform boundary.
+_admit_bodies = []
+# The transformed-body phase compares the hold with the exact bytes Workerd
+# forwarded. This capture is intentionally exposed only by this hermetic test
+# double; production requests never pass through this script.
+_provider_openai_requests = []
 
 
 def log(*a):
     print("[mock-platform]", *a, file=sys.stderr, flush=True)
+
+
+def bump_stat(name):
+    with _stats_lock:
+        _stats[name] += 1
+
+
+def provider_started():
+    with _stats_lock:
+        _stats["providerInFlight"] += 1
+        _stats["providerMaxInFlight"] = max(
+            _stats["providerMaxInFlight"], _stats["providerInFlight"]
+        )
+
+
+def provider_finished():
+    with _stats_lock:
+        _stats["providerInFlight"] -= 1
+
+
+def stats_snapshot():
+    # Copy each independently locked structure rather than holding both locks at
+    # once. The endpoint is polled while requests are in flight, and avoiding a
+    # cross-lock order makes the test double incapable of deadlocking the load it
+    # is supposed to observe. The final assertion happens only at active == 0.
+    with _stats_lock:
+        counters = dict(_stats)
+    with _lock:
+        reservation_states = {
+            state: sum(1 for item in _reservations.values() if item["state"] == state)
+            for state in ("ACTIVE", "COMPLETED", "ABANDONED", "CANCELLED", "EXPIRED")
+        }
+        reservations_total = len(_reservations)
+        reserved_usd = _reserved_usd
+        settlement_records = len(_settlements)
+        admit_bodies = [dict(body) for body in _admit_bodies]
+        provider_openai_requests = [dict(item) for item in _provider_openai_requests]
+    return {
+        "counters": counters,
+        "reservations": {
+            "total": reservations_total,
+            "active": reservation_states["ACTIVE"],
+            "completed": reservation_states["COMPLETED"],
+            "abandoned": reservation_states["ABANDONED"],
+            "cancelled": reservation_states["CANCELLED"],
+            "expired": reservation_states["EXPIRED"],
+            "reservedUsd": reserved_usd,
+        },
+        "settlementRecords": settlement_records,
+        "admitBodies": admit_bodies,
+        "providerOpenaiRequests": provider_openai_requests,
+    }
 
 
 def record_event(event):
@@ -189,8 +328,43 @@ def _apply_cost(cost):
         _org_state["cost"][w] += cost
 
 
+def _reap_expired_reservations_locked(now_ms):
+    """Release expired ACTIVE holds exactly as the platform lease reaper does.
+
+    Caller holds `_lock`. The dedicated Worker deadline phase asserts this is
+    never needed for a request whose upstream is still live: the gateway must
+    abandon first, before the lease can expire underneath the provider call.
+    """
+    global _reserved_usd
+    for rid, reservation in _reservations.items():
+        if (
+            reservation["state"] == "ACTIVE"
+            and reservation["expiresAtMonotonicMs"] <= now_ms
+        ):
+            reservation["state"] = "EXPIRED"
+            _reserved_usd -= reservation["costUsd"]
+            if abs(_reserved_usd) < 1e-12:
+                _reserved_usd = 0.0
+            if _by_request.get(reservation["requestId"]) == rid:
+                del _by_request[reservation["requestId"]]
+            bump_stat("reservationReaped")
+            log(
+                "REAP reservation=%s requestId=%s after %dms lease"
+                % (rid, reservation["requestId"], RESERVATION_LEASE_MS)
+            )
+
+
+class ConcurrentHTTPServer(ThreadingHTTPServer):
+    # A 16-client phase fans out into state, admission, provider and settlement
+    # requests. The stdlib TCPServer backlog is only five; raising it prevents the
+    # test double itself from serializing or refusing the burst under test.
+    request_queue_size = 64
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body=None, headers=None):
+        if code >= 400:
+            bump_stat("httpErrors")
         self.send_response(code)
         for k, v in (headers or {}).items():
             self.send_header(k, v)
@@ -205,11 +379,17 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_GET(self):
+        if self.path == "/__mock/stats":
+            return self._send(200, stats_snapshot(), {"Cache-Control": "no-store"})
         if self.path.endswith("/policies/effective"):
             if self.headers.get("If-None-Match") == POLICIES_ETAG:
                 log("GET /effective -> 304 (unchanged)")
                 return self._send(304, headers={"ETag": POLICIES_ETAG})
-            log("GET /effective -> 200 (1 cost_cap, maxUsd=%s, failClosed=%s)" % (MAX_USD, FAIL_CLOSED))
+            if NO_POLICIES:
+                log("GET /effective -> 200 (no policies)")
+            else:
+                log("GET /effective -> 200 (%d policies, maxUsd=%s, failClosed=%s)"
+                    % (len(POLICIES["policies"]), MAX_USD, FAIL_CLOSED))
             return self._send(200, POLICIES, {"ETag": POLICIES_ETAG, "Cache-Control": "private, max-age=30"})
         if self.path.endswith("/policies/state"):
             if STATE_UNAVAILABLE:
@@ -266,32 +446,53 @@ class Handler(BaseHTTPRequestHandler):
         if "/policies/reservations/" in self.path:
             return self._handle_settlement(raw)
         if self.path.startswith("/v1/chat/completions"):
-            # Mock OpenAI provider: echo the model, fixed content, configurable usage.
-            try:
-                req = json.loads(raw or b"{}")
-            except Exception:
-                req = {}
-            model = req.get("model", "gpt-4o")
-            if req.get("stream") is True:
-                return self._stream_completion(req, model)
-            log("POST /v1/chat/completions (mock provider) model=%s -> 200" % model)
-            return self._send(200, {
-                "id": "chatcmpl-mock-e2e",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "mock completion"},
-                    "finish_reason": "stop",
-                }],
-                "usage": {
-                    "prompt_tokens": PROMPT_TOKENS,
-                    "completion_tokens": COMPLETION_TOKENS,
-                    "total_tokens": PROMPT_TOKENS + COMPLETION_TOKENS,
-                },
-            })
+            return self._with_provider(lambda: self._handle_openai(raw))
+        if self.path.startswith("/v1/messages"):
+            return self._with_provider(lambda: self._handle_anthropic(raw))
         return self._send(404, {"error": "not found"})
+
+    def _with_provider(self, handle):
+        provider_started()
+        try:
+            if PROVIDER_DELAY_MS:
+                time.sleep(PROVIDER_DELAY_MS / 1000.0)
+            return handle()
+        finally:
+            provider_finished()
+
+    def _handle_openai(self, raw):
+        # Mock OpenAI provider: echo the model, fixed content, configurable usage.
+        try:
+            req = json.loads(raw or b"{}")
+        except Exception:
+            req = {}
+        with _lock:
+            _provider_openai_requests.append({
+                "rawBytes": len(raw),
+                "body": req,
+            })
+        model = req.get("model", "gpt-4o")
+        if req.get("stream") is True:
+            bump_stat("providerOpenaiStreaming")
+            return self._stream_completion(req, model)
+        bump_stat("providerOpenaiBuffered")
+        log("POST /v1/chat/completions (mock provider) model=%s -> 200" % model)
+        return self._send(200, {
+            "id": "chatcmpl-mock-e2e",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "mock completion"},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": PROMPT_TOKENS,
+                "completion_tokens": COMPLETION_TOKENS,
+                "total_tokens": PROMPT_TOKENS + COMPLETION_TOKENS,
+            },
+        })
 
     # --- Admission ---------------------------------------------------------
 
@@ -306,6 +507,7 @@ class Handler(BaseHTTPRequestHandler):
             the gateway retries a 5xx/429 with the same key.
         """
         global _reservation_seq, _reserved_usd
+        bump_stat("admitRequests")
         if ADMIT_UNAVAILABLE:
             log("POST /admit -> 503 (GUARDRAIL_ADMISSION_UNAVAILABLE)")
             return self._send(503, {"message": "GUARDRAIL_ADMISSION_UNAVAILABLE"})
@@ -317,8 +519,12 @@ class Handler(BaseHTTPRequestHandler):
         request_id = str(req.get("requestId") or "")
         est = float(req.get("estimatedCostUsd", 0.0) or 0.0)
         with _lock:
+            _admit_bodies.append(dict(req))
+            now_ms = time.monotonic() * 1000
+            _reap_expired_reservations_locked(now_ms)
             existing = _by_request.get(request_id)
             if existing:
+                bump_stat("admitReplayed")
                 log("POST /admit -> 200 REPLAY reservation=%s requestId=%s" % (existing, request_id))
                 return self._send(200, {
                     "allowed": True,
@@ -331,6 +537,7 @@ class Handler(BaseHTTPRequestHandler):
             spent = _state["cost"][WINDOW]
             projected = spent + _reserved_usd + est
             if projected > MAX_USD:
+                bump_stat("admitBlocked")
                 log("POST /admit -> 200 BLOCKED (spent=%.6f reserved=%.6f est=%.6f projected=%.6f > cap %.6f)"
                     % (spent, _reserved_usd, est, projected, MAX_USD))
                 return self._send(200, {
@@ -350,9 +557,15 @@ class Handler(BaseHTTPRequestHandler):
 
             _reservation_seq += 1
             rid = "res_mock_%d" % _reservation_seq
-            _reservations[rid] = {"requestId": request_id, "costUsd": est, "state": "ACTIVE"}
+            _reservations[rid] = {
+                "requestId": request_id,
+                "costUsd": est,
+                "state": "ACTIVE",
+                "expiresAtMonotonicMs": now_ms + RESERVATION_LEASE_MS,
+            }
             _by_request[request_id] = rid
             _reserved_usd += est
+            bump_stat("admitNewAllowed")
             log("POST /admit -> 200 ALLOWED reservation=%s model=%s in=%s maxOut=%s est=$%.6f "
                 "pricingVersion=%s (held total $%.6f)"
                 % (rid, req.get("model"), req.get("estimatedInputTokens"),
@@ -378,6 +591,7 @@ class Handler(BaseHTTPRequestHandler):
             body = {}
         if endpoint not in ("complete", "abandon", "cancel"):
             return self._send(404, {"error": "unknown settlement endpoint %r" % endpoint})
+        bump_stat("settlementRequests")
 
         with _lock:
             res = _reservations.get(rid)
@@ -386,11 +600,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "unknown reservation"})
             if res["state"] != "ACTIVE":
                 # Settlement is idempotent per reservation: the gateway retries.
+                bump_stat("settlementIdempotent")
                 log("POST /reservations/%s/%s -> 202 (already %s, idempotent)" % (rid, endpoint, res["state"]))
                 return self._send(202, {"success": True, "idempotent": True})
 
             held = res["costUsd"]
             _reserved_usd -= held
+            # Estimates are floating-point in this test double. Concurrently
+            # adding/subtracting the same 16 holds can leave a ~1e-17 residue;
+            # canonicalize that arithmetic noise so "no active hold" is also
+            # represented as an exact zero in the observable ledger.
+            if abs(_reserved_usd) < 1e-12:
+                _reserved_usd = 0.0
             if endpoint == "complete":
                 # The real usage REPLACES the estimate. This is the number that
                 # proves the stream tee worked: it comes from the terminal SSE
@@ -398,6 +619,7 @@ class Handler(BaseHTTPRequestHandler):
                 actual = float(body.get("costUsd", 0.0) or 0.0)
                 _apply_cost(actual)
                 res["state"] = "COMPLETED"
+                bump_stat("settlementCompleted")
                 log("POST /reservations/%s/complete -> 202  in=%s out=%s model=%s cost=$%.8f "
                     "pricingVersion=%s (estimate was $%.8f, released; project total $%.8f)"
                     % (rid, body.get("inputTokens"), body.get("outputTokens"),
@@ -408,11 +630,13 @@ class Handler(BaseHTTPRequestHandler):
                 # so the conservative estimate STAYS applied.
                 _apply_cost(held)
                 res["state"] = "ABANDONED"
+                bump_stat("settlementAbandoned")
                 log("POST /reservations/%s/abandon -> 202  reason=%r (estimate $%.8f RETAINED)"
                     % (rid, body.get("reason"), held))
             else:
                 # Provably never reached the provider: release the hold.
                 res["state"] = "CANCELLED"
+                bump_stat("settlementCancelled")
                 log("POST /reservations/%s/cancel -> 202  reason=%r (estimate $%.8f released)"
                     % (rid, body.get("reason"), held))
             _settlements.append({"reservationId": rid, "endpoint": endpoint, "body": body})
@@ -467,12 +691,175 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
+    # --- Mock provider: Anthropic Messages --------------------------------
+
+    def _handle_anthropic(self, raw):
+        try:
+            req = json.loads(raw or b"{}")
+        except Exception:
+            req = {}
+        model = req.get("model", "claude-sonnet-5")
+        roles = [m.get("role") for m in req.get("messages", []) if isinstance(m, dict)]
+        tools = [t.get("name") for t in req.get("tools", []) if isinstance(t, dict)]
+        system = req.get("system", "")
+        if isinstance(system, list):
+            system = "|".join(
+                str(block.get("text", "")) for block in system if isinstance(block, dict)
+            )
+        forbidden_names = {
+            "accept-encoding",
+            "connection",
+            "content-encoding",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "x-hop-by-hop-e2e",
+        }
+        filtered_header_leaks = sorted({
+            name.lower()
+            for name in self.headers.keys()
+            if name.lower() in forbidden_names
+            or name.lower().startswith("x-noveum-")
+        })
+        api_key = self.headers.get("x-api-key")
+        api_key_marker = {
+            "sk-ant-test": "bearer-test",
+            "sk-ant-direct-test": "direct-test",
+        }.get(api_key, "present-other" if api_key else "absent")
+        log(
+            "POST %s (mock anthropic) model=%s stream=%s max_tokens=%r "
+            "max_completion_present=%s stream_options_present=%s roles=%s tools=%s "
+            "system=%r x_api_key=%s anthropic_beta=%r filtered_header_leaks=%r "
+            "x_api_key_marker=%s"
+            % (
+                self.path,
+                model,
+                req.get("stream") is True,
+                req.get("max_tokens"),
+                "max_completion_tokens" in req,
+                "stream_options" in req,
+                roles,
+                tools,
+                system,
+                bool(api_key),
+                self.headers.get("anthropic-beta"),
+                filtered_header_leaks,
+                api_key_marker,
+            )
+        )
+
+        if req.get("stream") is True:
+            bump_stat("providerAnthropicStreaming")
+            return self._stream_anthropic(req, model, tools)
+
+        bump_stat("providerAnthropicBuffered")
+        content = []
+        stop_reason = "end_turn"
+        if tools:
+            content.append({
+                "type": "tool_use",
+                "id": "toolu_weather_1",
+                "name": tools[0],
+                "input": {"city": "Paris"},
+            })
+            stop_reason = "tool_use"
+        else:
+            content.append({"type": "text", "text": "mock Claude completion"})
+        return self._send(200, {
+            "id": "msg_mock_buffered",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": stop_reason,
+            "usage": {
+                "input_tokens": STREAM_PROMPT_TOKENS,
+                "output_tokens": STREAM_COMPLETION_TOKENS,
+            },
+        }, {"request-id": "req_mock_anthropic"})
+
+    def _stream_anthropic(self, req, model, tools):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("request-id", "req_mock_anthropic_stream")
+        self.end_headers()
+
+        def event(kind, payload):
+            raw_event = "event: %s\ndata: %s\n\n" % (kind, json.dumps(payload))
+            # Deliberately split each SSE frame into awkward tiny writes. TCP is
+            # free to coalesce them, but this still exercises arbitrary transport
+            # boundaries in workerd instead of one pre-buffered response.
+            encoded = raw_event.encode()
+            for start in range(0, len(encoded), 3):
+                self.wfile.write(encoded[start:start + 3])
+                self.wfile.flush()
+
+        event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": "msg_mock_stream",
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "usage": {"input_tokens": STREAM_PROMPT_TOKENS, "output_tokens": 0},
+            },
+        })
+        if tools:
+            event("content_block_start", {
+                "type": "content_block_start",
+                "index": 4,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_weather_1",
+                    "name": tools[0],
+                    "input": {},
+                },
+            })
+            event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 4,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"},
+            })
+            event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 4,
+                "delta": {"type": "input_json_delta", "partial_json": "\"Paris\"}"},
+            })
+            event("content_block_stop", {"type": "content_block_stop", "index": 4})
+            stop_reason = "tool_use"
+        else:
+            event("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })
+            event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "mock Claude stream"},
+            })
+            event("content_block_stop", {"type": "content_block_stop", "index": 0})
+            stop_reason = "end_turn"
+        event("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": STREAM_COMPLETION_TOKENS},
+        })
+        event("message_stop", {"type": "message_stop"})
+
     def log_message(self, *a):
         pass  # quiet the default per-request stderr spam; we log our own lines
 
 
 if __name__ == "__main__":
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv = ConcurrentHTTPServer(("127.0.0.1", PORT), Handler)
     log("listening on http://127.0.0.1:%d  (maxUsd=%s window=%s seedUsd=%s failClosed=%s eventsFile=%r)"
         % (PORT, MAX_USD, WINDOW, _seed, FAIL_CLOSED, EVENTS_FILE))
     try:

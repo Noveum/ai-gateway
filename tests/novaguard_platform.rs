@@ -309,6 +309,7 @@ async fn middleware_blocks_over_cap_and_reports_blocked_event() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-provider-test")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -358,6 +359,7 @@ async fn middleware_allows_under_cap_and_reports_no_block() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-provider-test")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -409,6 +411,7 @@ async fn fail_closed_blocks_when_state_unavailable() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-provider-test")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -514,6 +517,7 @@ async fn pending_spend_blocks_concurrent_burst_near_cap() {
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-provider-test")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     };
@@ -576,6 +580,7 @@ async fn concurrent_burst_respects_max_requests_one() {
                     .method("POST")
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
+                    .header("authorization", "Bearer sk-provider-test")
                     .body(Body::from(body))
                     .unwrap();
                 let resp = app.oneshot(req).await.unwrap();
@@ -648,6 +653,7 @@ async fn cancellation_before_upstream_headers_does_not_leak_an_active_reservatio
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-provider-test")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
 
@@ -719,6 +725,7 @@ async fn explicit_include_usage_false_is_overridden_while_metering() {
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
             .header("x-provider", "openai")
+            .header("authorization", "Bearer sk-provider-test")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -775,6 +782,7 @@ async fn overflow_sized_max_tokens_is_rejected_with_400() {
         ("max_completion_tokens", json!(u64::MAX)),
         ("max_output_tokens", json!(u64::MAX)),
         ("max_tokens", json!(-1)),
+        ("max_tokens", json!(0)),
         ("max_tokens", json!(10_000_001u64)),
     ] {
         let mut body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
@@ -783,6 +791,7 @@ async fn overflow_sized_max_tokens_is_rejected_with_400() {
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-provider-test")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -809,6 +818,7 @@ async fn overflow_sized_max_tokens_is_rejected_with_400() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-provider-test")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -977,6 +987,7 @@ async fn state_503_is_unavailable_state_not_zero_usage() {
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-provider-test")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1132,6 +1143,7 @@ fn chat_request(body: &Value) -> Request<Body> {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-test")
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap()
 }
@@ -1237,6 +1249,587 @@ async fn strict_admission_reserves_then_completes_with_real_usage() {
 }
 
 #[tokio::test]
+async fn strict_admission_includes_declared_anthropic_cache_write_premium() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-cache-premium").await;
+    mount_settlement_ok(&server).await;
+
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(usage_handler))
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    for cache_control in [Value::Null, json!({"type": "ephemeral", "ttl": "1h"})] {
+        let mut body = json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 100,
+            "inference_geo": "global",
+            "messages": [{"role": "user", "content": "cache me"}]
+        });
+        if !cache_control.is_null() {
+            body["cache_control"] = cache_control;
+        }
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-provider", "anthropic")
+            .header("authorization", "Bearer sk-ant-test")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+    }
+
+    let admits = wait_for_path_suffix(&server, "/admit", 2, Duration::from_secs(5)).await;
+    assert_eq!(admits.len(), 2);
+    let plain = admits[0].1["estimatedCostUsd"].as_f64().unwrap();
+    let cached = admits[1].1["estimatedCostUsd"].as_f64().unwrap();
+    let input_tokens = admits[1].1["estimatedInputTokens"].as_u64().unwrap() as f64;
+    let expected_cached = (input_tokens / 1_000_000.0) * 4.0 + (100.0 / 1_000_000.0) * 10.0;
+    assert!((cached - expected_cached).abs() < 1e-12);
+    assert!(
+        cached > plain,
+        "1h cache miss must reserve its 2x input rate"
+    );
+}
+
+#[tokio::test]
+async fn strict_admission_counts_the_post_transform_full_json_body() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "res-full-input").await;
+    mount_settlement_ok(&server).await;
+
+    let bundle = PolicyBundle::from_json_str(&format!(
+        r#"{{"policies":[
+          {{"name":"strict","type":"cost_cap","mode":"enforce","config":{{
+            "window":"30d_rolling","maxUsd":100.0,"action":"block","enforcementMode":"strict"
+          }}}},
+          {{"name":"expand","type":"regex_match","mode":"enforce","config":{{
+            "phase":"input","patterns":[{{"name":"x","regex":"x"}}],
+            "action":"redact","redactWith":"{}"
+          }}}}
+        ]}}"#,
+        "Y".repeat(8_192)
+    ))
+    .unwrap();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(echo_handler))
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    let body = json!({
+        "model": "gpt-4o",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "x"}],
+        "tools": [{"type": "function", "function": {
+            "name": "lookup",
+            "description": "z".repeat(8_000),
+            "parameters": {"type": "object"}
+        }}]
+    });
+    let response = app.oneshot(chat_request(&body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let forwarded: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        forwarded["messages"][0]["content"].as_str().unwrap().len(),
+        8_192,
+        "the measured body must be the same expanded body forwarded upstream"
+    );
+
+    let admits = wait_for_path_suffix(&server, "/admit", 1, Duration::from_secs(5)).await;
+    let estimated = admits[0].1["estimatedInputTokens"].as_u64().unwrap();
+    let serialized = serde_json::to_vec(&forwarded).unwrap().len() as u64;
+    assert!(
+        estimated >= serialized + 4_096,
+        "strict admission reserved {estimated} tokens for a {serialized}-byte transformed body with tools"
+    );
+}
+
+#[tokio::test]
+async fn native_anthropic_preflight_rejects_mcp_and_server_tools_before_platform_or_provider() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+
+    // Advisory is deliberate: strict admission already rejects these shapes.
+    // The shared Anthropic converter must reject them for every stateful policy
+    // mode, before either native middleware or the Worker can create a hold or
+    // call the provider.
+    let bundle = translate_bundle(&json!({"policies":[{
+        "policyId":"pol_advisory","name":"Advisory cap","type":"COST_CAP",
+        "enabled":true,"failClosed":false,
+        "config":{"window":"1d_rolling","maxUsd":100.0,"action":"BLOCK",
+                  "enforcementMode":"ADVISORY"}
+    }]}))
+    .unwrap();
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits = upstream_hits.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    usage_handler().await
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    let cases = [
+        (
+            "mcp_servers",
+            "mcp_servers",
+            json!({
+                "model": "claude-sonnet-5",
+                "messages": [{"role": "user", "content": "hello"}],
+                "mcp_servers": [{"type": "url", "url": "https://mcp.example"}]
+            }),
+        ),
+        (
+            "server tool",
+            "web_search_20250305",
+            json!({
+                "model": "claude-sonnet-5",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "input_schema": {"type": "object"}
+                }]
+            }),
+        ),
+    ];
+
+    for (label, expected_error, body) in cases {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-provider", "anthropic")
+            .header("authorization", "Bearer sk-ant-test")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+        let response_body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&response_body).contains(expected_error),
+            "the client error must identify {label}"
+        );
+    }
+
+    assert_eq!(
+        upstream_hits.load(Ordering::SeqCst),
+        0,
+        "unsupported Anthropic tools must never reach the provider"
+    );
+    assert!(
+        wait_for_path_suffix(&server, "/state", 1, Duration::from_millis(100))
+            .await
+            .is_empty(),
+        "provider preflight must run before even the platform state read"
+    );
+    assert!(
+        wait_for_path_suffix(&server, "/admit", 1, Duration::from_millis(100))
+            .await
+            .is_empty(),
+        "provider preflight must run before admission"
+    );
+}
+
+#[tokio::test]
+async fn strict_cap_rejects_opaque_json_and_non_json_before_admission() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "must-not-be-created").await;
+
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits = upstream_hits.clone();
+    let response_hits = upstream_hits.clone();
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post({
+                let hits = hits.clone();
+                move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        usage_handler().await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post(move || {
+                let hits = response_hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    usage_handler().await
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    let base = || {
+        json!({
+            "model": "gpt-4o",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "bounded text"}]
+        })
+    };
+    for (field, value) in [
+        ("web_search_options", json!({"search_context_size": "high"})),
+        (
+            "mcp_servers",
+            json!([{"type": "url", "url": "https://mcp.example"}]),
+        ),
+        ("service_tier", json!("priority")),
+    ] {
+        let mut opaque = base();
+        opaque[field] = value;
+        let response = app.clone().oneshot(chat_request(&opaque)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+    }
+
+    let malformed = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-provider-test")
+        .body(Body::from("{not-json"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(malformed).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let multipart = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "multipart/form-data; boundary=test")
+        .header("authorization", "Bearer sk-provider-test")
+        .body(Body::from("--test\r\nopaque\r\n--test--\r\n"))
+        .unwrap();
+    let response = app.clone().oneshot(multipart).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let responses = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-provider-test")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4o",
+                "max_output_tokens": 64,
+                "input": "server-side state may expand this"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(responses).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    for provider in ["perplexity", "openrouter"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-provider", provider)
+            .header("authorization", "Bearer sk-provider-test")
+            .body(Body::from(serde_json::to_vec(&base()).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "{provider}"
+        );
+    }
+
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    assert!(
+        wait_for_path_suffix(&server, "/admit", 1, Duration::from_millis(100))
+            .await
+            .is_empty(),
+        "invalid strict input must not create a reservation"
+    );
+}
+
+/// A strict cost cap is only a hard cap when the reservation covers every
+/// token the provider can generate.  Reserving the 1,024-token fallback for an
+/// otherwise unbounded request leaves the provider free to emit far more and
+/// overshoot the cap, so strict admission must refuse such a request before it
+/// creates a reservation or reaches the provider. (The cached `/state` read may
+/// already have occurred; it is read-only.)
+#[tokio::test]
+async fn strict_cost_cap_requires_an_explicit_output_limit() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "must-not-be-created").await;
+    mount_settlement_ok(&server).await;
+
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits = upstream_hits.clone();
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    usage_handler().await
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let resp = app.oneshot(chat_request(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !resp.headers().contains_key("x-noveum-guard-blocked"),
+        "a malformed client request is not a policy-limit decision"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "missing_output_limit");
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("strict Nova Guard cost cap")));
+
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    assert!(
+        wait_for_path_suffix(&server, "/admit", 1, Duration::from_millis(100))
+            .await
+            .is_empty(),
+        "an unbounded request must be rejected before reserving"
+    );
+}
+
+#[tokio::test]
+async fn deterministic_provider_errors_are_rejected_before_admission_or_provider() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_usage_ok(&server).await;
+    mount_admit_allowed(&server, "must-not-be-created").await;
+    mount_settlement_ok(&server).await;
+
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits = upstream_hits.clone();
+    let bundle = translate_bundle(&strict_cost_cap_payload(100.0, true)).unwrap();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    usage_handler().await
+                }
+            }),
+        )
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    let invalid_body = json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 32,
+        "n": 2,
+        "messages": [{"role":"user","content":"hi"}]
+    });
+    let invalid_shape = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-provider", "anthropic")
+        .header("authorization", "Bearer sk-ant-test")
+        .body(Body::from(serde_json::to_vec(&invalid_body).unwrap()))
+        .unwrap();
+    let response = app.clone().oneshot(invalid_shape).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let invalid_auth = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-provider", "anthropic")
+        .header("authorization", "Basic c2VjcmV0")
+        .body(Body::from(
+            json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 32,
+                "messages": [{"role":"user","content":"hi"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(invalid_auth).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_openai_auth = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4o",
+                "max_tokens": 32,
+                "messages": [{"role":"user","content":"hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(missing_openai_auth).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let unsupported_provider = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-test")
+        .header("x-provider", "not-a-provider")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-4o",
+                "max_tokens": 32,
+                "messages": [{"role":"user","content":"hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(unsupported_provider).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let missing_bedrock_auth = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-provider", "bedrock")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "amazon.nova-micro-v1:0",
+                "max_tokens": 32,
+                "messages": [{"role":"user","content":"hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(missing_bedrock_auth).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let missing_model = json!({
+        "max_tokens": 32,
+        "messages": [{"role":"user","content":"hi"}]
+    });
+    let response = app
+        .clone()
+        .oneshot(chat_request(&missing_model))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let region_priced_nova = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-provider", "bedrock")
+        .header("x-aws-access-key-id", "AKIATEST")
+        .header("x-aws-secret-access-key", "secret")
+        .header("x-aws-region", "eu-south-1")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "amazon.nova-pro-v1:0",
+                "max_tokens": 32,
+                "messages": [{"role":"user","content":"hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(region_priced_nova).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["error"]["code"], "unsupported_strict_input");
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("source-region-aware pricing")));
+
+    let native_bedrock = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-provider", "bedrock")
+        .header("x-aws-access-key-id", "AKIATEST")
+        .header("x-aws-secret-access-key", "secret")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "amazon.nova-micro-v1:0",
+                "max_tokens": 32,
+                "messages": [{"role":"user","content":"hi"}],
+                "inferenceConfig": {"maxTokens": 100000}
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.oneshot(native_bedrock).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    assert!(
+        wait_for_path_suffix(&server, "/admit", 1, Duration::from_millis(100))
+            .await
+            .is_empty(),
+        "provider-local validation errors must not create a reservation"
+    );
+}
+
+#[tokio::test]
 async fn platform_block_is_provider_shaped_and_never_reaches_upstream() {
     let server = MockServer::start().await;
     mount_state_zero(&server).await;
@@ -1275,7 +1868,8 @@ async fn platform_block_is_provider_shaped_and_never_reaches_upstream() {
             guard_middleware,
         ));
 
-    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let body =
+        json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     assert!(
         resp.headers().contains_key("x-noveum-guard-blocked"),
@@ -1327,7 +1921,8 @@ async fn admission_503_fails_closed_and_fails_open_per_policy() {
                 guard_middleware,
             ));
 
-        let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+        let body =
+            json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
         let resp = app.oneshot(chat_request(&body)).await.unwrap();
         if fail_closed {
             assert!(
@@ -1361,7 +1956,8 @@ async fn a_stream_that_ends_without_usage_abandons_rather_than_completing() {
             guard_middleware,
         ));
 
-    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let body =
+        json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -1425,8 +2021,8 @@ async fn a_gateway_policy_block_after_admission_cancels_the_reservation() {
             guard_middleware,
         ));
 
-    let body =
-        json!({"model":"gpt-4o","messages":[{"role":"user","content":"the launchcodes are"}]});
+    let body = json!({"model":"gpt-4o","max_tokens":256,
+        "messages":[{"role":"user","content":"the launchcodes are"}]});
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     assert!(resp.headers().contains_key("x-noveum-guard-blocked"));
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
@@ -1473,7 +2069,8 @@ async fn a_retried_admit_reuses_the_same_request_id() {
             guard_middleware,
         ));
 
-    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let body =
+        json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "the retry must succeed");
     let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -1512,7 +2109,8 @@ async fn client_cancellation_mid_request_still_settles_the_reservation() {
             guard_middleware,
         ));
 
-    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let body =
+        json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
     let cancelled =
         tokio::time::timeout(Duration::from_millis(600), app.oneshot(chat_request(&body))).await;
     assert!(cancelled.is_err(), "the request must still be in flight");
@@ -1725,7 +2323,8 @@ async fn a_fail_open_request_that_was_never_reserved_is_still_metered_once() {
         .route("/v1/chat/completions", post(usage_handler))
         .layer(from_fn_with_state(gs, guard_middleware));
 
-    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let body =
+        json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     assert_eq!(
         resp.status(),
@@ -1789,7 +2388,8 @@ async fn a_platform_block_reports_no_usage_from_either_path() {
         .route("/v1/chat/completions", post(usage_handler))
         .layer(from_fn_with_state(gs, guard_middleware));
 
-    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let body =
+        json!({"model":"gpt-4o","max_tokens":256,"messages":[{"role":"user","content":"hi"}]});
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     assert!(resp.headers().contains_key("x-noveum-guard-blocked"));
     // The telemetry layer fires for a synthetic block too — flagged as one.
@@ -1830,7 +2430,8 @@ async fn a_strict_stream_is_metered_once_through_its_abandoned_reservation() {
         .route("/v1/chat/completions", post(sse_handler))
         .layer(from_fn_with_state(gs, guard_middleware));
 
-    let body = json!({"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]});
+    let body = json!({"model":"gpt-4o","stream":true,"max_tokens":256,
+        "messages":[{"role":"user","content":"hi"}]});
     let resp = app.oneshot(chat_request(&body)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -2214,6 +2815,7 @@ fn stream_request(model: &str, provider: &str, max_tokens: u64) -> Request<Body>
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
         .header("x-provider", provider)
+        .header("authorization", "Bearer test-provider-key")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
 }
@@ -2758,7 +3360,8 @@ fn tenant_request(key: Option<&str>, project: Option<&str>, org: Option<&str>) -
         .method("POST")
         .uri("/v1/chat/completions")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("x-provider", "openai");
+        .header("x-provider", "openai")
+        .header("authorization", "Bearer sk-provider-test");
     if let Some(k) = key {
         b = b.header(TENANT_CREDENTIAL_HEADER, k);
     }

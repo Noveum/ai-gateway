@@ -1,245 +1,229 @@
-# Deploying the Noveum AI Gateway on Cloudflare (Distributed Edge)
+# Cloudflare deployment architecture
 
-Research + migration plan for running the gateway as a globally‑distributed
-Cloudflare service. Current as of **June 2026**.
+Current as of **August 2026**.
 
-## TL;DR — chosen direction
+The repository ships two deployment shapes from the same Rust crate:
 
-**Primary: native Cloudflare Workers (Rust → WASM).** Containers add container
-cold‑start + higher cost and are not true per‑PoP, so they are **not** the fast
-path; we target the native Worker (V8 isolates, ~0 cold start, every PoP). We
-**keep the existing native binary + Docker image fully working** for self‑hosting
-(no Cloudflare Containers dependency), sharing **one Nova Guard engine** across
-both builds so they never diverge.
+| Shape | Runtime | Entry point | Typical use |
+|---|---|---|---|
+| Cloudflare Worker | Rust compiled to `wasm32-unknown-unknown`, executed by `workerd` | `src/worker_rt.rs` | Globally distributed edge proxy |
+| Native binary / Docker | Tokio + Axum on Linux or a host OS | `src/main.rs` | Self-hosting and native shared-tenancy deployments |
 
-| | **Native Worker (WASM)** — primary edge | **Native binary / Docker** — self‑host (kept) |
+The Nova Guard engine, pricing catalog, provider routing, Anthropic translation,
+and Bedrock request/response mapping are shared. The HTTP transports, runtime
+lifecycle, and supported tenancy modes are runtime-specific, so “one crate” does
+not mean every deployment option is identical.
+
+For operator commands and the platform-bridge runbook, use
+[CLOUDFLARE_WORKER.md](CLOUDFLARE_WORKER.md).
+
+## Current implementation status
+
+The Worker implementation includes:
+
+- `/health`, CORS, request-size limits, and `/v1/*` routing.
+- Transparent proxying for the OpenAI-compatible provider routes.
+- Anthropic OpenAI Chat Completions ↔ Messages translation for requests,
+  successful buffered responses, and successful SSE streams, including function
+  tool calls and terminal usage. Cache, `inference_geo`, and `speed` usage
+  survive both response paths for settlement. Client function tools are
+  supported; native Anthropic server/MCP tool definitions are not. The exact
+  subset is documented in [providers/anthropic.md](providers/anthropic.md).
+- Bedrock Converse conversion and SigV4 signing in pure Rust (`sha2` + `hmac`),
+  including temporary credentials through `x-aws-session-token` on the Worker.
+- Inline stateless Nova Guard policies.
+- Dedicated platform-managed Nova Guard: effective policies, project **and
+  organization** live counters, atomic admission, and reservation settlement.
+- Incremental stream metering without buffering. OpenAI-compatible SSE bytes pass
+  through; successful Anthropic SSE is translated to OpenAI chunks before it is
+  metered and returned.
+
+This document does not assert that the latest working tree is deployed on a
+production Cloudflare account. The reproducible PR evidence is:
+
+1. native formatting, lint, build, and hermetic tests;
+2. wasm compilation and `worker-build --release`;
+3. `wrangler deploy --dry-run`; and
+4. `scripts/novaguard_worker_e2e.sh`, a nine-phase suite running the generated
+   bundle in real local `workerd` against mock Noveum, OpenAI, and Anthropic
+   upstreams.
+
+The workerd suite covers `worker::Fetch`, policy/state/admission calls,
+`ctx.wait_until` settlement, incomplete streams, strict failure behavior,
+Anthropic tool-stream translation, mixed concurrent agents, and the matrix that
+selects which unbounded requests require a strict output limit. A real edge
+deployment and live-provider smoke test remain separate release activities.
+
+## Architecture
+
+```text
+client
+  |
+  v
+Cloudflare Worker (workerd / WASM)
+  |-- route, authenticate provider request, enforce body limit
+  |-- fetch/compile effective policy and read live state (when configured)
+  |-- provider preflight and optional atomic admission
+  |-- Nova Guard input evaluation/transforms
+  |-- provider adapter
+  |     |-- OpenAI-compatible: transparent HTTP/SSE proxy
+  |     |-- Anthropic: OpenAI request -> Messages; response/SSE -> OpenAI
+  |     `-- Bedrock: OpenAI request -> Converse + SigV4; response -> OpenAI
+  |-- Nova Guard buffered output phase (streaming output phase is skipped)
+  `-- reservation completion/abandon/cancel through ctx.wait_until
+```
+
+The Worker needs no provider secret at deployment time: provider credentials are
+supplied per request. Platform-managed Nova Guard does require a scoped
+`NOVEUM_API_KEY` secret and a fixed `NOVEUM_GUARD_PROJECT_ID`.
+
+## Runtime differences that matter
+
+| Concern | Cloudflare Worker | Native gateway |
 |---|---|---|
-| Runtime | V8 isolate, `wasm32-unknown-unknown` via `workers-rs` | Tokio + Axum + reqwest (today's binary) |
-| Distribution | **True per‑PoP edge**, 330+ cities, ~0 cold start | Wherever the operator runs it |
 | Outbound HTTP | `worker::Fetch` | `reqwest` |
-| Crypto (Bedrock SigV4) | **Web Crypto** (`crypto.subtle` HMAC‑SHA256) | `aws-sigv4` |
-| Token caps | heuristic / wasm‑safe tokenizer | `tiktoken-rs` |
-| Built from | the **same** `noveum-ai-gateway` crate (`--target wasm32 --no-default-features`) | the **same** crate (`cargo build`, default `native` feature) |
+| Server runtime | `workerd` isolate | Tokio + Axum |
+| Bedrock signing | Pure Rust `sha2` + `hmac`; accepts optional session token | Native AWS signing path; session-token parity is tracked separately |
+| Caller tenancy | Dedicated project only; `NOVEUM_GUARD_TENANCY=shared` is refused with 503 | Dedicated or shared, with tenant derived from `x-noveum-api-key` |
+| Local policy source | Inline Worker var/secret; filesystem paths are unavailable | Inline JSON or file |
+| Stateful inline policy | Inline `cost_cap` / `rate_limit` is refused with 503 because it has no backend | Without platform state, stateful rules fail open and warn |
+| Platform state | Dedicated policy fetch, project/org counters, admission, settlement | Dedicated or per-derived-tenant clients |
+| Deployment-wide cost-mode override | Not implemented; each policy's `enforcementMode` decides | `NOVEUM_GUARD_COST_ENFORCEMENT=strict\|advisory` |
+| Streaming | OpenAI-compatible pass-through; Anthropic translated incrementally; no output-phase Guard enforcement | Same protocol-level behavior through the native transport |
+| Telemetry export | No full native exporter; platform settlement is supported | Native telemetry plugins/exporters |
 
-**Shared core:** the Nova Guard engine (regex/PII/secrets/banned/model‑allowlist/
-json‑schema), pricing/cost, and provider base‑URL/path mapping live in one place
-and compile to **both** native and wasm32, so the edge Worker and the self‑hosted
-binary enforce identically.
+## Nova Guard correctness at the edge
 
-> Cloudflare **Containers** remain a documented fallback (run the same Docker
-> image) for anyone who wants the full native feature set without the WASM build —
-> but they are not the primary deployment.
+### Organization scope remains organization scope
 
-> Why not "just compile it to a Worker"? Cloudflare Workers run on V8 isolates and
-> execute Rust as **WebAssembly (`wasm32-unknown-unknown`)**. That environment has
-> **no threaded async runtime (no Tokio), no native sockets, no `reqwest`/`hyper`,
-> and no native crypto (`ring`/`aws-lc`)**. Our current stack is built on exactly
-> those. So a Worker port is a real engineering project, not a recompile.
+An organization-sourced `cost_cap` or `rate_limit` reads organization counters
+from the control plane's nested organization state. The Worker never substitutes
+project counters when organization state is absent. Missing state takes the
+policy's unavailable-state path: fail-closed blocks; fail-open allows with an
+explicit reason. Substituting project state would let every project spend the
+full organization allowance independently.
 
----
+### Strict cost caps require a real provider bound
 
-## Implementation status
+For the requested model, a `cost_cap` imposes the explicit-limit requirement
+only when all of these are true:
 
-**Phase 1 — DONE (single package, three targets).** The `noveum-ai-gateway` crate
-now compiles to `wasm32-unknown-unknown` as a Cloudflare Worker *and* to the
-native server, from one codebase:
-- Cargo deps split by target (`cfg(not(target_arch = "wasm32"))` = native server;
-  `cfg(target_arch = "wasm32")` = `worker`); the native binary is gated by a
-  `native` feature so the wasm build (`--no-default-features`) excludes it.
-- Native-only modules (`proxy`, `handlers`, `config`, `providers`, `telemetry`,
-  `error`, axum router) are `cfg`-gated; the **Nova Guard engine + pricing +
-  `routing`** are shared and compile to both.
-- `src/worker_rt.rs` is the `#[event(fetch)]` entry: `/health`, Nova Guard input
-  enforcement via the shared engine, and proxy of the OpenAI-compatible providers
-  via `worker::Fetch`.
-- **Verified locally in `workerd` (`wrangler dev`):** real OpenAI + Groq proxy and
-  the SSN block behave identically to the native server. Native: 166 unit + 10
-  integration tests green; clippy clean on **both** targets; `worker-build`
-  produces a deployable bundle.
+- `mode` is `enforce`;
+- `action` is `block`;
+- effective `enforcementMode` is `strict`; and
+- `scopeToModels` is empty/absent or contains the model (case-insensitive).
 
-See **[CLOUDFLARE_WORKER.md](CLOUDFLARE_WORKER.md)** for build/test/deploy steps.
+Such a request must include a positive `max_tokens`, `max_completion_tokens`, or
+`max_output_tokens` value no greater than 10,000,000. Otherwise the Worker
+returns HTTP 400 with `error.code: "missing_output_limit"` before `/admit` or the
+provider is called. Advisory, shadow, non-blocking, out-of-scope, and rate-only
+cases retain the configured assumed-output heuristic where an estimate is
+needed.
 
-**Phase 2 — DONE (verified live on the global edge).** Anthropic (path/auth
-transform + Anthropic→OpenAI response conversion), Nova Guard input redaction,
-Nova Guard output-phase enforcement (block + redact, with an 8 MB inspection
-cap), and SSE streaming pass-through all work on the edge with full parity to
-native. The request/response transforms (`apply_input_transforms`,
-`flatten_output_text`, `rewrite_output_text`, `transform_anthropic_to_openai_format`)
-are one shared codebase used by both targets — verified live against OpenAI,
-Groq, Gemini, and Anthropic on `noveum-ai-gateway.<account>.workers.dev`.
+Strict admission supports bounded JSON `/v1/chat/completions` only. It requires
+a non-empty model and messages array, estimates the post-transform serialized
+body, and rejects request shapes whose provider-side cost cannot be bounded:
+Responses/conversation state, images, files, audio, remote search, server/MCP
+tools, multi-choice `n`/`best_of`, Perplexity, and OpenRouter. Direct OpenAI
+requests are pinned to `service_tier: "default"`; premium tiers are rejected.
+Advisory policies keep the broader transparent-proxy compatibility surface.
 
-**Phase 3 — DONE (verified live).** **Bedrock** now runs on the edge: OpenAI →
-Bedrock Converse request, **AWS SigV4** signing implemented in pure Rust
-(`sha2`+`hmac` in `src/sigv4.rs`; simpler + more reliable than async Web Crypto,
-and unit-tested in native CI against RFC 4231), Converse→OpenAI response
-conversion, and **temporary-credential support** (`x-aws-session-token`) that the
-native path lacks. Verified live against `amazon.nova-micro-v1:0` with temporary
-STS credentials, including Nova Guard input block + redaction.
+Provider preflight also runs before `/admit`. For Anthropic it rejects invalid
+cache controls, geo, speed, mixed-model fallbacks, constrained-model sampling,
+and Sonnet 5 thinking/prefill. A valid strict reservation includes the entire
+estimated prompt at the longest declared cache-write TTL, a conservative 1.1x
+premium when eligible geo is omitted (or explicitly US-only), and the 2x Opus
+5/4.8 fast-mode premium. Fast plus US geo reserves 2.2x across all token/cache
+dimensions. The native gateway uses the same conversion and pricing functions.
 
-**All 13 providers now run on the edge. Remaining:** edge telemetry sink +
-Workers-KV policies; re-enable `wasm-opt`; (optional) add session-token support
-to the native Bedrock path for full parity.
+### Settlement is conservative
 
-## How Cloudflare runs code (the constraint that drives everything)
+Authoritative provider usage completes a reservation at actual token counts
+only when both input and output counts are present; explicit zero is valid.
+Converters do not fabricate a missing half as zero. A buffered or streaming
+response with missing/partial usage, a truncated stream, a client disconnect,
+or a body beyond the inspection limit abandons the reservation and leaves the
+estimate in place. A gateway policy block after admission cancels the
+reservation because the provider was provably not called. An Anthropic refusal
+before any output retains its usage counts but settles monetary cost to $0; a
+partial-output refusal is billed normally.
 
-- **Workers = V8 isolates.** Rust is supported via [`workers-rs`](https://github.com/cloudflare/workers-rs)
-  (`worker` crate, currently 0.8.x) compiled to `wasm32-unknown-unknown` with
-  `wrangler`. Async/await works, but there is **no Tokio runtime / no threads /
-  no `mio` / no `tokio::net` / no `tokio::time` multi‑thread**. `tokio::sync`
-  primitives are fine. Outbound HTTP must use **`worker::Fetch`** (the platform
-  fetch API), not `reqwest`/`hyper`. Crypto must use the **Web Crypto API**
-  (`crypto.subtle`), not `ring`/`aws-lc-rs`.
-- **Containers = real Linux containers** at the edge (GA since Apr 2026). Run **any
-  x86‑64 Docker image unmodified**, fronted by a Worker, placed in the optimal
-  location. Requires Workers Paid; billed per 10 ms of active CPU.
+An admitted Worker provider call, buffered body, or stream is bounded to 10
+minutes (`NOVEUM_GUARD_WORKER_UPSTREAM_TIMEOUT_MS` may lower but cannot raise
+that ceiling). At the deadline the Worker terminates the body and abandons the
+reservation conservatively. This guarantees an active Cloudflare stream cannot
+outlive the platform's 15-minute pending-reservation lease and have its hold
+reaped while the provider is still spending.
 
-### Relevant platform limits (Workers)
-- Memory: **128 MB hard**. CPU: **30 s default, 5 min hard** (per invocation).
-- Subrequests: **10,000** default now (was 1,000); free plan = 50 external. A
-  gateway makes ~1 upstream call/request, so this is a non‑issue.
-- **WASM bundle size** matters — large embedded data (e.g. tiktoken BPE tables)
-  risks the bundle/startup limits.
+## Reproducible toolchain
 
-Sources: see bottom.
+The repository and CI use a coherent Worker toolchain:
 
----
+| Tool | Pin |
+|---|---|
+| `worker`, `worker-macros`, `worker-sys` crates | `0.8.5` in `Cargo.lock` |
+| `worker-build` | `0.8.5` |
+| Wrangler | `4.120.0` |
+| Node.js in CI | `22` |
+| Crate MSRV | Rust `1.94.1` |
+| Docker builder | Rust `1.96` |
+| Worker compatibility date | `2026-08-01` |
 
-## Dependency reality check (this codebase → `wasm32-unknown-unknown`)
+Build output is `build/index_bg.wasm` plus the canonical `build/index.js` entry;
+`build/worker/shim.mjs` is only a compatibility alias. Use the exact pins rather
+than an arbitrary global `worker-build` or Wrangler installation:
 
-| Dependency / subsystem | On Workers (WASM)? | Action for a Worker port |
-|---|---|---|
-| `tokio` (features = full, rt-multi-thread) | ❌ pulls in `mio`/native net; won't compile | Drop the runtime; use the `worker` executor + `tokio` with only `sync`/`macros` if needed |
-| `reqwest` + `hyper` (proxy client) | ❌ not on Workers | Rewrite outbound calls with **`worker::Fetch`** |
-| `axum` (server) + `tower-http` | ⚠️ axum *routing* works via the `http` feature; server/compression do not | Use the `worker` router (or `axum` with `worker` http shim); drop `tower-http` compression |
-| `aws-sigv4` + `aws-credential-types` (Bedrock signing) | ❌ needs native crypto | **Reimplement SigV4 with Web Crypto** (HMAC‑SHA256 via `crypto.subtle`) |
-| `tiktoken-rs` (token_length_cap) | ⚠️ large embedded BPE + `fancy-regex`; bundle/wasm risk | Replace with a lightweight heuristic or a WASM‑safe tokenizer; or keep precise counts only on Containers |
-| `jsonschema` (json_schema policy) | ⚠️ verify wasm32 build | Test; swap for a wasm‑friendly validator if needed |
-| `regex`, `aho-corasick` | ✅ pure Rust | Keep (Nova Guard regex/banned/secrets/PII) |
-| `arc-swap`, `parking_lot`, `bytes`, `serde`, `serde_json`, `thiserror`, `futures(-util)`, `async-stream` | ✅ | Keep |
-| `chrono` (timestamps) | ⚠️ `now()` needs the wasm/js path | Use `worker::Date` or `js-sys::Date` for time |
-| `uuid` v4 | ⚠️ needs `getrandom` `js` feature on wasm | Add `getrandom = { features = ["js"] }` for wasm, or use `worker`/Web Crypto randomness |
-| `tracing-subscriber`, `colored`, `num_cpus`, `dotenv` | ❌ server/CLI only | Drop on Workers; log via `console_log!`/`worker` |
-| `aws_event_stream_parser` (Bedrock streaming) | ⚠️ parsing is pure but tied to the Bedrock path | Port with the Bedrock rewrite (or keep Bedrock on Containers) |
-
-**What ports cleanly:** the whole **Nova Guard deterministic engine** (regex,
-banned substrings, secrets, PII, model allowlist — all `regex`/`aho-corasick`),
-the **pricing/cost table**, and the request/response transform logic are pure
-Rust and are the easy, high‑value part to run at the edge.
-
-**What is hard:** the **proxy core** (`reqwest`→`worker::Fetch`, including
-streaming SSE pass‑through), **Bedrock SigV4** (→ Web Crypto), **tiktoken**
-(token caps), and **time/RNG** wasm features.
-
----
-
-## Recommended plan (phased)
-
-### Phase 0 — Decision + scaffolding
-- [ ] Confirm the target: Containers‑first (fast) vs Workers‑native (edge‑max) vs both.
-- [ ] Create a Cloudflare account on **Workers Paid** ($5/mo) — required for both
-      Containers and meaningful Workers usage.
-- [ ] Add `wrangler` + a `wrangler.toml` (or `.jsonc`) to the repo.
-
-### Phase 1 — Cloudflare Containers (fast global win, ~no code changes)
-- [ ] Reuse the existing `Dockerfile` (already builds a static `x86_64` binary on
-      `rust:1.96`). Ensure it binds `0.0.0.0:$PORT` (it does, via `HOST`/`PORT`).
-- [ ] Add a thin **Worker + Durable Object** front that routes incoming requests to
-      a `Container` binding (the standard Cloudflare Containers pattern).
-- [ ] Wire env/secrets (provider keys are passed per‑request via headers, so the
-      container itself needs little config beyond `NOVEUM_GUARD_*`).
-- [ ] Load‑test, confirm streaming pass‑through works through the Worker→Container hop.
-- [ ] **Outcome:** the full gateway (all 13 providers incl. Bedrock, full Nova
-      Guard) runs globally, unmodified. Trade‑off: container cold‑starts + higher
-      cost than isolates; not literally per‑PoP.
-
-### Phase 2 — Workers‑native core (the real edge play)
-**Implemented in the single `noveum-ai-gateway` crate via target gating** (NOT a
-separate/workspace crate): the wasm32 build (`src/worker_rt.rs`, compiled with
-`--no-default-features`) handles **all OpenAI‑compatible providers + Anthropic**
-(OpenAI, Groq, Together, Fireworks, Mistral, Cohere, Gemini, DeepSeek, xAI,
-OpenRouter, Perplexity, Anthropic — everything except Bedrock):
-- [ ] Scaffold with `worker` 0.8.x + `wrangler`; target `wasm32-unknown-unknown`.
-- [ ] **Router:** port the `/v1/*` + `/health` routes to the `worker` router.
-- [ ] **Proxy:** reimplement `proxy_request_to_provider` using `worker::Fetch`
-      (`base_url + transform_path(path) + query`, header passthrough, **streaming
-      response pass‑through** via `worker::Response` streaming).
-- [ ] **Nova Guard:** compile the existing `policy` engine to wasm32 (regex/PII/
-      secrets/banned/model‑allowlist all port directly). Replace `tiktoken-rs`
-      (token caps) with a heuristic or wasm‑safe tokenizer; verify/replace
-      `jsonschema`.
-- [ ] **Metrics:** keep per‑request token/cost extraction (pure); ship telemetry
-      via a Worker‑friendly path (e.g. a subrequest, Workers Analytics Engine, or
-      Queues) instead of the Tokio‑spawned exporter.
-- [ ] **Time/RNG:** `worker::Date`/`getrandom js` for timestamps + ids.
-- [ ] Optimize WASM bundle size (`wasm-opt`, `default-features = false`, strip).
-- [ ] **Outcome:** the most common providers run as true per‑PoP edge Workers
-      (instant cold start, cheapest, lowest latency worldwide).
-
-### Phase 3 — Bedrock on Workers (optional, hardest)
-- [ ] Reimplement **AWS SigV4** signing with **Web Crypto** (`crypto.subtle`
-      HMAC‑SHA256 chain) and port the Bedrock Converse request/response + event‑
-      stream transforms to `worker::Fetch`.
-- [ ] Until then, **route `x-provider: bedrock` to the Container** (a Worker can
-      fall back to the Container binding for providers not yet ported) — a clean
-      hybrid.
-
-### Phase 4 — State & distribution niceties (optional)
-- [ ] Hosted **Nova Guard policies** at the edge via **Workers KV** (replace the
-      local file/inline bundle; cache‑on‑read, global propagation) — this also
-      revives the deferred "hosted policies" idea without a custom control plane.
-- [ ] **Durable Objects** for any cross‑request state we later want (e.g. real
-      `rate_limit`/`cost_cap` counters — the live‑state seam already exists in the
-      engine).
-- [ ] Per‑PoP caching, WAF, and Cloudflare rate‑limiting in front.
-
----
-
-## Architecture (target hybrid)
-
-```
-            ┌──────────── Cloudflare global edge (330+ PoPs) ───────────┐
-client ───▶ │  Worker (WASM, workers-rs)                                │
-            │   • routes /v1/* + /health                                │
-            │   • Nova Guard (regex/PII/secrets/allowlist/json/token)   │
-            │   • OpenAI-compatible providers via worker::Fetch ────────┼──▶ OpenAI/Groq/…
-            │   • x-provider: bedrock ──▶ Container binding ────────────┼──▶ (Phase 1/3)
-            │   • policies from Workers KV; metrics via Analytics/Queue │
-            └───────────────────────────────────────────────────────────┘
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install worker-build --version 0.8.5 --locked --force
+worker-build --release
+npx --yes wrangler@4.120.0 deploy --dry-run
 ```
 
-## Concrete code-change checklist (Workers port)
+The compatibility date and Wrangler version should be reviewed together when
+upgrading. A newer package existing upstream is not, by itself, a reason to
+change a PR whose pinned build and dry-run pass.
 
-- `src/main.rs` → replace `#[tokio::main]` + `TcpListener` with a `#[event(fetch)]`
-  entry; drop the banner/`colored`/`num_cpus`.
-- `src/proxy/client.rs`, `src/proxy/mod.rs` → delete `reqwest`/`hyper`; implement
-  with `worker::Fetch` + `worker::Response` (incl. streaming).
-- `src/proxy/signing.rs` (`aws-sigv4`) → Web Crypto SigV4 (Phase 3) or container‑only.
-- `src/policy/rules/token_length_cap.rs` (`tiktoken-rs`) → heuristic/wasm tokenizer.
-- `src/telemetry/*` → replace Tokio‑spawned exporter with a Worker‑native sink.
-- `Cargo.toml` → wasm feature set: `default-features = false` everywhere; add
-  `worker`, `getrandom = { features=["js"] }`; gate native‑only deps behind a
-  `#[cfg(not(target_arch = "wasm32"))]` / Cargo feature so the **native binary
-  (Containers / `cargo install`) keeps working unchanged**.
+## Release verification
 
-> Keep both targets in one crate via features (`native` vs `worker`) so the
-> published crate + Docker/Container build stay intact while the Worker build is
-> added.
+Before deploying a release candidate:
 
-## Open questions / decisions for the team
-1. **Containers‑first, Workers‑first, or both?** (Recommendation: both, phased.)
-2. **Bedrock at the edge** worth the Web‑Crypto SigV4 rewrite, or keep on Containers?
-3. **Token caps** precision on Workers — heuristic acceptable, or required exact?
-4. **Telemetry sink** on Workers — Analytics Engine, Queues, or subrequest to Noveum?
-5. **Policy distribution** — move to Workers KV now (and retire the local‑file model at the edge)?
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --lib
+cargo test --test novaguard_platform
+cargo test --test policy_integration
+worker-build --release
+npx --yes wrangler@4.120.0 deploy --dry-run
+scripts/novaguard_worker_e2e.sh
+git diff --check
+```
 
-## Sources
-- [workers-rs (GitHub)](https://github.com/cloudflare/workers-rs)
-- [Cloudflare Workers — Rust language support](https://developers.cloudflare.com/workers/languages/rust/)
-- [Supported crates · Workers Rust](https://developers.cloudflare.com/workers/languages/rust/crates/)
-- [`worker` crate docs](https://docs.rs/worker/latest/worker/)
+Then perform an explicitly authorized staged deployment and smoke test with
+scoped credentials. At minimum verify `/health`, one buffered and one streaming
+OpenAI call, one buffered and one tool-streaming Anthropic call, an organization
+cap, a strict unbounded 400, and reservation settlement. Do not infer a live
+result from the hermetic suite.
+
+## Remaining work
+
+- Add a Worker-native telemetry sink (for example Analytics Engine or Queues).
+- Add Workers KV policy loading if globally distributed stateless bundles are a
+  requirement; this release reads Worker vars/secrets, not KV.
+- Re-enable `wasm-opt` after preserving panic recovery and bundle checks.
+- Decide whether the native Bedrock path should accept temporary credentials for
+  parity with the Worker.
+- Add an authorized staged-deployment smoke workflow if the organization wants a
+  repeatable live edge gate separate from hermetic PR CI.
+
+## Primary sources
+
+- [Cloudflare Workers Rust support](https://developers.cloudflare.com/workers/languages/rust/)
+- [workers-rs v0.8.5 release](https://github.com/cloudflare/workers-rs/releases/tag/v0.8.5)
+- [Wrangler 4.120.0 release](https://github.com/cloudflare/workers-sdk/releases/tag/wrangler%404.120.0)
+- [Wrangler installation and updates](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
+- [Worker compatibility dates](https://developers.cloudflare.com/workers/configuration/compatibility-dates/)
 - [Workers platform limits](https://developers.cloudflare.com/workers/platform/limits/)
-- [Workers are no longer limited to 1000 subrequests (Feb 2026)](https://developers.cloudflare.com/changelog/post/2026-02-11-subrequests-limit/)
-- [Cloudflare Containers — product](https://www.cloudflare.com/products/containers/)
-- [Cloudflare Containers — pricing](https://developers.cloudflare.com/containers/pricing/)
-- [workers-rs issue #736 — wasm compile (mio/getrandom) pitfalls](https://github.com/cloudflare/workers-rs/issues/736)
-- [Making Rust Workers reliable (Cloudflare blog)](https://blog.cloudflare.com/making-rust-workers-reliable/)
+- [Anthropic Messages API](https://platform.claude.com/docs/en/api/messages/create)
+- [Anthropic streaming protocol](https://platform.claude.com/docs/en/build-with-claude/streaming)

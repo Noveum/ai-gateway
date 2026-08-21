@@ -1,173 +1,143 @@
-# AWS Bedrock Provider Integration
+# AWS Bedrock provider
 
-## Overview
-The AWS Bedrock provider enables seamless access to AWS's AI models through an OpenAI-compatible interface. This means you can use your existing OpenAI SDK code and simply point it to our gateway - no code changes required!
+The Bedrock adapter accepts OpenAI-shaped **text chat-completions** requests and
+converts them to the AWS Bedrock Converse API. Buffered Converse responses and
+AWS EventStream responses are converted back to OpenAI chat-completions/SSE
+shapes.
 
-## Configuration
+This is not full OpenAI feature parity. In particular, OpenAI `tools`,
+`tool_calls`, multimodal parts, and provider-native Bedrock request extensions
+are not currently translated by this adapter. Use text messages only; tool-use
+conversion is tracked as follow-up work.
 
-### Headers
-```bash
-x-aws-access-key-id: your_access_key
-x-aws-secret-access-key: your_secret_key
-x-aws-region: us-east-1  # Optional
+## Authentication
+
+Send these headers to the gateway:
+
+```text
 x-provider: bedrock
+x-aws-access-key-id: <access key>
+x-aws-secret-access-key: <secret key>
+x-aws-region: us-east-1
 ```
 
-## IAM Setup
+`x-aws-region` defaults to `us-east-1`. The Cloudflare Worker also accepts
+`x-aws-session-token` for temporary credentials. The native adapter does not
+yet have session-token parity.
 
-1. Create a new IAM Policy:
+Grant the credentials only the model resources they need. The minimum runtime
+actions are normally:
+
 ```json
 {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "bedrock:InvokeModel",
-                "bedrock:InvokeModelWithResponseStream"
-            ],
-            "Resource": "*"
-        }
-    ]
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream"
+    ],
+    "Resource": "<foundation-model-or-inference-profile-arn>"
+  }]
 }
 ```
 
-2. Create a new IAM Role:
-   - Go to IAM Console
-   - Click "Roles" → "Create role"
-   - Select "AWS service" and "Bedrock"
-   - Attach the policy created above
-   - Name the role (e.g., "bedrock-gateway-role")
+## Request mapping
 
-3. Create an IAM User:
-   - Go to IAM Console
-   - Click "Users" → "Add user"
-   - Enable programmatic access
-   - Attach the policy created above
-   - Save the access key and secret key
+The adapter currently maps:
 
-## Model Activation
+| OpenAI chat field | Bedrock Converse field |
+|---|---|
+| `messages[].role/content` (text) | `messages[].role/content[].text` |
+| `system` messages | top-level `system[].text` |
+| `max_tokens`, `max_completion_tokens`, or `max_output_tokens` | `inferenceConfig.maxTokens` |
+| `temperature` | `inferenceConfig.temperature` |
+| `top_p` | `inferenceConfig.topP` |
+| `stop` | `inferenceConfig.stopSequences` |
+| `stream: true` | Converse Stream + OpenAI SSE translation |
 
-Before using any model, you need to enable it in your AWS Console:
+Under an enforcing strict NovaGuard cost cap, output-limit aliases must agree,
+the body must be bounded JSON `/v1/chat/completions`, and provider-native fields
+such as `inferenceConfig` are rejected before admission. This keeps the amount
+reserved by NovaGuard tied to the request that Bedrock receives.
 
-1. Go to AWS Bedrock Console
-2. Navigate to "Model access"
-3. Click "Manage model access"
-4. Select the models you want to use
-5. Click "Request model access"
+## Example
 
-## Examples
-
-### Using OpenAI SDK
-```typescript
-import OpenAI from 'openai';
-
-const openai = new OpenAI({
-  baseURL: 'http://localhost:3000/v1',
-  defaultHeaders: {
-    'x-provider': 'bedrock',
-    'x-aws-access-key-id': 'YOUR_ACCESS_KEY',
-    'x-aws-secret-access-key': 'YOUR_SECRET_KEY',
-    "x-aws-region": process.env.AWS_REGION,
-  }
-});
-
-// Use exactly like OpenAI!
-const response = await openai.chat.completions.create({
-  model: 'anthropic.claude-3-sonnet-20240229-v1:0',
-  messages: [{ role: 'user', content: 'Hello!' }]
-});
-```
-
-### Using Curl
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-provider: bedrock" \
-  -H "x-aws-access-key-id: YOUR_ACCESS_KEY" \
-  -H "x-aws-secret-access-key: YOUR_SECRET_KEY" \
+curl http://localhost:3000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'x-provider: bedrock' \
+  -H 'x-aws-access-key-id: YOUR_ACCESS_KEY' \
+  -H 'x-aws-secret-access-key: YOUR_SECRET_KEY' \
+  -H 'x-aws-region: us-east-1' \
   -d '{
-    "model": "anthropic.claude-3-sonnet-20240229-v1:0",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "model": "amazon.nova-micro-v1:0",
+    "max_tokens": 64,
+    "messages": [{"role": "user", "content": "Reply with one sentence."}]
   }'
 ```
 
-## Supported Models
+The exact model must be enabled for the AWS account and callable from the
+selected source Region. Model availability is account- and Region-specific, so
+the gateway does not claim that every model listed by AWS is enabled for every
+deployment.
 
-### AI21 Labs Models
-| Model Name | Model ID | Regions | Capabilities | Streaming |
-|------------|----------|---------|--------------|-----------|
-| Jamba 1.5 Large | ai21.jamba-1-5-large-v1:0 | us-east-1 | Text, Chat | Yes |
-| Jamba 1.5 Mini | ai21.jamba-1-5-mini-v1:0 | us-east-1 | Text, Chat | Yes |
-| Jamba-Instruct | ai21.jamba-instruct-v1:0 | us-east-1 | Text, Chat | Yes |
+## Claude inference-profile pricing
 
-### Amazon Titan Models
-| Model Name | Model ID | Regions | Capabilities | Streaming |
-|------------|----------|---------|--------------|-----------|
-| Titan Text G1 - Express | amazon.titan-text-express-v1 | Multiple | Text, Chat | Yes |
-| Titan Text G1 - Lite | amazon.titan-text-lite-v1 | Multiple | Text | Yes |
-| Titan Text G1 - Premier | amazon.titan-text-premier-v1:0 | us-east-1 | Text | Yes |
-| Titan Text Large | amazon.titan-tg1-large | us-east-1, us-west-2 | Text | Yes |
+The catalog stores the published **global** Bedrock Claude rates. For the
+catalogued Claude 4.5 models, NovaGuard applies the documented 1.1x token/cache
+multiplier to direct and geography-scoped model IDs, while an explicitly
+`global.` inference profile remains at the global rate.
 
-### Anthropic Models
-| Model Name | Model ID | Regions | Capabilities | Streaming |
-|------------|----------|---------|--------------|-----------|
-| Claude 2.1 | anthropic.claude-v2:1 | Multiple | Text, Chat | Yes |
-| Claude 2 | anthropic.claude-v2 | Multiple | Text, Chat | Yes |
-| Claude 3.5 Haiku | anthropic.claude-3-5-haiku-20241022-v1:0 | Multiple | Text, Chat | Yes |
+Recognized forms include:
 
-### Cohere Models
-| Model Name | Model ID | Regions | Capabilities | Streaming |
-|------------|----------|---------|--------------|-----------|
-| Command Light | cohere.command-light-text-v14 | us-east-1, us-west-2 | Text | Yes |
-| Command R+ | cohere.command-r-plus-v1:0 | us-east-1, us-west-2 | Text, Chat | Yes |
-| Command R | cohere.command-r-v1:0 | us-east-1, us-west-2 | Text, Chat | Yes |
-| Command | cohere.command-text-v14 | us-east-1, us-west-2 | Text | Yes |
+```text
+anthropic.claude-sonnet-4-5-20250929-v1:0
+us.anthropic.claude-sonnet-4-5-20250929-v1:0
+global.anthropic.claude-sonnet-4-5-20250929-v1:0
+arn:aws:bedrock:us-east-1:123456789012:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0
+```
 
-### Meta Models
-| Model Name | Model ID | Regions | Capabilities | Streaming |
-|------------|----------|---------|--------------|-----------|
-| Llama 3 8B Instruct | meta.llama3-8b-instruct-v1:0 | Multiple | Text, Chat | Yes |
-| Llama 3 70B Instruct | meta.llama3-70b-instruct-v1:0 | Multiple | Text, Chat | Yes |
-| Llama 3.1 8B Instruct | meta.llama3-1-8b-instruct-v1:0 | Multiple | Text, Chat | Yes |
-| Llama 3.2 1B Instruct | meta.llama3-2-1b-instruct-v1:0 | Multiple | Text, Chat | Yes |
+Commercial AWS system-defined inference-profile ARNs are normalized only when
+the backing catalog model can be identified from the ARN. Application
+inference-profile ARNs and non-commercial AWS-partition ARNs are not assigned a
+commercial rate; NovaGuard keeps them unpriced/assumed, and a `failClosed` cost
+cap rejects them rather than guessing.
 
-### Mistral AI Models
-| Model Name | Model ID | Regions | Capabilities | Streaming |
-|------------|----------|---------|--------------|-----------|
-| Mistral 7B Instruct | mistral.mistral-7b-instruct-v0:2 | Multiple | Text | Yes |
-| Mixtral 8x7B Instruct | mistral.mixtral-8x7b-instruct-v0:1 | Multiple | Text | Yes |
+Under an enforcing strict cost cap, this catalogued commercial Claude set is
+the complete Bedrock pricing surface. Amazon Nova, Titan, and other Bedrock
+families remain available for ordinary/advisory proxying, but strict requests
+receive HTTP 400 `unsupported_strict_input` before `/admit`. AWS publishes
+source-Region-specific Nova prices (the public 2026-08-20 price list, for
+example, prices Nova Pro in `eu-south-1` at $1.28/M input and $5.21/M output,
+versus the catalog's $0.80/$3.20 global row). The gateway cannot make that hold
+exact until the validated `x-aws-region` is threaded into both reservation and
+settlement.
 
-> Note: All models need to be enabled in your AWS Bedrock Console before use. See the [Model Activation](#model-activation) section for setup instructions.
+## Streaming and settlement
 
-## Error Handling
+Bedrock's `application/vnd.amazon.eventstream` response is preserved until the
+Bedrock decoder has reassembled complete AWS frames. The adapter then emits
+separate OpenAI SSE events and a final `[DONE]`. NovaGuard reads the native
+`inputTokens`, `outputTokens`, `cacheReadInputTokens`, and
+`cacheWriteInputTokens` counters before the OpenAI response conversion so a
+strict reservation settles across every reported token/cache dimension.
 
-| Error Code | Description | Solution |
-|------------|-------------|----------|
-| 401 | Invalid AWS credentials | Check AWS access key and secret |
-| 403 | Insufficient permissions | Verify IAM permissions |
-| 404 | Model not found | Enable model in AWS Console |
-| 429 | Rate limit exceeded | Check AWS quotas |
+## Known limitations
 
-## Best Practices
+- OpenAI function/tool definitions and Bedrock `toolUse`/`toolResult` blocks are
+  not translated yet.
+- Multimodal Converse content is not exposed by the current OpenAI adapter.
+- Native temporary-session credential support is not yet at Worker parity.
+- A live Bedrock provider call still requires credentials and model entitlement;
+  the repository's hermetic tests cover signing, conversion, fragmented AWS
+  EventStream reassembly, SSE framing, and usage settlement without an AWS bill.
 
-1. **Security**
-   - Use IAM roles with minimum required permissions
-   - Rotate access keys regularly
-   - Never commit credentials to code
+## References
 
-2. **Performance**
-   - Choose the closest AWS region
-   - Implement proper error handling and retries
-   - Monitor usage and costs
-
-3. **Model Selection**
-   - Enable models before use
-   - Verify model availability in your region
-   - Consider model-specific pricing
-
-## Additional Resources
-
-- [AWS Bedrock Documentation](https://docs.aws.amazon.com/bedrock)
-- [IAM Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html)
-- [Bedrock Pricing](https://aws.amazon.com/bedrock/pricing/) 
+- [AWS Bedrock pricing](https://aws.amazon.com/bedrock/pricing/)
+- [AWS public Bedrock price list](https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonBedrock/current/index.json)
+- [Bedrock Converse API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html)
+- [Global cross-Region inference](https://docs.aws.amazon.com/bedrock/latest/userguide/global-cross-region-inference.html)
+- [Regional availability and model ID forms](https://docs.aws.amazon.com/bedrock/latest/userguide/models-region-compatibility.html)
+- [IAM best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html)

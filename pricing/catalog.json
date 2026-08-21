@@ -1,5 +1,5 @@
 {
-	"version": "2026.08.12",
+  "version": "2026.08.21",
 	"units": "USD per 1,000,000 tokens",
 	"notes": [
 		"SINGLE SOURCE OF TRUTH for LLM rates. The gateway's Rust table (src/policy/pricing_catalog.rs) and the platform's TypeScript table (packages/telemetry/src/pricing/generated/index.ts) are hand-maintained copies of these rows. Edit this file first, then mirror the same change into both tables by hand.",
@@ -9,8 +9,8 @@
 		"Gemini charges cached content as storage per hour rather than per written token; no response field reports that time, so it is out of scope for per-request costing and cacheWritePer1m is 0.0.",
 		"legacy: true marks rows carried over verbatim from the platform's pre-catalog table. Their base rates are unverified and they carry no cache dimensions."
 	],
-	"authoritativeCostProviders": [],
-	"authoritativeCostNote": "Providers whose response body carries a BILLED total in USD that the gateway may trust in place of its own arithmetic. Empty as of 2026-08-12: no provider in this catalog returns one. Perplexity explicitly disclaims the figure it does return ('Estimate only. Final cost is metered from each response's usage field'), so it is not listed. The code path exists and is tested; add a provider id here only with a documentation link proving the field is authoritative.",
+  "authoritativeCostProviders": ["xai", "grok"],
+  "authoritativeCostNote": "xAI documents usage.cost_in_usd_ticks as the exact billed per-request total, inclusive of caching discounts and server-side tools (1 USD = 10^10 ticks): https://docs.x.ai/developers/cost-tracking. Perplexity explicitly disclaims its estimate, so it is not listed.",
 	"models": [
 		{
 			"id": "gpt-5.6-luna",
@@ -57,6 +57,21 @@
 			"targets": ["rust", "typescript"],
 			"source": "https://developers.openai.com/api/docs/pricing"
 		},
+    {
+      "id": "gpt-5.6-cyber",
+      "provider": "openai",
+      "inputPer1m": 12.5,
+      "outputPer1m": 75.0,
+      "averagePer1m": 43.75,
+      "cachedInputPer1m": 1.25,
+      "cacheWritePer1m": 15.625,
+      "cacheWrite1hPer1m": null,
+      "cachedInputBasis": "published",
+      "platformKey": "gpt-5.6-cyber",
+      "legacy": false,
+      "targets": ["rust", "typescript"],
+      "source": "https://developers.openai.com/api/docs/pricing"
+    },
 		{
 			"id": "gpt-5",
 			"provider": "openai",
@@ -267,6 +282,21 @@
 			"targets": ["rust", "typescript"],
 			"source": "https://platform.claude.com/docs/en/about-claude/pricing"
 		},
+    {
+      "id": "claude-opus-5",
+      "provider": "anthropic",
+      "inputPer1m": 5.0,
+      "outputPer1m": 25.0,
+      "averagePer1m": 15.0,
+      "cachedInputPer1m": 0.5,
+      "cacheWritePer1m": 6.25,
+      "cacheWrite1hPer1m": 10.0,
+      "cachedInputBasis": "published",
+      "platformKey": "claude-opus-5",
+      "legacy": false,
+      "targets": ["rust", "typescript"],
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
 		{
 			"id": "claude-opus-4-8",
 			"provider": "anthropic",
@@ -312,6 +342,21 @@
 			"targets": ["rust", "typescript"],
 			"source": "https://platform.claude.com/docs/en/about-claude/pricing"
 		},
+    {
+      "id": "claude-opus-4-5-20251101",
+      "provider": "anthropic",
+      "inputPer1m": 5.0,
+      "outputPer1m": 25.0,
+      "averagePer1m": 15.0,
+      "cachedInputPer1m": 0.5,
+      "cacheWritePer1m": 6.25,
+      "cacheWrite1hPer1m": 10.0,
+      "cachedInputBasis": "published",
+      "platformKey": "claude-opus-4-5-20251101",
+      "legacy": false,
+      "targets": ["rust", "typescript"],
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
 		{
 			"id": "claude-sonnet-4-6",
 			"provider": "anthropic",
@@ -372,6 +417,21 @@
 			"targets": ["rust", "typescript"],
 			"source": "https://platform.claude.com/docs/en/about-claude/pricing"
 		},
+    {
+      "id": "claude-mythos-5",
+      "provider": "anthropic",
+      "inputPer1m": 10.0,
+      "outputPer1m": 50.0,
+      "averagePer1m": 30.0,
+      "cachedInputPer1m": 1.0,
+      "cacheWritePer1m": 12.5,
+      "cacheWrite1hPer1m": 20.0,
+      "cachedInputBasis": "published",
+      "platformKey": "claude-mythos-5",
+      "legacy": false,
+      "targets": ["rust", "typescript"],
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing"
+    },
 		{
 			"id": "gemini-3.6-flash",
 			"provider": "google",
@@ -2368,40 +2428,48 @@
 			"source": "platform-legacy-table"
 		}
 	],
-	"aliases": [
-		{
-			"alias": "gpt-5.6",
-			"target": "gpt-5.6-sol"
-		}
-	],
+  "aliases": [
+    {
+      "alias": "gpt-5.6",
+      "target": "gpt-5.6-sol"
+    },
+    {
+      "alias": "daybreak-blue-latest",
+      "target": "gpt-5.6-sol"
+    },
+    {
+      "alias": "daybreak-red-latest",
+      "target": "gpt-5.6-cyber"
+    }
+  ],
 	"longContext": [
-		{
-			"id": "gpt-5.6-luna",
-			"thresholdInputTokens": 272000,
-			"inputPer1m": 0.4,
-			"outputPer1m": 1.8,
-			"cachedInputPer1m": null,
-			"cacheWritePer1m": null,
-			"source": "https://developers.openai.com/api/docs/pricing"
-		},
-		{
-			"id": "gpt-5.6-terra",
-			"thresholdInputTokens": 272000,
-			"inputPer1m": 4.0,
-			"outputPer1m": 18.0,
-			"cachedInputPer1m": null,
-			"cacheWritePer1m": null,
-			"source": "https://developers.openai.com/api/docs/pricing"
-		},
-		{
-			"id": "gpt-5.6-sol",
-			"thresholdInputTokens": 272000,
-			"inputPer1m": 10.0,
-			"outputPer1m": 45.0,
-			"cachedInputPer1m": null,
-			"cacheWritePer1m": null,
-			"source": "https://developers.openai.com/api/docs/pricing"
-		},
+    {
+      "id": "gpt-5.6-luna",
+      "thresholdInputTokens": 272000,
+      "inputPer1m": 0.4,
+      "outputPer1m": 1.8,
+      "cachedInputPer1m": 0.04,
+      "cacheWritePer1m": 0.5,
+      "source": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "thresholdInputTokens": 272000,
+      "inputPer1m": 4.0,
+      "outputPer1m": 18.0,
+      "cachedInputPer1m": 0.4,
+      "cacheWritePer1m": 5.0,
+      "source": "https://developers.openai.com/api/docs/pricing"
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "thresholdInputTokens": 272000,
+      "inputPer1m": 10.0,
+      "outputPer1m": 45.0,
+      "cachedInputPer1m": 1.0,
+      "cacheWritePer1m": 12.5,
+      "source": "https://developers.openai.com/api/docs/pricing"
+    },
 		{
 			"id": "gemini-2.5-pro",
 			"thresholdInputTokens": 200000,

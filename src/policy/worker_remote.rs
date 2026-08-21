@@ -252,7 +252,7 @@ pub use crate::policy::admission_wire::{
 
 /// How a request's provider stream (or buffered body) ended, from the settling
 /// side's point of view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StreamOutcome {
     /// The body reached EOF and the provider's own token counts were recovered.
     /// A reported `completion_tokens: 0` lands here and is authoritative.
@@ -280,14 +280,16 @@ pub enum StreamOutcome {
 pub fn settlement_for(outcome: StreamOutcome, model: &str, event_id: Option<String>) -> Settlement {
     match outcome {
         StreamOutcome::Usage(u) => {
-            let cost = crate::policy::pricing::price_usage(
-                model,
-                &crate::policy::pricing::BillableUsage::from_tokens(
-                    u.input_tokens,
-                    u.output_tokens,
-                ),
-            )
-            .total_usd;
+            let cost = u.cost_usd.unwrap_or_else(|| {
+                crate::policy::pricing::price_usage(
+                    model,
+                    &crate::policy::pricing::BillableUsage::from_tokens(
+                        u.input_tokens,
+                        u.output_tokens,
+                    ),
+                )
+                .total_usd
+            });
             Settlement::Complete(Box::new(SettlementUsage {
                 model: Some(model.to_string()),
                 input_tokens: u64::from(u.input_tokens),
@@ -312,9 +314,9 @@ pub fn settlement_for(outcome: StreamOutcome, model: &str, event_id: Option<Stri
 /// `converted` is the OpenAI-shaped body the gateway is about to return, or
 /// `None` when there is no JSON body at all (a non-JSON payload, or one past the
 /// inspection cap). `raw_usage` is whatever the *provider's own* body carried
-/// before translation, and is consulted only as a fallback: Bedrock reports
-/// `usage.inputTokens`/`outputTokens` in camelCase, a spelling the OpenAI
-/// conversion normalizes but a failed conversion would drop.
+/// before translation and wins when present: it can retain cache-write TTL
+/// tiers and server-tool fees that the portable OpenAI response shape cannot
+/// represent. The converted body remains the fallback for ordinary providers.
 ///
 /// No usage at all — an error envelope, a 4xx, a body past the cap — is
 /// [`StreamOutcome::EndedWithoutUsage`], i.e. abandon: the call reached the
@@ -323,10 +325,7 @@ pub fn buffered_body_outcome(
     converted: Option<&Value>,
     raw_usage: Option<ActualUsage>,
 ) -> StreamOutcome {
-    match converted
-        .and_then(crate::policy::metering::extract_actual_usage)
-        .or(raw_usage)
-    {
+    match raw_usage.or_else(|| converted.and_then(crate::policy::metering::extract_actual_usage)) {
         Some(u) => StreamOutcome::Usage(u),
         None => StreamOutcome::EndedWithoutUsage,
     }
@@ -356,7 +355,7 @@ pub fn resolve_max_output_tokens(body: &Value) -> Result<Option<u64>, &'static s
             continue;
         }
         return match v.as_u64() {
-            Some(n) if n <= MAX_OUTPUT_TOKEN_LIMIT => Ok(Some(n)),
+            Some(n) if n > 0 && n <= MAX_OUTPUT_TOKEN_LIMIT => Ok(Some(n)),
             _ => Err(key),
         };
     }
@@ -1101,6 +1100,7 @@ mod tests {
             StreamOutcome::Usage(ActualUsage {
                 input_tokens: 11,
                 output_tokens: 4,
+                cost_usd: None,
             }),
             "gpt-4o",
             Some("evt-1".into()),
@@ -1117,12 +1117,30 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_detailed_cost_wins_over_the_token_only_fallback() {
+        let s = settlement_for(
+            StreamOutcome::Usage(ActualUsage {
+                input_tokens: 125,
+                output_tokens: 7,
+                cost_usd: Some(0.123_456_789),
+            }),
+            "claude-sonnet-5",
+            None,
+        );
+        let Settlement::Complete(usage) = s else {
+            panic!("detailed usage must complete");
+        };
+        assert!((usage.cost_usd - 0.123_456_789).abs() < 1e-12);
+    }
+
+    #[test]
     fn an_unknown_model_settles_at_the_same_assumption_it_reserved_at() {
         let model = "qq-unknown-strict-probe";
         let s = settlement_for(
             StreamOutcome::Usage(ActualUsage {
                 input_tokens: 1000,
                 output_tokens: 500,
+                cost_usd: None,
             }),
             model,
             None,
@@ -1148,6 +1166,7 @@ mod tests {
             StreamOutcome::Usage(ActualUsage {
                 input_tokens: 11,
                 output_tokens: 4,
+                cost_usd: None,
             }),
             "gpt-4o",
             None,
@@ -1176,6 +1195,7 @@ mod tests {
             StreamOutcome::Usage(ActualUsage {
                 input_tokens: 7,
                 output_tokens: 0,
+                cost_usd: None,
             }),
             "gpt-4o",
             None,
@@ -1277,7 +1297,8 @@ mod tests {
             buffered_body_outcome(Some(&body), None),
             StreamOutcome::Usage(ActualUsage {
                 input_tokens: 12,
-                output_tokens: 34
+                output_tokens: 34,
+                cost_usd: None,
             })
         );
 
@@ -1287,19 +1308,24 @@ mod tests {
         let raw = ActualUsage {
             input_tokens: 5,
             output_tokens: 6,
+            cost_usd: None,
         };
         assert_eq!(
             buffered_body_outcome(Some(&converted), Some(raw)),
             StreamOutcome::Usage(raw)
         );
-        // ...but the converted body wins when it has counters of its own.
+        // Provider-native usage wins when it carries a detailed price. The
+        // OpenAI conversion intentionally keeps only portable counters and
+        // cannot replace cache-write TTL tiers or server-tool fees.
         let converted = json!({"usage": {"prompt_tokens": 1, "completion_tokens": 2}});
+        let detailed_raw = ActualUsage {
+            input_tokens: 5,
+            output_tokens: 6,
+            cost_usd: Some(0.012345),
+        };
         assert_eq!(
-            buffered_body_outcome(Some(&converted), Some(raw)),
-            StreamOutcome::Usage(ActualUsage {
-                input_tokens: 1,
-                output_tokens: 2
-            })
+            buffered_body_outcome(Some(&converted), Some(detailed_raw)),
+            StreamOutcome::Usage(detailed_raw)
         );
 
         // No body (non-JSON, or past the inspection cap), an error envelope, and
@@ -1372,13 +1398,8 @@ mod tests {
             resolve_max_output_tokens(&json!({"max_tokens": null, "max_output_tokens": 32})),
             Ok(Some(32))
         );
-        // `0` is accepted (it is what the native path accepts); only values that
-        // are not usable token counts at all are rejected.
-        assert_eq!(
-            resolve_max_output_tokens(&json!({"max_tokens": 0})),
-            Ok(Some(0))
-        );
         for bad in [
+            json!({"max_tokens": 0}),
             json!({"max_tokens": -1}),
             json!({"max_tokens": "many"}),
             json!({"max_tokens": MAX_OUTPUT_TOKEN_LIMIT + 1}),

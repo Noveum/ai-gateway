@@ -15,9 +15,10 @@
 //! [`CostBreakdown`] is that a dimension the catalog cannot price is *named*
 //! ([`CostBreakdown::missing_dimensions`]) and charged at a conservative upper
 //! bound, never dropped. `is_complete == false` is the signal that a cost is a
-//! bound rather than a quote; a fail-closed cost policy blocks on it
-//! ([`CostBreakdown::blocks_fail_closed`]) and a fail-open one still meters the
-//! bound so cost caps keep advancing.
+//! bound rather than a quote. [`CostBreakdown::blocks_fail_closed`] exposes the
+//! conservative decision a caller can apply; the current policy preflight uses
+//! `failClosed` for unknown model lookups, while known-model missing dimensions
+//! remain flagged and conservatively metered.
 //!
 //! # Layering
 //!
@@ -41,6 +42,77 @@ use crate::policy::pricing_catalog as catalog;
 
 pub use crate::policy::pricing_catalog::CATALOG_VERSION;
 
+#[derive(Debug, Clone, PartialEq)]
+struct BedrockAnthropicPricing {
+    catalog_model: String,
+    token_price_multiplier: f64,
+}
+
+/// Resolve an Anthropic Bedrock foundation model from either its direct id or
+/// a system-defined inference-profile id/ARN. AWS application inference
+/// profiles are deliberately excluded: their opaque id does not identify the
+/// backing model without a control-plane lookup.
+fn bedrock_anthropic_pricing(model: &str) -> Option<BedrockAnthropicPricing> {
+    fn system_profile_id(arn: &str) -> Option<&str> {
+        let mut parts = arn.splitn(6, ':');
+        if parts.next()? != "arn" {
+            return None;
+        }
+        // The catalog holds commercial AWS rates. GovCloud, China and ISO
+        // partitions publish separate regional prices, so their ARNs must stay
+        // unknown until those rows exist rather than borrowing this multiplier.
+        if parts.next()? != "aws" || parts.next()? != "bedrock" {
+            return None;
+        }
+        let _region = parts.next()?;
+        let account = parts.next()?;
+        if !account.is_empty()
+            && (account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return None;
+        }
+        let id = parts.next()?.strip_prefix("inference-profile/")?;
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'.'))
+        {
+            return None;
+        }
+        Some(id)
+    }
+
+    let lower = model.to_ascii_lowercase();
+    let profile_id = if lower.starts_with("arn:") {
+        system_profile_id(&lower)?
+    } else {
+        lower.as_str()
+    };
+    let (catalog_id, explicitly_global) = match profile_id.split_once('.') {
+        Some(("global", underlying)) => (underlying, true),
+        Some(("us" | "eu" | "au" | "jp" | "apac", underlying)) => (underlying, false),
+        _ => (profile_id, false),
+    };
+    let row = catalog::MODEL_ROWS.iter().find(|row| {
+        row.provider == "bedrock" && row.id.starts_with("anthropic.") && row.id == catalog_id
+    })?;
+    Some(BedrockAnthropicPricing {
+        catalog_model: row.id.to_string(),
+        token_price_multiplier: if explicitly_global { 1.0 } else { 1.1 },
+    })
+}
+
+/// Whether a Bedrock model/profile has a complete strict-admission rate that
+/// can be derived from the request model id alone.
+///
+/// AWS prices Amazon Nova and other Bedrock families by source region, but the
+/// current admission/settlement API does not carry `x-aws-region`. Until that
+/// context is threaded into pricing, only catalogued commercial Claude model
+/// and system-profile ids have a safe global/geographic rate derivation.
+pub fn bedrock_model_has_strict_pricing(model: &str) -> bool {
+    bedrock_anthropic_pricing(model).is_some()
+}
+
 /// Current wall-clock time as unix seconds, on both build targets.
 /// `chrono::Utc::now()` is unavailable under wasm32, where the Worker runtime
 /// supplies the clock instead.
@@ -55,12 +127,16 @@ fn now_unix_seconds() -> i64 {
     }
 }
 
-/// Normalize a caller-supplied model id: lowercase, then resolve a bare
-/// provider alias (e.g. `gpt-5.6` → `gpt-5.6-sol`) to the concrete model it
-/// routes to. Used by every lookup so alias requests price and tier exactly
-/// like the model that will actually serve them.
+/// Normalize a caller-supplied model id: lowercase, resolve a safely
+/// identifiable Bedrock inference profile to its foundation model, then
+/// resolve a bare provider alias (e.g. `gpt-5.6` → `gpt-5.6-sol`) to the
+/// concrete model it routes to. Used by every lookup so alias requests price
+/// and tier exactly like the model that will actually serve them.
 fn canonical(model: &str) -> String {
     let m = model.to_lowercase();
+    let m = bedrock_anthropic_pricing(&m)
+        .map(|pricing| pricing.catalog_model)
+        .unwrap_or(m);
     match catalog::MODEL_ALIASES.iter().find(|(alias, _)| *alias == m) {
         Some((_, target)) => (*target).to_string(),
         None => m,
@@ -283,6 +359,14 @@ pub struct BillableUsage {
     pub output_tokens: u32,
     /// `(tool_id, call_count)`, ids as in `catalog::TOOL_FEES_USD_PER_1K_CALLS`.
     pub tool_calls: Vec<(String, u32)>,
+    /// Request/response-selected multiplier for token and cache dimensions.
+    /// `None` is the standard 1.0 rate. Anthropic US-only data residency
+    /// contributes 1.1x and fast mode 2x; both stack multiplicatively.
+    pub token_price_multiplier: Option<f64>,
+    /// The provider explicitly says this usage shape is not billed. Anthropic
+    /// pre-output refusals are HTTP 200 and retain token counts for observability
+    /// even though their monetary cost is zero.
+    pub billing_exempt: bool,
     /// A billed total the provider returned, accepted only from a provider on
     /// [`catalog::AUTHORITATIVE_COST_PROVIDERS`].
     pub provider_reported_cost_usd: Option<f64>,
@@ -322,10 +406,11 @@ impl BillableUsage {
 /// USD per 1M tokens charged to a model that matches nothing in the catalog.
 ///
 /// **Derived from the catalog rather than hard-coded**: the maximum input rate
-/// and the maximum output rate over every published row — base, announced and
-/// long-context. Today that is `o1`'s $15.00 / $60.00 per 1M. Adding a pricier
-/// model automatically raises the assumption, so an unknown model can never be
-/// estimated below the most expensive call the gateway knows how to make
+/// and the maximum output rate over every Rust runtime row — base, announced
+/// and long-context. Today input is bounded by `o1` at $15.00/M and output by
+/// `gpt-5.6-cyber` at $75.00/M. Adding a pricier runtime row automatically
+/// raises the assumption, so an unknown model can never be estimated below a
+/// model the compiled gateway knows how to price
 /// (`assumed_rate_bounds_every_catalog_rate` pins this).
 ///
 /// Erring high is the intended direction. An unknown id is either a newly
@@ -531,6 +616,39 @@ fn is_family(m: &str, id: &str) -> bool {
         || (m.len() > id.len()
             && m.starts_with(id)
             && matches!(m.as_bytes()[id.len()], b'-' | b':' | b'.' | b'@' | b'/'))
+}
+
+/// Whether Anthropic can select US-only inference (and therefore the 1.1x
+/// token/cache multiplier) for this model. Unknown future Claude ids are
+/// treated as eligible so a newly launched model cannot under-reserve; known
+/// pre-4.6 catalog rows remain at their exact standard rate.
+pub fn anthropic_supports_inference_geo(model: &str) -> bool {
+    let model = canonical(model);
+    if model.is_empty() {
+        return false;
+    }
+    let supported = [
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-mythos-preview",
+    ]
+    .iter()
+    .any(|family| is_family(&model, family));
+    if supported {
+        return true;
+    }
+    // A known Anthropic row not listed above predates 4.6 and does not accept
+    // `inference_geo`. Anything else may be a future pass-through model, for
+    // which the conservative 1.1x reservation is the safe contract.
+    !catalog::MODEL_ROWS
+        .iter()
+        .any(|row| row.provider == "anthropic" && is_family(&model, row.id))
 }
 
 /// The catalog row a canonical id resolves to: exact match wins, otherwise the
@@ -760,8 +878,13 @@ pub fn price_usage_at(model: &str, usage: &BillableUsage, at: DateTime<Utc>) -> 
     let canonical_id = canonical(model);
     let per_1m = |tokens: u32, rate: f64| (tokens as f64 / 1_000_000.0) * rate;
 
-    out.uncached_input_usd = per_1m(usage.uncached_input_tokens, card.input_per_1m);
-    out.output_usd = per_1m(usage.output_tokens, card.output_per_1m);
+    let token_multiplier = usage
+        .token_price_multiplier
+        .filter(|multiplier| multiplier.is_finite() && *multiplier >= 1.0)
+        .unwrap_or(1.0);
+    out.uncached_input_usd =
+        per_1m(usage.uncached_input_tokens, card.input_per_1m) * token_multiplier;
+    out.output_usd = per_1m(usage.output_tokens, card.output_per_1m) * token_multiplier;
 
     if usage.cache_read_tokens > 0 {
         let rate = match card.cached_input_per_1m {
@@ -773,7 +896,7 @@ pub fn price_usage_at(model: &str, usage: &BillableUsage, at: DateTime<Utc>) -> 
                 bound
             }
         };
-        out.cache_read_usd = per_1m(usage.cache_read_tokens, rate);
+        out.cache_read_usd = per_1m(usage.cache_read_tokens, rate) * token_multiplier;
     }
 
     if usage.cache_write_tokens > 0 || usage.cache_write_1h_tokens > 0 {
@@ -788,10 +911,11 @@ pub fn price_usage_at(model: &str, usage: &BillableUsage, at: DateTime<Utc>) -> 
                     .cache_write_tokens
                     .saturating_add(usage.cache_write_1h_tokens),
                 bound,
-            );
+            ) * token_multiplier;
         } else {
             out.cache_write_usd = per_1m(usage.cache_write_tokens, default_rate.unwrap_or(0.0))
-                + per_1m(usage.cache_write_1h_tokens, hour_rate.unwrap_or(0.0));
+                * token_multiplier
+                + per_1m(usage.cache_write_1h_tokens, hour_rate.unwrap_or(0.0)) * token_multiplier;
         }
     }
 
@@ -821,6 +945,15 @@ pub fn price_usage_at(model: &str, usage: &BillableUsage, at: DateTime<Utc>) -> 
         + out.output_usd
         + out.tool_usd;
 
+    if usage.billing_exempt {
+        out.uncached_input_usd = 0.0;
+        out.cache_read_usd = 0.0;
+        out.cache_write_usd = 0.0;
+        out.output_usd = 0.0;
+        out.tool_usd = 0.0;
+        out.total_usd = 0.0;
+    }
+
     // The provider is the system of record for its own bill. When we trust its
     // total it replaces our arithmetic outright, and nothing is missing any
     // more: the components stay for auditability but stop being the answer.
@@ -835,15 +968,11 @@ pub fn price_usage_at(model: &str, usage: &BillableUsage, at: DateTime<Utc>) -> 
     out
 }
 
-/// Assumed completion size when the request doesn't set `max_tokens`: cost caps
-/// need *some* forward estimate of the call being admitted, and most chat
-/// completions finish well under this. Erring high only blocks slightly before
-/// the cap instead of after it — the right direction for a hard cap. (An
-/// unbounded request can exceed this — models allow up to 128K output — but
-/// reserving a model's full output ceiling for every unbounded chat request
-/// would block ordinary traffic whenever cap headroom drops below ~$1;
-/// operators who want stricter admission raise the assumption via
-/// `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS`.)
+/// Assumed completion size when a request does not set an output limit. This is
+/// an advisory/rate-only estimate and an outage fallback; an enforcing strict
+/// cost cap rejects an unbounded request instead of pretending this heuristic
+/// is a hard maximum. Operators can tune the estimate via
+/// `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS`.
 pub const DEFAULT_ASSUMED_OUTPUT_TOKENS: u64 = 1024;
 
 /// The assumed completion size for requests without an explicit output limit:
@@ -906,6 +1035,103 @@ pub fn reserve_request_cost(model: &str, input_tokens: u32, max_output_tokens: O
     })
 }
 
+/// Billable request dimensions that are knowable before an upstream call.
+///
+/// A reservation must cover the most expensive outcome the request itself can
+/// select. Anthropic cache writes are therefore treated as a miss and the
+/// whole estimated prompt is assigned to the longest declared TTL. Explicit
+/// breakpoints may cover less than the whole prompt, but reserving less would
+/// let a strict cap be crossed on the first cache population. OpenAI's Chat
+/// Completions web-search option represents one separately billed search call.
+pub fn declared_request_usage(
+    provider: &str,
+    body: &Value,
+    estimated_input_tokens: u32,
+) -> BillableUsage {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum CacheTtl {
+        None,
+        FiveMinutes,
+        OneHour,
+    }
+
+    fn declared_cache_ttl(value: &Value) -> CacheTtl {
+        match value {
+            Value::Array(values) => values
+                .iter()
+                .map(declared_cache_ttl)
+                .max()
+                .unwrap_or(CacheTtl::None),
+            Value::Object(object) => {
+                let here = object
+                    .get("cache_control")
+                    .and_then(Value::as_object)
+                    .filter(|cache| cache.get("type").and_then(Value::as_str) == Some("ephemeral"))
+                    .map(|cache| match cache.get("ttl").and_then(Value::as_str) {
+                        Some("1h") => CacheTtl::OneHour,
+                        Some("5m") | None => CacheTtl::FiveMinutes,
+                        Some(_) => CacheTtl::None,
+                    })
+                    .unwrap_or(CacheTtl::None);
+                object
+                    .values()
+                    .map(declared_cache_ttl)
+                    .fold(here, std::cmp::max)
+            }
+            _ => CacheTtl::None,
+        }
+    }
+
+    let mut declared = BillableUsage::default();
+    if provider.eq_ignore_ascii_case("anthropic") {
+        // `inference_geo` may be supplied by the workspace rather than the
+        // request. Reserve the 1.1x US-only rate unless the caller explicitly
+        // pins global routing; settlement uses the provider-reported geo and
+        // reconciles the conservative hold back to the exact amount.
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut multiplier = 1.0;
+        if anthropic_supports_inference_geo(model)
+            && body.get("inference_geo").and_then(Value::as_str) != Some("global")
+        {
+            multiplier *= 1.1;
+        }
+        if body.get("speed").and_then(Value::as_str) == Some("fast") {
+            multiplier *= 2.0;
+        }
+        if multiplier > 1.0 {
+            declared.token_price_multiplier = Some(multiplier);
+        }
+        match declared_cache_ttl(body) {
+            CacheTtl::OneHour => declared.cache_write_1h_tokens = estimated_input_tokens,
+            CacheTtl::FiveMinutes => declared.cache_write_tokens = estimated_input_tokens,
+            CacheTtl::None => {}
+        }
+    } else if provider.eq_ignore_ascii_case("bedrock") {
+        // The Bedrock Anthropic catalog rows are the global rates. Direct and
+        // geography-scoped inference cost 10% more, including cache tokens.
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some(pricing) = bedrock_anthropic_pricing(model) {
+            if pricing.token_price_multiplier > 1.0 {
+                declared.token_price_multiplier = Some(pricing.token_price_multiplier);
+            }
+        }
+    }
+    if provider.eq_ignore_ascii_case("openai")
+        && body.get("web_search_options").is_some_and(Value::is_object)
+    {
+        declared
+            .tool_calls
+            .push(("openai:web_search".to_string(), 1));
+    }
+    declared
+}
+
 /// The forward reservation for a request, as a full breakdown.
 ///
 /// Admission reserves against a request that has not run, so the only
@@ -922,8 +1148,15 @@ pub fn reserve_request_breakdown(
     max_output_tokens: Option<u64>,
     declared: &BillableUsage,
 ) -> CostBreakdown {
+    let declared_prompt_tokens = declared
+        .cache_read_tokens
+        .saturating_add(declared.cache_write_tokens)
+        .saturating_add(declared.cache_write_1h_tokens);
     let usage = BillableUsage {
-        uncached_input_tokens: input_tokens,
+        // Declared cache dimensions are a split of the estimated prompt, not
+        // extra tokens. `saturating_sub` also remains conservative when an
+        // exact declaration is larger than our text-only token estimate.
+        uncached_input_tokens: input_tokens.saturating_sub(declared_prompt_tokens),
         output_tokens: max_output_tokens
             .unwrap_or_else(assumed_output_tokens)
             .min(u32::MAX as u64) as u32,
@@ -931,6 +1164,8 @@ pub fn reserve_request_breakdown(
         cache_write_tokens: declared.cache_write_tokens,
         cache_write_1h_tokens: declared.cache_write_1h_tokens,
         tool_calls: declared.tool_calls.clone(),
+        token_price_multiplier: declared.token_price_multiplier,
+        billing_exempt: false,
         // A reservation is a forward estimate; there is no provider bill yet.
         provider_reported_cost_usd: None,
     };
@@ -1054,18 +1289,37 @@ pub fn parse_usage(model: &str, provider: &str, body: &Value) -> Option<Billable
             &["input_tokens_details", "cached_tokens"],
         ],
     );
-    let cache_write_5m = first_u32(
-        usage,
-        &[
-            &["cache_creation", "ephemeral_5m_input_tokens"],
-            &["cache_creation_input_tokens"],
-            &["cacheWriteInputTokens"],
-            &["prompt_tokens_details", "cache_write_tokens"],
-            &["input_tokens_details", "cache_write_tokens"],
-            &["cache_write_tokens"],
-        ],
-    );
-    let cache_write_1h = u32_field(usage, &["cache_creation", "ephemeral_1h_input_tokens"]);
+    // Anthropic's aggregate cache-creation counter equals the sum of the two
+    // TTL buckets. Once either explicit bucket is present, both explicit
+    // values (including zero) are authoritative; falling through from an
+    // explicit 5m zero to the aggregate would count a pure 1h write twice.
+    let has_ttl_breakdown = usage
+        .get("cache_creation")
+        .and_then(Value::as_object)
+        .is_some_and(|creation| {
+            creation.contains_key("ephemeral_5m_input_tokens")
+                || creation.contains_key("ephemeral_1h_input_tokens")
+        });
+    let (cache_write_5m, cache_write_1h) = if has_ttl_breakdown {
+        (
+            u32_field(usage, &["cache_creation", "ephemeral_5m_input_tokens"]),
+            u32_field(usage, &["cache_creation", "ephemeral_1h_input_tokens"]),
+        )
+    } else {
+        (
+            first_u32(
+                usage,
+                &[
+                    &["cache_creation_input_tokens"],
+                    &["cacheWriteInputTokens"],
+                    &["prompt_tokens_details", "cache_write_tokens"],
+                    &["input_tokens_details", "cache_write_tokens"],
+                    &["cache_write_tokens"],
+                ],
+            ),
+            0,
+        )
+    };
 
     let prompt = first_u32(
         usage,
@@ -1085,6 +1339,14 @@ pub fn parse_usage(model: &str, provider: &str, body: &Value) -> Option<Billable
             &["completionTokens"],
         ],
     );
+    if matches!(provider.to_ascii_lowercase().as_str(), "xai" | "grok") {
+        // xAI's `total_tokens` includes billed hidden reasoning tokens that
+        // some Chat responses omit from `completion_tokens`. Prefer the larger
+        // derived output so a response without the exact-ticks field cannot
+        // release a strict hold at visible-output cost only.
+        let total = first_u32(usage, &[&["total_tokens"], &["totalTokens"]]);
+        out.output_tokens = out.output_tokens.max(total.saturating_sub(prompt));
+    }
 
     out.cache_read_tokens = cache_read;
     out.cache_write_tokens = cache_write_5m;
@@ -1097,6 +1359,33 @@ pub fn parse_usage(model: &str, provider: &str, body: &Value) -> Option<Billable
     } else {
         prompt
     };
+    if provider.eq_ignore_ascii_case("anthropic") {
+        let mut multiplier = 1.0;
+        if usage.get("inference_geo").and_then(Value::as_str) == Some("us") {
+            multiplier *= 1.1;
+        }
+        if usage.get("speed").and_then(Value::as_str) == Some("fast") {
+            multiplier *= 2.0;
+        }
+        if multiplier > 1.0 {
+            out.token_price_multiplier = Some(multiplier);
+        }
+    } else if provider.eq_ignore_ascii_case("bedrock") {
+        // Mirror the request hold at settlement so regional usage cannot
+        // release a reservation at the cheaper global rate.
+        if let Some(pricing) = bedrock_anthropic_pricing(model) {
+            if pricing.token_price_multiplier > 1.0 {
+                out.token_price_multiplier = Some(pricing.token_price_multiplier);
+            }
+        }
+    }
+    out.billing_exempt = provider.eq_ignore_ascii_case("anthropic")
+        && out.output_tokens == 0
+        && (body.get("stop_reason").and_then(Value::as_str) == Some("refusal")
+            || usage
+                .get("unbilled_refusal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false));
 
     // Anthropic server tools. `web_fetch` is catalogued at $0, so counting it
     // is free but keeps the record honest about what ran.
@@ -1126,10 +1415,18 @@ pub fn parse_usage(model: &str, provider: &str, body: &Value) -> Option<Billable
     }
 
     if is_authoritative_cost_provider(provider) {
-        out.provider_reported_cost_usd = ["cost", "cost_usd", "total_cost_usd"]
-            .iter()
-            .find_map(|k| usage.get(k).and_then(Value::as_f64))
-            .filter(|c| c.is_finite() && *c >= 0.0);
+        out.provider_reported_cost_usd =
+            if matches!(provider.to_ascii_lowercase().as_str(), "xai" | "grok") {
+                usage
+                    .get("cost_in_usd_ticks")
+                    .and_then(Value::as_u64)
+                    .map(|ticks| ticks as f64 / 10_000_000_000.0)
+            } else {
+                ["cost", "cost_usd", "total_cost_usd"]
+                    .iter()
+                    .find_map(|k| usage.get(k).and_then(Value::as_f64))
+                    .filter(|c| c.is_finite() && *c >= 0.0)
+            };
     }
 
     Some(out)
@@ -1286,8 +1583,8 @@ mod tests {
             assert!(r.input_per_1m <= a.input_per_1m, "{} tier input", r.id);
             assert!(r.output_per_1m <= a.output_per_1m, "{} tier output", r.id);
         }
-        // Today the ceiling is o1 ($15 / $60 per 1M).
-        assert_eq!((a.input_per_1m, a.output_per_1m), (15.00, 60.00));
+        // Input is bounded by o1; output by GPT-5.6 Cyber.
+        assert_eq!((a.input_per_1m, a.output_per_1m), (15.00, 75.00));
         let unknown = price_call("totally-made-up-model-xyz", 10_000, 10_000).usd;
         for r in catalog::MODEL_ROWS {
             assert!(
@@ -1368,6 +1665,42 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_anthropic_profile_ids_and_arns_resolve_to_the_global_catalog_row() {
+        let direct = "anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let global = lookup(direct).expect("direct Bedrock model is catalogued");
+        assert_eq!((global.input_per_1m, global.output_per_1m), (3.00, 15.00));
+
+        for profile in [
+            "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "jp.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "apac.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "arn:aws:bedrock:us-east-1:111122223333:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "arn:aws:bedrock:eu-west-1:111122223333:inference-profile/eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ] {
+            assert_eq!(lookup(profile), Some(global), "{profile}");
+        }
+
+        // Application profile ids are opaque and need a control-plane lookup;
+        // a suggestive resource name is not enough to price one safely.
+        assert!(lookup(
+            "arn:aws:bedrock:us-east-1:111122223333:application-inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        )
+        .is_none());
+        // Non-commercial partitions have separate regional price tables. Do
+        // not project the commercial 1.1x rule onto them without a catalog row.
+        assert!(lookup(
+            "arn:aws-us-gov:bedrock:us-gov-west-1:111122223333:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        )
+        .is_none());
+        // Prefix normalization is deliberately Anthropic-only.
+        assert!(lookup("global.amazon.nova-pro-v1:0").is_none());
+        assert_eq!(lookup("amazon.nova-pro-v1:0").unwrap().input_per_1m, 0.8);
+    }
+
+    #[test]
     fn current_generation_models_priced() {
         let luna = lookup("gpt-5.6-luna").unwrap();
         assert_eq!((luna.input_per_1m, luna.output_per_1m), (0.20, 1.20));
@@ -1377,6 +1710,29 @@ mod tests {
         assert_eq!((sol.input_per_1m, sol.output_per_1m), (5.00, 30.00));
         let sonnet5 = lookup_at("claude-sonnet-5", 0, at("2026-08-11T00:00:00Z")).unwrap();
         assert_eq!((sonnet5.input_per_1m, sonnet5.output_per_1m), (2.00, 10.00));
+        for (model, expected) in [
+            ("claude-opus-5", (5.00, 25.00, 0.50, 6.25, 10.00)),
+            ("claude-opus-4-5-20251101", (5.00, 25.00, 0.50, 6.25, 10.00)),
+            ("claude-mythos-5", (10.00, 50.00, 1.00, 12.50, 20.00)),
+        ] {
+            let row = rates_at(model, 0, at("2026-08-21T00:00:00Z"))
+                .unwrap_or_else(|| panic!("missing active model {model}"));
+            assert_eq!(
+                (
+                    row.input_per_1m,
+                    row.output_per_1m,
+                    row.cached_input_per_1m.unwrap(),
+                    row.cache_write_per_1m.unwrap(),
+                    row.cache_write_1h_per_1m.unwrap(),
+                ),
+                expected,
+                "{model} rates"
+            );
+            assert!(
+                !price_for_context(model, 0).is_assumed(),
+                "{model} must not take the fail-closed unknown-model path"
+            );
+        }
         let flash = lookup("gemini-3.6-flash").unwrap();
         assert_eq!((flash.input_per_1m, flash.output_per_1m), (1.50, 7.50));
         assert_eq!(
@@ -1405,6 +1761,46 @@ mod tests {
                 "{model} standard rate"
             );
         }
+    }
+
+    #[test]
+    fn gpt_5_6_cyber_uses_published_standard_rates() {
+        let rates = rates_at("gpt-5.6-cyber", 0, at("2026-08-21T00:00:00Z"))
+            .expect("the active Daybreak cyber model must be catalogued");
+        assert_eq!(
+            (
+                rates.input_per_1m,
+                rates.output_per_1m,
+                rates.cached_input_per_1m,
+                rates.cache_write_per_1m,
+                rates.cache_write_1h_per_1m,
+            ),
+            (12.50, 75.00, Some(1.25), Some(15.625), None)
+        );
+    }
+
+    #[test]
+    fn unknown_model_output_assumption_covers_the_cyber_rate() {
+        let assumed = assumed_unknown_price();
+        assert!(
+            assumed.output_per_1m >= 75.00,
+            "an unknown model reserved ${}/M output, below the published cyber rate",
+            assumed.output_per_1m
+        );
+    }
+
+    #[test]
+    fn daybreak_aliases_resolve_to_their_official_targets() {
+        assert_eq!(
+            lookup("daybreak-blue-latest"),
+            lookup("gpt-5.6-sol"),
+            "the blue alias must use the current Sol rate"
+        );
+        assert_eq!(
+            lookup("daybreak-red-latest"),
+            lookup("gpt-5.6-cyber"),
+            "the red alias must use the current Cyber rate"
+        );
     }
 
     #[test]
@@ -1865,6 +2261,104 @@ mod tests {
             long_context_entries.len(),
             catalog::LONG_CONTEXT_ROWS.len()
         );
+
+        let scheduled_entries = parsed["scheduled"]
+            .as_array()
+            .expect("catalog `scheduled` is not an array");
+        for entry in scheduled_entries {
+            let id = entry["id"]
+                .as_str()
+                .expect("catalog scheduled entry has no `id`");
+            let row = catalog::SCHEDULED_ROWS
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{id}: pricing/catalog.json declares a scheduled rate but \
+                         SCHEDULED_ROWS has no row with that id"
+                    )
+                });
+            let effective = field(entry, id, "effectiveFromUnixSecs")
+                .as_i64()
+                .unwrap_or_else(|| {
+                    panic!("{id}: catalog field `effectiveFromUnixSecs` is not a signed integer")
+                });
+            assert_eq!(
+                effective, row.effective_from_unix_secs,
+                "{id}: field `effectiveFromUnixSecs` disagrees"
+            );
+            assert_rate_eq(
+                id,
+                "scheduled.inputPer1m",
+                required_rate(entry, id, "inputPer1m"),
+                row.input_per_1m,
+            );
+            assert_rate_eq(
+                id,
+                "scheduled.outputPer1m",
+                required_rate(entry, id, "outputPer1m"),
+                row.output_per_1m,
+            );
+        }
+        for row in catalog::SCHEDULED_ROWS {
+            let matches = scheduled_entries
+                .iter()
+                .filter(|entry| entry["id"].as_str() == Some(row.id))
+                .count();
+            assert_eq!(
+                matches, 1,
+                "{}: SCHEDULED_ROWS carries this change but pricing/catalog.json has \
+                 {matches} scheduled entries for it",
+                row.id
+            );
+        }
+        assert_eq!(
+            scheduled_entries.len(),
+            catalog::SCHEDULED_ROWS.len(),
+            "pricing/catalog.json has {} scheduled entries but SCHEDULED_ROWS has {} rows",
+            scheduled_entries.len(),
+            catalog::SCHEDULED_ROWS.len()
+        );
+
+        let alias_entries = parsed["aliases"]
+            .as_array()
+            .expect("catalog `aliases` is not an array");
+        for entry in alias_entries {
+            let alias = entry["alias"]
+                .as_str()
+                .expect("catalog alias entry has no string `alias`");
+            let target = entry["target"]
+                .as_str()
+                .expect("catalog alias entry has no string `target`");
+            assert!(
+                catalog::MODEL_ALIASES
+                    .iter()
+                    .any(|(rust_alias, rust_target)|
+                        *rust_alias == alias && *rust_target == target),
+                "pricing/catalog.json maps {alias} to {target}, but MODEL_ALIASES does not"
+            );
+        }
+        for (alias, target) in catalog::MODEL_ALIASES {
+            let matches = alias_entries
+                .iter()
+                .filter(|entry| {
+                    entry["alias"].as_str() == Some(alias)
+                        && entry["target"].as_str() == Some(target)
+                })
+                .count();
+            assert_eq!(
+                matches, 1,
+                "MODEL_ALIASES maps {alias} to {target}, but pricing/catalog.json has \
+                 {matches} matching entries"
+            );
+        }
+        assert_eq!(
+            alias_entries.len(),
+            catalog::MODEL_ALIASES.len(),
+            "pricing/catalog.json has {} aliases but MODEL_ALIASES has {} entries",
+            alias_entries.len(),
+            catalog::MODEL_ALIASES.len()
+        );
     }
 
     #[test]
@@ -2130,8 +2624,8 @@ mod tests {
 
     #[test]
     fn a_provider_reported_total_wins_when_it_is_authoritative() {
-        // No provider is on the allowlist today, so the parser refuses to read
-        // a cost field at all: an unverified number must not become the bill.
+        // Generic provider cost fields remain untrusted: an unverified number
+        // must not become the bill.
         let body = json!({
             "usage": { "prompt_tokens": 1000, "completion_tokens": 1000, "cost": 42.0 }
         });
@@ -2140,6 +2634,39 @@ mod tests {
         let priced = price_usage("gpt-4o", &parsed);
         assert_eq!(priced.source, CostSource::Catalog);
         assert!(priced.total_usd < 1.0);
+
+        // xAI documents cost_in_usd_ticks as the exact billed total, inclusive
+        // of caching, discounts, and server-side tools. One USD is 1e10 ticks.
+        let xai_body = json!({
+            "usage": {
+                "prompt_tokens": 199,
+                "completion_tokens": 1,
+                "cost_in_usd_ticks": 37_756_000_u64
+            }
+        });
+        for provider in ["xai", "grok"] {
+            let parsed = parse_usage("grok-4.6", provider, &xai_body).unwrap();
+            assert_eq!(parsed.provider_reported_cost_usd, Some(0.0037756));
+            let priced = price_usage("grok-4.6", &parsed);
+            assert_eq!(priced.source, CostSource::ProviderReported);
+            assert_eq!(priced.total_usd, 0.0037756);
+        }
+
+        // Some valid xAI responses omit ticks. `total_tokens` still includes
+        // hidden reasoning tokens, so the output charged by the catalog must
+        // not stop at the visible completion-token count.
+        let xai_without_ticks = json!({
+            "usage": {
+                "prompt_tokens": 32,
+                "completion_tokens": 9,
+                "total_tokens": 135,
+                "completion_tokens_details": {"reasoning_tokens": 94}
+            }
+        });
+        let parsed = parse_usage("grok-4.6", "xai", &xai_without_ticks).unwrap();
+        assert_eq!(parsed.uncached_input_tokens, 32);
+        assert_eq!(parsed.output_tokens, 103);
+        assert_eq!(parsed.provider_reported_cost_usd, None);
 
         // When a total IS authoritative it supersedes the arithmetic outright,
         // and the components remain for audit.
@@ -2314,26 +2841,145 @@ mod tests {
     }
 
     #[test]
-    fn long_context_tier_leaves_gpt_5_6_cache_rates_unpublished() {
-        // OpenAI publishes separate long-context cache-write columns that could
-        // not be read off the page. Rather than assume the short-context 1.25x
-        // still applies above 272K, the tier carries no cache rates, so a
-        // cached long-context call is flagged instead of quietly mispriced.
-        let r = rates_at("gpt-5.6-sol", 300_000, at("2026-08-12T00:00:00Z")).unwrap();
-        assert_eq!(r.input_per_1m, 10.00);
-        assert_eq!(r.cached_input_per_1m, None);
+    fn request_declarations_reserve_anthropic_cache_writes_conservatively() {
+        let plain = declared_request_usage(
+            "anthropic",
+            &json!({"messages": [{"role": "user", "content": "hello"}]}),
+            1_000,
+        );
+        assert!(plain.is_empty());
+
+        let default_ttl = declared_request_usage(
+            "AnThRoPiC",
+            &json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            1_000,
+        );
+        assert_eq!(default_ttl.cache_write_tokens, 1_000);
+        assert_eq!(default_ttl.cache_write_1h_tokens, 0);
+
+        let one_hour = declared_request_usage(
+            "anthropic",
+            &json!({
+                "inference_geo": "global",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "a", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+                        {"type": "text", "text": "b", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                    ]
+                }]
+            }),
+            1_000,
+        );
+        assert_eq!(one_hour.cache_write_tokens, 0);
+        assert_eq!(one_hour.cache_write_1h_tokens, 1_000);
+        assert_eq!(one_hour.token_price_multiplier, None);
+
+        let workspace_may_select_us = declared_request_usage(
+            "anthropic",
+            &json!({
+                "model": "claude-sonnet-5",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            1_000,
+        );
+        assert_eq!(workspace_may_select_us.token_price_multiplier, Some(1.1));
+        let fast_us = declared_request_usage(
+            "anthropic",
+            &json!({
+                "model": "claude-opus-5",
+                "speed": "fast",
+                "inference_geo": "us",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            1_000,
+        );
+        assert_eq!(fast_us.token_price_multiplier, Some(2.2));
+        let fast_global = declared_request_usage(
+            "anthropic",
+            &json!({
+                "model": "claude-opus-5",
+                "speed": "fast",
+                "inference_geo": "global",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            1_000,
+        );
+        assert_eq!(fast_global.token_price_multiplier, Some(2.0));
+        let legacy_has_no_residency_multiplier = declared_request_usage(
+            "anthropic",
+            &json!({
+                "model": "claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            1_000,
+        );
+        assert_eq!(
+            legacy_has_no_residency_multiplier.token_price_multiplier,
+            None
+        );
+
+        let non_anthropic = declared_request_usage(
+            "openai",
+            &json!({"cache_control": {"type": "ephemeral", "ttl": "1h"}}),
+            1_000,
+        );
+        assert!(non_anthropic.is_empty());
+
+        let reserved = reserve_request_breakdown("claude-sonnet-5", 1_000, Some(100), &one_hour);
+        assert_eq!(reserved.uncached_input_usd, 0.0);
+        assert!((reserved.cache_write_usd - (1_000.0 / 1e6) * 4.0).abs() < 1e-12);
+        assert!((reserved.output_usd - (100.0 / 1e6) * 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn request_declarations_reserve_the_known_openai_web_search_fee() {
+        let declared = declared_request_usage(
+            "openai",
+            &json!({"web_search_options": {"search_context_size": "low"}}),
+            10,
+        );
+        assert_eq!(
+            declared.tool_calls,
+            vec![("openai:web_search".to_string(), 1)]
+        );
+        let reserved = reserve_request_breakdown("gpt-4o", 10, Some(10), &declared);
+        assert!((reserved.tool_usd - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gpt_5_6_long_context_cache_rates_match_published_prices() {
+        for (model, cached_input, cache_write) in [
+            ("gpt-5.6-luna", 0.04, 0.50),
+            ("gpt-5.6-terra", 0.40, 5.00),
+            ("gpt-5.6-sol", 1.00, 12.50),
+        ] {
+            let rates = rates_at(model, 272_001, at("2026-08-21T00:00:00Z")).unwrap();
+            assert_eq!(rates.cached_input_per_1m, Some(cached_input), "{model}");
+            assert_eq!(rates.cache_write_per_1m, Some(cache_write), "{model}");
+        }
+
         let b = price_usage(
             "gpt-5.6-sol",
             &BillableUsage {
                 uncached_input_tokens: 200_000,
-                cache_read_tokens: 100_000,
+                cache_read_tokens: 50_000,
+                cache_write_tokens: 50_000,
                 output_tokens: 1_000,
                 ..Default::default()
             },
         );
-        assert!(!b.is_complete);
-        assert_eq!(b.missing_dimensions, vec![BillableDimension::CacheRead]);
-        assert!((b.cache_read_usd - (100_000.0 / 1e6) * 10.00).abs() < 1e-12);
+        assert!(b.is_complete);
+        assert!(b.missing_dimensions.is_empty());
+        assert!((b.uncached_input_usd - 2.00).abs() < 1e-12);
+        assert!((b.cache_read_usd - 0.05).abs() < 1e-12);
+        assert!((b.cache_write_usd - 0.625).abs() < 1e-12);
+        assert!((b.output_usd - 0.045).abs() < 1e-12);
+        assert!((b.total_usd - 2.72).abs() < 1e-12);
+
         // Below the threshold the published short-context rate applies again.
         let short = price_usage(
             "gpt-5.6-sol",
@@ -2441,6 +3087,102 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_cache_creation_breakdown_is_disjoint_even_when_one_ttl_is_zero() {
+        for (cache_creation, aggregate, expected_5m, expected_1h) in [
+            (
+                json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 100}),
+                100,
+                0,
+                100,
+            ),
+            (
+                json!({"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 0}),
+                100,
+                100,
+                0,
+            ),
+            (
+                json!({"ephemeral_5m_input_tokens": 40, "ephemeral_1h_input_tokens": 60}),
+                100,
+                40,
+                60,
+            ),
+        ] {
+            let body = json!({
+                "usage": {
+                    "input_tokens": 1,
+                    "cache_creation_input_tokens": aggregate,
+                    "cache_creation": cache_creation
+                }
+            });
+            let usage = parse_usage("claude-sonnet-5", "anthropic", &body).unwrap();
+            assert_eq!(usage.cache_write_tokens, expected_5m);
+            assert_eq!(usage.cache_write_1h_tokens, expected_1h);
+            assert_eq!(usage.total_input_tokens(), 101);
+        }
+
+        let aggregate_only = json!({
+            "usage": {"input_tokens": 1, "cache_creation_input_tokens": 100}
+        });
+        let usage = parse_usage("claude-sonnet-5", "anthropic", &aggregate_only).unwrap();
+        assert_eq!(usage.cache_write_tokens, 100);
+        assert_eq!(usage.cache_write_1h_tokens, 0);
+    }
+
+    #[test]
+    fn anthropic_usage_applies_reported_us_residency_to_every_token_dimension() {
+        let body = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 50,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 10,
+                    "ephemeral_1h_input_tokens": 40
+                },
+                "inference_geo": "us",
+                "speed": "fast"
+            }
+        });
+        let usage = parse_usage("claude-sonnet-5", "anthropic", &body).unwrap();
+        assert_eq!(usage.token_price_multiplier, Some(2.2));
+        let cost = price_usage("claude-sonnet-5", &usage);
+        let standard = (100.0 / 1e6) * 2.0
+            + (20.0 / 1e6) * 10.0
+            + (30.0 / 1e6) * 0.2
+            + (10.0 / 1e6) * 2.5
+            + (40.0 / 1e6) * 4.0;
+        assert!((cost.total_usd - standard * 2.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn anthropic_pre_output_refusal_keeps_tokens_but_has_zero_cost() {
+        let body = json!({
+            "stop_reason": "refusal",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 0
+            }
+        });
+        let usage = parse_usage("claude-sonnet-5", "anthropic", &body).unwrap();
+        assert!(usage.billing_exempt);
+        assert_eq!(usage.uncached_input_tokens, 100);
+        assert_eq!(price_usage("claude-sonnet-5", &usage).total_usd, 0.0);
+
+        let billed_partial = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 1,
+                "unbilled_refusal": true
+            }
+        });
+        let usage = parse_usage("claude-sonnet-5", "anthropic", &billed_partial).unwrap();
+        assert!(!usage.billing_exempt, "partial-output refusals are billed");
+        assert!(price_usage("claude-sonnet-5", &usage).total_usd > 0.0);
+    }
+
+    #[test]
     fn the_gateways_anthropic_stream_translation_keeps_exclusive_semantics() {
         // `providers::anthropic_stream` emits an OpenAI-shaped final chunk in
         // which `prompt_tokens` is Anthropic's non-cache input and the cache hit
@@ -2485,6 +3227,90 @@ mod tests {
         assert_eq!(u.cache_read_tokens, 4_000);
         assert_eq!(u.cache_write_tokens, 500);
         assert_eq!(u.total_input_tokens(), 5_500);
+    }
+
+    #[test]
+    fn bedrock_anthropic_request_reservation_distinguishes_global_and_regional_profiles() {
+        let cases = [
+            (
+                "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                Some(1.1),
+                0.005775,
+            ),
+            (
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                Some(1.1),
+                0.005775,
+            ),
+            (
+                "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                None,
+                0.00525,
+            ),
+            (
+                "arn:aws:bedrock:us-east-1:111122223333:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                None,
+                0.00525,
+            ),
+            (
+                "arn:aws:bedrock:ap-southeast-2:111122223333:inference-profile/apac.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                Some(1.1),
+                0.005775,
+            ),
+        ];
+        for (model, multiplier, expected_total) in cases {
+            let mut declared = declared_request_usage("bedrock", &json!({"model": model}), 1_000);
+            assert_eq!(declared.token_price_multiplier, multiplier, "{model}");
+            // A strict reservation that knows the prompt will populate the
+            // provider cache must apply the same geo rate to the write premium.
+            declared.cache_write_tokens = 1_000;
+            let reserved = reserve_request_breakdown(model, 1_000, Some(100), &declared);
+            assert!(!reserved.assumed_model_rate, "{model}");
+            assert_eq!(reserved.uncached_input_usd, 0.0, "{model}");
+            assert!(
+                (reserved.total_usd - expected_total).abs() < 1e-12,
+                "{model}: {:?}",
+                reserved
+            );
+        }
+
+        let nova =
+            declared_request_usage("bedrock", &json!({"model": "amazon.nova-pro-v1:0"}), 1_000);
+        assert_eq!(nova.token_price_multiplier, None);
+        let nova_reserved =
+            reserve_request_breakdown("amazon.nova-pro-v1:0", 1_000, Some(100), &nova);
+        assert!((nova_reserved.total_usd - 0.00112).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bedrock_anthropic_settlement_multiplies_input_output_and_cache_dimensions() {
+        let response = json!({
+            "usage": {
+                "inputTokens": 1_000,
+                "outputTokens": 200,
+                "cacheReadInputTokens": 4_000,
+                "cacheWriteInputTokens": 500
+            }
+        });
+
+        let direct_model = "anthropic.claude-haiku-4-5-20251001-v1:0";
+        let direct_usage = parse_usage(direct_model, "bedrock", &response).unwrap();
+        assert_eq!(direct_usage.token_price_multiplier, Some(1.1));
+        let direct = price_usage(direct_model, &direct_usage);
+        assert!(!direct.assumed_model_rate);
+        assert!((direct.uncached_input_usd - 0.0011).abs() < 1e-12);
+        assert!((direct.cache_read_usd - 0.00044).abs() < 1e-12);
+        assert!((direct.cache_write_usd - 0.0006875).abs() < 1e-12);
+        assert!((direct.output_usd - 0.0011).abs() < 1e-12);
+        assert!((direct.total_usd - 0.0033275).abs() < 1e-12);
+
+        let global_model = "global.anthropic.claude-haiku-4-5-20251001-v1:0";
+        let global_usage = parse_usage(global_model, "bedrock", &response).unwrap();
+        assert_eq!(global_usage.token_price_multiplier, None);
+        let global = price_usage(global_model, &global_usage);
+        assert!(!global.assumed_model_rate);
+        assert!((global.total_usd - 0.003025).abs() < 1e-12);
+        assert!((direct.total_usd - global.total_usd * 1.1).abs() < 1e-12);
     }
 
     #[test]

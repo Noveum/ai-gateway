@@ -25,7 +25,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::State,
     http::{header, Request},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -61,7 +61,7 @@ fn resolve_max_output_tokens(body_json: &Value) -> Result<Option<u64>, &'static 
             continue;
         }
         return match v.as_u64() {
-            Some(n) if n <= MAX_OUTPUT_TOKEN_LIMIT => Ok(Some(n)),
+            Some(n) if n > 0 && n <= MAX_OUTPUT_TOKEN_LIMIT => Ok(Some(n)),
             _ => Err(key),
         };
     }
@@ -82,6 +82,57 @@ fn invalid_output_limit_response(key: &str) -> Response {
     });
     Response::builder()
         .status(axum::http::StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static error response is valid")
+}
+
+/// Provider-shaped 400 for a request whose completion is unbounded while a
+/// strict cost cap is active. Reserving the configured fallback would only be
+/// an estimate: the provider could emit more and move spend beyond the cap.
+fn missing_strict_output_limit_response() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": "a strict Nova Guard cost cap requires an explicit output limit (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`)",
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "missing_output_limit",
+        }
+    });
+    Response::builder()
+        .status(axum::http::StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static error response is valid")
+}
+
+fn invalid_strict_input_response(message: impl Into<String>) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message.into(),
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "unsupported_strict_input",
+        }
+    });
+    Response::builder()
+        .status(axum::http::StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static error response is valid")
+}
+
+fn transformed_body_too_large_response() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": format!("transformed request body exceeds the {MAX_BODY}-byte gateway limit"),
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "request_too_large",
+        }
+    });
+    Response::builder()
+        .status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .expect("static error response is valid")
@@ -135,12 +186,31 @@ pub async fn guard_middleware(
         return next.run(req).await;
     }
 
+    let provider = header_str(&req, "x-provider").unwrap_or_else(|| "openai".to_string());
+    if crate::routing::resolve_provider(&provider).is_none()
+        && !provider.eq_ignore_ascii_case("anthropic")
+        && !provider.eq_ignore_ascii_case("bedrock")
+    {
+        return crate::error::AppError::UnsupportedProvider.into_response();
+    }
+    let admission_mode_override = gs
+        .admission
+        .as_ref()
+        .and_then(|client| client.mode_override());
+    let strict_input_required = engine.requires_bounded_json_input(admission_mode_override);
+
+    // An opaque POST cannot prove its model scope or bound provider-side input.
+    // Advisory policies preserve the historical pass-through behavior.
+    if is_proxy_post(&req) && strict_input_required && !is_guardable(&req) {
+        return invalid_strict_input_response(
+            "a strict Nova Guard cost cap supports only JSON /v1/chat/completions requests",
+        );
+    }
+
     // Only inspect JSON POST bodies on the proxy path.
     if !is_guardable(&req) {
         return next.run(req).await;
     }
-
-    let provider = header_str(&req, "x-provider").unwrap_or_else(|| "openai".to_string());
 
     // --- INPUT PHASE ---
     let (parts, body) = req.into_parts();
@@ -158,12 +228,77 @@ pub async fn guard_middleware(
     };
 
     let json: Option<Value> = serde_json::from_slice(&bytes).ok();
+    if strict_input_required && json.is_none() {
+        return invalid_strict_input_response(
+            "a strict Nova Guard cost cap requires a valid JSON request body",
+        );
+    }
     let model = json
         .as_ref()
         .and_then(|j| j.get("model"))
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+    if strict_input_required && model.trim().is_empty() {
+        return invalid_strict_input_response(
+            "a strict Nova Guard cost cap requires a non-empty model so policy scope and pricing can be resolved",
+        );
+    }
+
+    // Provider-local validation must happen before atomic admission. Once a
+    // reservation exists, an early 4xx would otherwise look indistinguishable
+    // from an uncertain provider failure and conservatively retain the hold,
+    // even though these errors prove no upstream call was attempted.
+    if engine.stateful_policy_count() > 0 && provider.eq_ignore_ascii_case("anthropic") {
+        let bearer_key = parts
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::routing::authorization_bearer_token);
+        let native_key = parts
+            .headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if bearer_key.or(native_key).is_none() {
+            return crate::error::AppError::MissingApiKey.into_response();
+        }
+        if let Some(body_json) = &json {
+            if let Err(message) = crate::routing::openai_to_anthropic_messages(body_json.clone()) {
+                return crate::error::AppError::RequestError(message).into_response();
+            }
+        }
+    } else if engine.stateful_policy_count() > 0 && provider.eq_ignore_ascii_case("bedrock") {
+        let access = parts
+            .headers
+            .get("x-aws-access-key-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let secret = parts
+            .headers
+            .get("x-aws-secret-access-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if access.is_none() || secret.is_none() {
+            return crate::error::AppError::RequestError(
+                "Bedrock requires x-aws-access-key-id and x-aws-secret-access-key headers"
+                    .to_string(),
+            )
+            .into_response();
+        }
+    } else if engine.stateful_policy_count() > 0 {
+        let bearer = parts
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::routing::authorization_bearer_token);
+        if bearer.is_none() {
+            return crate::error::AppError::MissingApiKey.into_response();
+        }
+    }
 
     // Live cost/rate counters from the platform (for cost_cap/rate_limit). `None`
     // when platform-managed Nova Guard isn't configured → those policies fail open.
@@ -193,13 +328,26 @@ pub async fn guard_middleware(
         .admission
         .as_ref()
         .filter(|a| a.strict_for(engine.has_strict_cost_cap()));
+    let strict_cost_cap = strict_client.is_some_and(|client| {
+        engine.requires_explicit_output_limit(&model, client.mode_override())
+    });
 
-    if let Some(mut body_json) = json.clone() {
+    if let Some(body_json) = json.clone() {
         let input_text = flatten_input_text(&body_json);
-        let est_input_tokens =
-            crate::telemetry::provider_metrics::ProviderMetrics::estimate_tokens_from_text(
-                &input_text,
+        // Build the exact candidate that will be forwarded before estimating
+        // it. Policy replacements and forced stream usage can expand the body;
+        // strict admission must reserve the post-transform shape, not the
+        // caller's smaller original.
+        let mut forward_body = body_json.clone();
+        apply_input_transforms(&engine, &model, &mut forward_body);
+        if gs.usage.is_some()
+            && crate::policy::worker_remote::force_include_usage(&provider, &mut forward_body)
+        {
+            debug!(
+                model = %model,
+                "Nova Guard: forcing stream_options.include_usage for platform metering"
             );
+        }
         // Untrusted client JSON — reject an unusable limit before it reaches the
         // admission arithmetic (or the provider).
         let max_output_tokens = match resolve_max_output_tokens(&body_json) {
@@ -210,14 +358,72 @@ pub async fn guard_middleware(
                 return invalid_output_limit_response(key);
             }
         };
-        // Always yields a figure: an unknown model reserves the defensive
-        // assumption rather than $0, so it cannot walk past a cap it will then
-        // be billed against. See `pricing::reserve_request_cost`.
-        let est_request_cost = crate::policy::pricing::reserve_request_cost(
+        if strict_cost_cap && max_output_tokens.is_none() {
+            warn!(
+                provider = %provider,
+                model = %model,
+                "Nova Guard: rejecting an unbounded request under a strict cost cap"
+            );
+            return missing_strict_output_limit_response();
+        }
+        let est_input_tokens = if strict_cost_cap {
+            if provider.eq_ignore_ascii_case("openai") {
+                let override_base = std::env::var(crate::routing::OPENAI_BASE_URL_VAR).ok();
+                if let Err(message) =
+                    crate::routing::validate_strict_openai_base_url(override_base.as_deref())
+                {
+                    return invalid_strict_input_response(message);
+                }
+            } else if provider.eq_ignore_ascii_case("anthropic") {
+                let override_base = std::env::var(crate::routing::ANTHROPIC_BASE_URL_VAR).ok();
+                if let Err(message) =
+                    crate::routing::validate_strict_anthropic_base_url(override_base.as_deref())
+                {
+                    return invalid_strict_input_response(message);
+                }
+            }
+            match crate::routing::prepare_strict_admission_body(
+                &provider,
+                parts.uri.path(),
+                &mut forward_body,
+            ) {
+                Ok(tokens) => tokens,
+                Err(message) => return invalid_strict_input_response(message),
+            }
+        } else {
+            crate::routing::estimate_admission_input_tokens(&forward_body, false)
+        };
+        let serialized_forward = match serde_json::to_vec(&forward_body) {
+            Ok(body) => body,
+            Err(error) => {
+                return invalid_strict_input_response(format!(
+                    "request body could not be serialized after Nova Guard transforms: {error}"
+                ))
+            }
+        };
+        if serialized_forward.len() > MAX_BODY {
+            return transformed_body_too_large_response();
+        }
+        if serialized_forward.as_slice() != bytes.as_ref() {
+            forward_bytes = serialized_forward.into();
+            body_mutated = true;
+        }
+        // Reserve every billable dimension the request declares up front. An
+        // unknown model still takes the defensive catalog maximum; a cache
+        // miss or paid search cannot walk past a cap that later settlement
+        // correctly charges.
+        let declared_usage = crate::policy::pricing::declared_request_usage(
+            &provider,
+            &forward_body,
+            est_input_tokens,
+        );
+        let est_request_cost = crate::policy::pricing::reserve_request_breakdown(
             &model,
             est_input_tokens,
             max_output_tokens,
-        );
+            &declared_usage,
+        )
+        .total_usd;
         // `max_output_tokens` is bounded by `MAX_OUTPUT_TOKEN_LIMIT` above, so
         // this cannot overflow; `saturating_add` keeps that true if either
         // bound ever changes.
@@ -400,60 +606,9 @@ pub async fn guard_middleware(
             return block_response(&provider, &model, block, engine.block_mode());
         }
 
-        // Apply input transforms per text segment (so structured messages stay valid).
-        if result.transformed_text.is_some()
-            && apply_input_transforms(&engine, &model, &mut body_json)
-        {
-            if let Ok(v) = serde_json::to_vec(&body_json) {
-                forward_bytes = v.into();
-                body_mutated = true;
-            }
-        }
-
-        // When the platform is metering usage, ask OpenAI to append the final
-        // usage chunk to streaming responses (`stream_options.include_usage`).
-        // Without it a default stream carries no token counts, the ALLOWED event
-        // posts $0, and cost caps silently never advance. The extra final chunk
-        // is standard OpenAI shape (empty `choices` + `usage`) that SDKs handle.
-        //
-        // The flag is FORCED, not merely defaulted: an explicit
-        // `include_usage: false` is overridden while platform metering is
-        // active. Honoring it would let any caller select approximate
-        // accounting for their own spend — a real Luna stream that reports
-        // 11 in / 4 out ($0.000035) falls back to 6 in / 1 out ($0.000012),
-        // a 65.7% undercount, and reasoning tokens are not recoverable from
-        // visible deltas at all. The delta-based estimator stays what it was
-        // meant to be: an outage fallback for streams that arrive without
-        // usage, not a client-selectable accounting mode.
-        if gs.usage.is_some()
-            && provider.eq_ignore_ascii_case("openai")
-            && body_json.get("stream").and_then(|s| s.as_bool()) == Some(true)
-            && body_json
-                .pointer("/stream_options/include_usage")
-                .and_then(|v| v.as_bool())
-                != Some(true)
-        {
-            debug!(
-                model = %model,
-                overridden = body_json
-                    .pointer("/stream_options/include_usage")
-                    .is_some(),
-                "Nova Guard: forcing stream_options.include_usage for platform metering"
-            );
-            // Replace a missing OR malformed `stream_options` wholesale —
-            // indexing into a non-object would panic.
-            match body_json
-                .get_mut("stream_options")
-                .filter(|v| v.is_object())
-            {
-                Some(opts) => opts["include_usage"] = serde_json::json!(true),
-                None => body_json["stream_options"] = serde_json::json!({"include_usage": true}),
-            }
-            if let Ok(v) = serde_json::to_vec(&body_json) {
-                forward_bytes = v.into();
-                body_mutated = true;
-            }
-        }
+        // `forward_body` was transformed and forced to include stream usage
+        // before admission, so the exact bytes measured above are already the
+        // bytes this request will forward.
     }
 
     let mut parts = parts;
@@ -482,18 +637,11 @@ pub async fn guard_middleware(
         // streamed reply. So tee the body: bytes pass through untouched while a
         // scanner reads the final usage frame, and settle from what it saw.
         if actual_usage.is_none() && is_event_stream(&response) {
-            return attach_stream_settlement(response, guard, model.clone());
+            return attach_stream_settlement(response, guard, model.clone(), provider.clone());
         }
         return match actual_usage {
             Some(u) => {
-                let cost = crate::policy::pricing::price_usage(
-                    &model,
-                    &crate::policy::pricing::BillableUsage::from_tokens(
-                        u.input_tokens,
-                        u.output_tokens,
-                    ),
-                )
-                .total_usd;
+                let cost = actual_usage_cost(&model, u);
                 debug!(
                     reservation = %guard.reservation_id(), model = %model,
                     input_tokens = u.input_tokens, output_tokens = u.output_tokens, cost,
@@ -545,6 +693,7 @@ pub async fn guard_middleware(
                 response,
                 gs.usage.clone(),
                 model.clone(),
+                provider.clone(),
                 estimate,
                 reservation.take(),
             );
@@ -612,10 +761,11 @@ fn attach_stream_settlement(
     response: Response,
     guard: crate::policy::admission::AdmissionGuard,
     model: String,
+    provider: String,
 ) -> Response {
     use futures_util::StreamExt;
     let (parts, body) = response.into_parts();
-    let mut settler = StreamSettler::new(guard, model);
+    let mut settler = StreamSettler::new(guard, model, provider);
     let stream = body.into_data_stream().map(move |chunk| {
         if let Ok(bytes) = chunk.as_ref() {
             settler.observe(bytes);
@@ -641,14 +791,20 @@ struct StreamSettler {
     guard: Option<crate::policy::admission::AdmissionGuard>,
     scanner: crate::policy::metering::StreamUsageScanner,
     model: String,
+    provider: String,
 }
 
 impl StreamSettler {
-    fn new(guard: crate::policy::admission::AdmissionGuard, model: String) -> Self {
+    fn new(
+        guard: crate::policy::admission::AdmissionGuard,
+        model: String,
+        provider: String,
+    ) -> Self {
         Self {
             guard: Some(guard),
             scanner: crate::policy::metering::StreamUsageScanner::new(),
             model,
+            provider,
         }
     }
 
@@ -664,16 +820,9 @@ impl Drop for StreamSettler {
             return;
         };
         self.scanner.finish();
-        match self.scanner.usage() {
+        match self.scanner.usage_priced(&self.model, &self.provider) {
             Some(u) => {
-                let cost = crate::policy::pricing::price_usage(
-                    &self.model,
-                    &crate::policy::pricing::BillableUsage::from_tokens(
-                        u.input_tokens,
-                        u.output_tokens,
-                    ),
-                )
-                .total_usd;
+                let cost = actual_usage_cost(&self.model, u);
                 debug!(
                     reservation = %guard.reservation_id(), model = %self.model,
                     input_tokens = u.input_tokens, output_tokens = u.output_tokens, cost,
@@ -712,6 +861,7 @@ fn attach_stream_metering(
     response: Response,
     usage: Option<crate::policy::usage::UsageReporter>,
     model: String,
+    provider: String,
     estimate: Option<RequestEstimate>,
     reservation: Option<crate::policy::remote::ReservationGuard>,
 ) -> Response {
@@ -726,6 +876,7 @@ fn attach_stream_metering(
     let mut meter = StreamMeter {
         usage,
         model,
+        provider,
         estimate,
         _reservation: reservation,
         scanner: crate::policy::metering::StreamUsageScanner::new(),
@@ -743,6 +894,7 @@ fn attach_stream_metering(
 struct StreamMeter {
     usage: Option<crate::policy::usage::UsageReporter>,
     model: String,
+    provider: String,
     estimate: Option<RequestEstimate>,
     /// Completes the pending-ledger entry on drop; never read.
     _reservation: Option<crate::policy::remote::ReservationGuard>,
@@ -761,24 +913,18 @@ impl Drop for StreamMeter {
         // Measured counts when the stream reported them; otherwise the
         // conservative forward estimate — a call this layer could not measure
         // must not be metered at $0 (same choice `abandon` makes in strict mode).
-        let (input_tokens, output_tokens, cost_usd) = match self.scanner.usage() {
-            Some(u) => (
-                u.input_tokens,
-                u.output_tokens,
-                crate::policy::pricing::price_usage(
-                    &self.model,
-                    &crate::policy::pricing::BillableUsage::from_tokens(
-                        u.input_tokens,
-                        u.output_tokens,
-                    ),
-                )
-                .total_usd,
-            ),
-            None => match self.estimate {
-                Some(e) => (e.input_tokens, e.output_tokens, e.cost_usd),
-                None => return,
-            },
-        };
+        let (input_tokens, output_tokens, cost_usd) =
+            match self.scanner.usage_priced(&self.model, &self.provider) {
+                Some(u) => (
+                    u.input_tokens,
+                    u.output_tokens,
+                    actual_usage_cost(&self.model, u),
+                ),
+                None => match self.estimate {
+                    Some(e) => (e.input_tokens, e.output_tokens, e.cost_usd),
+                    None => return,
+                },
+            };
         debug!(
             model = %self.model, input_tokens, output_tokens, cost_usd,
             "Nova Guard: metering a shared-gateway stream against its own tenant"
@@ -838,18 +984,7 @@ fn report_unreserved_usage(
     // reservation, and for the same reason: a call this layer cannot measure
     // (a stream, a body past the inspection cap) must not be metered at $0.
     let (input_tokens, output_tokens, cost_usd) = match (actual, estimate) {
-        (Some(u), _) => (
-            u.input_tokens,
-            u.output_tokens,
-            crate::policy::pricing::price_usage(
-                model,
-                &crate::policy::pricing::BillableUsage::from_tokens(
-                    u.input_tokens,
-                    u.output_tokens,
-                ),
-            )
-            .total_usd,
-        ),
+        (Some(u), _) => (u.input_tokens, u.output_tokens, actual_usage_cost(model, u)),
         (None, Some(e)) => (e.input_tokens, e.output_tokens, e.cost_usd),
         // No usage and no estimate: nothing honest to report.
         (None, None) => return,
@@ -867,19 +1002,38 @@ fn report_unreserved_usage(
     ));
 }
 
+/// Prefer the provider-aware price recovered alongside authoritative usage;
+/// retain token-only pricing for providers that report no detailed dimensions.
+fn actual_usage_cost(model: &str, usage: ActualUsage) -> f64 {
+    usage.cost_usd.unwrap_or_else(|| {
+        crate::policy::pricing::price_usage(
+            model,
+            &crate::policy::pricing::BillableUsage::from_tokens(
+                usage.input_tokens,
+                usage.output_tokens,
+            ),
+        )
+        .total_usd
+    })
+}
+
 // Authoritative token counts + the parser that recovers them from a buffered
 // provider body. Both live in `policy::metering` so the Worker bridge (which has
 // no Tower/Axum layer) reads usage exactly the way this middleware does.
-pub use crate::policy::metering::{extract_actual_usage, ActualUsage};
+pub use crate::policy::metering::{extract_actual_usage, extract_actual_usage_priced, ActualUsage};
 
-/// Should this request be inspected? POST, JSON, on the `/v1/` proxy path.
-fn is_guardable<B>(req: &Request<B>) -> bool {
+fn is_proxy_post<B>(req: &Request<B>) -> bool {
     if req.method() != axum::http::Method::POST {
         return false;
     }
     // Anchor to the proxy route prefix so unrelated JSON POSTs that merely
     // contain "/v1/" elsewhere in the path are not buffered/scanned.
-    if !req.uri().path().starts_with("/v1/") {
+    req.uri().path().starts_with("/v1/")
+}
+
+/// Should this request be inspected? POST, JSON, on the `/v1/` proxy path.
+fn is_guardable<B>(req: &Request<B>) -> bool {
+    if !is_proxy_post(req) {
         return false;
     }
     req.headers()
@@ -969,7 +1123,7 @@ async fn enforce_output(
     // The provider's own token counts, if it reported them. Read BEFORE any
     // block/transform path so settlement is accurate even when output-phase
     // enforcement replaces the body: the model call happened either way.
-    let actual_usage = extract_actual_usage(&body_json);
+    let actual_usage = extract_actual_usage_priced(model, provider, &body_json);
 
     // Native providers (notably Anthropic) convert the upstream body to OpenAI
     // chat-completion shape BEFORE this middleware runs. Pick the flatten/transform
@@ -1550,7 +1704,8 @@ mod tests {
             })),
             Some(ActualUsage {
                 input_tokens: 123,
-                output_tokens: 45
+                output_tokens: 45,
+                cost_usd: None,
             })
         );
         // Anthropic shape (reaches us on pass-through paths).
@@ -1560,16 +1715,15 @@ mod tests {
             })),
             Some(ActualUsage {
                 input_tokens: 7,
-                output_tokens: 9
+                output_tokens: 9,
+                cost_usd: None,
             })
         );
-        // A half-reported usage block still counts what it does carry.
+        // A half-reported usage block is not authoritative: settling it with
+        // an invented zero would release spend the provider may have billed.
         assert_eq!(
             extract_actual_usage(&serde_json::json!({"usage": {"completion_tokens": 5}})),
-            Some(ActualUsage {
-                input_tokens: 0,
-                output_tokens: 5
-            })
+            None
         );
     }
 
@@ -1582,6 +1736,7 @@ mod tests {
             serde_json::json!({"choices": [{"message": {"content": "hi"}}]}),
             serde_json::json!({"usage": {}}),
             serde_json::json!({"usage": {"total_tokens": 10}}),
+            serde_json::json!({"usage": {"prompt_tokens": 7}}),
             serde_json::json!({"usage": null}),
             serde_json::json!({}),
         ] {

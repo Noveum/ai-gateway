@@ -9,7 +9,7 @@
 //! model id, so every compatible provider gets accurate per-model pricing
 //! without a bespoke cost function.
 
-use super::utils::log_tracking_headers;
+use super::utils::{log_tracking_headers, normalized_bearer_header};
 use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
@@ -72,23 +72,9 @@ impl Provider for OpenAICompatibleProvider {
             .get(http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
         {
-            // Validate the Bearer token shape locally so malformed credentials
-            // fail fast as InvalidHeader rather than being forwarded upstream
-            // (where they'd surface as an opaque 401 to the caller).
-            if !auth.starts_with("Bearer ") {
-                error!(
-                    "Invalid authorization format for {} request - must start with 'Bearer '",
-                    self.name
-                );
-                return Err(AppError::InvalidHeader);
-            }
-            if auth.len() <= 7 {
-                error!("Empty Bearer token for {} request", self.name);
-                return Err(AppError::InvalidHeader);
-            }
             headers.insert(
                 http::header::AUTHORIZATION,
-                http::header::HeaderValue::from_str(auth).map_err(|_| {
+                normalized_bearer_header(auth).map_err(|_| {
                     error!("Failed to process {} authorization header", self.name);
                     AppError::InvalidHeader
                 })?,
@@ -265,6 +251,12 @@ mod tests {
         assert_eq!(
             out.get(http::header::CONTENT_TYPE).unwrap(),
             "application/json"
+        );
+        h.insert("authorization", "bearer sk-x".parse().unwrap());
+        let normalized = p.process_headers(&h).unwrap();
+        assert_eq!(
+            normalized.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-x"
         );
     }
 

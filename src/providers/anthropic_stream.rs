@@ -32,9 +32,13 @@
 //!    to price the request.
 
 use crate::policy::metering::SseFrameBuffer;
+#[cfg(not(target_arch = "wasm32"))]
 use axum::body::{Body, Bytes};
+#[cfg(not(target_arch = "wasm32"))]
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::pin::Pin;
 use tracing::{debug, warn};
 
@@ -62,7 +66,7 @@ impl TransformOutput {
 fn map_stop_reason(reason: Option<&str>) -> &str {
     match reason {
         Some("end_turn") | Some("stop_sequence") | Some("pause_turn") => "stop",
-        Some("max_tokens") => "length",
+        Some("max_tokens" | "model_context_window_exceeded") => "length",
         Some("tool_use") => "tool_calls",
         Some("refusal") => "content_filter",
         Some(other) => other,
@@ -84,7 +88,21 @@ pub struct AnthropicStreamTransformer {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cached_tokens: Option<u64>,
+    /// Raw provider-specific billing dimensions retained on the terminal usage
+    /// chunk so NovaGuard can price cache writes and server tools exactly.
+    detailed_usage: serde_json::Map<String, Value>,
     finish_reason: Option<String>,
+    /// Anthropic content-block indexes are unrelated to OpenAI's dense tool
+    /// indexes. Keep the mapping per stream so parallel calls never bleed into
+    /// one another and each subsequent `input_json_delta` lands on the tool
+    /// whose id/name were announced at `content_block_start`.
+    tool_indexes: HashMap<u64, u64>,
+    /// Built-in server and MCP tool blocks also stream `input_json_delta`, but
+    /// they are executed by Anthropic rather than returned to the OpenAI
+    /// client as function calls. Track their content indexes so those JSON
+    /// fragments can be ignored without treating the stream as malformed.
+    ignored_json_indexes: HashSet<u64>,
+    next_tool_index: u64,
     /// The `finish_reason` + `usage` chunk has been emitted.
     final_emitted: bool,
     saw_message_stop: bool,
@@ -104,7 +122,11 @@ impl AnthropicStreamTransformer {
             input_tokens: None,
             output_tokens: None,
             cached_tokens: None,
+            detailed_usage: serde_json::Map::new(),
             finish_reason: None,
+            tool_indexes: HashMap::new(),
+            ignored_json_indexes: HashSet::new(),
+            next_tool_index: 0,
             final_emitted: false,
             saw_message_stop: false,
             done: false,
@@ -186,6 +208,14 @@ impl AnthropicStreamTransformer {
         }
     }
 
+    /// Surface a transport failure through the same client-visible error frame
+    /// used for malformed/upstream-error events. The native Axum adapter and
+    /// the Worker Fetch adapter both call this when their upstream byte stream
+    /// fails between complete SSE frames.
+    pub fn fail_transport(&mut self, message: impl Into<String>) -> TransformOutput {
+        self.fail(String::new(), StreamFailure::gateway(message))
+    }
+
     /// Translate one reassembled SSE frame.
     fn handle_frame(&mut self, frame: &str) -> Result<String, StreamFailure> {
         // Per the SSE spec a frame may carry several `data:` lines, joined with
@@ -219,8 +249,8 @@ impl AnthropicStreamTransformer {
 
         match event_type.as_str() {
             "message_start" => Ok(self.on_message_start(&event)),
-            "content_block_start" => Ok(self.on_content_block_start(&event)),
-            "content_block_delta" => Ok(self.on_content_block_delta(&event)),
+            "content_block_start" => self.on_content_block_start(&event),
+            "content_block_delta" => self.on_content_block_delta(&event),
             "content_block_stop" => Ok(String::new()),
             "message_delta" => Ok(self.on_message_delta(&event)),
             "message_stop" => Ok(self.on_message_stop()),
@@ -262,57 +292,151 @@ impl AnthropicStreamTransformer {
         )
     }
 
-    /// A text block may open with content already in it; anything else (tool
-    /// use, thinking) has no OpenAI `delta.content` equivalent.
-    fn on_content_block_start(&mut self, event: &Value) -> String {
-        let text = event
-            .get("content_block")
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .and_then(|b| b.get("text"))
+    /// A text block may open with content already in it. A tool block announces
+    /// the OpenAI tool call (id/name/index); its JSON arguments arrive in later
+    /// `input_json_delta` events.
+    fn on_content_block_start(&mut self, event: &Value) -> Result<String, StreamFailure> {
+        let block = event.get("content_block").ok_or_else(|| {
+            StreamFailure::gateway("anthropic content_block_start omitted content_block")
+        })?;
+        match block
+            .get("type")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        if text.is_empty() {
-            String::new()
-        } else {
-            self.content_delta(text)
+            .unwrap_or_default()
+        {
+            "text" => {
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(if text.is_empty() {
+                    String::new()
+                } else {
+                    self.content_delta(text)
+                })
+            }
+            "tool_use" => {
+                let block_index = event.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    StreamFailure::gateway("anthropic tool_use block omitted its index")
+                })?;
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        StreamFailure::gateway("anthropic tool_use block omitted its id")
+                    })?;
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        StreamFailure::gateway("anthropic tool_use block omitted its name")
+                    })?;
+                if self.tool_indexes.contains_key(&block_index) {
+                    return Err(StreamFailure::gateway(format!(
+                        "anthropic repeated tool content-block index {block_index}"
+                    )));
+                }
+                let tool_index = self.next_tool_index;
+                self.next_tool_index = self.next_tool_index.saturating_add(1);
+                self.tool_indexes.insert(block_index, tool_index);
+                Ok(self.tool_start_delta(tool_index, id, name))
+            }
+            "server_tool_use" | "mcp_tool_use" => {
+                if let Some(block_index) = event.get("index").and_then(Value::as_u64) {
+                    self.ignored_json_indexes.insert(block_index);
+                }
+                debug!(
+                    "Ignoring Anthropic-managed tool content block: {}",
+                    block
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                );
+                Ok(String::new())
+            }
+            // Thinking/signature/citation blocks have no Chat Completions delta
+            // representation. They remain intentionally absent rather than
+            // being misreported as assistant text.
+            other => {
+                debug!("Ignoring non-text Anthropic content block: {}", other);
+                Ok(String::new())
+            }
         }
     }
 
-    fn on_content_block_delta(&mut self, event: &Value) -> String {
+    fn on_content_block_delta(&mut self, event: &Value) -> Result<String, StreamFailure> {
         let delta = event.get("delta");
         let kind = delta
             .and_then(|d| d.get("type"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if kind != "text_delta" {
-            debug!("Ignoring non-text Anthropic content delta: {}", kind);
-            return String::new();
-        }
-        let text = delta
-            .and_then(|d| d.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if text.is_empty() {
-            String::new()
-        } else {
-            self.content_delta(text)
+        match kind {
+            "text_delta" => {
+                let text = delta
+                    .and_then(|d| d.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(if text.is_empty() {
+                    String::new()
+                } else {
+                    self.content_delta(text)
+                })
+            }
+            "input_json_delta" => {
+                let block_index = event.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                    StreamFailure::gateway("anthropic tool argument delta omitted its index")
+                })?;
+                if self.ignored_json_indexes.contains(&block_index) {
+                    return Ok(String::new());
+                }
+                let tool_index = self
+                    .tool_indexes
+                    .get(&block_index)
+                    .copied()
+                    .ok_or_else(|| {
+                        StreamFailure::gateway(format!(
+                            "anthropic tool argument delta referenced unknown block {block_index}"
+                        ))
+                    })?;
+                let partial = delta
+                    .and_then(|d| d.get("partial_json"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        StreamFailure::gateway("anthropic input_json_delta omitted partial_json")
+                    })?;
+                Ok(if partial.is_empty() {
+                    String::new()
+                } else {
+                    self.tool_arguments_delta(tool_index, partial)
+                })
+            }
+            other => {
+                debug!("Ignoring non-text Anthropic content delta: {}", other);
+                Ok(String::new())
+            }
         }
     }
 
     /// `message_delta` carries the stop reason and the **output** half of the
     /// token accounting — the point at which usage becomes complete.
     fn on_message_delta(&mut self, event: &Value) -> String {
-        if let Some(reason) = event
+        let reason = event
             .get("delta")
             .and_then(|d| d.get("stop_reason"))
-            .and_then(Value::as_str)
-        {
+            .and_then(Value::as_str);
+        if let Some(reason) = reason {
             self.finish_reason = Some(map_stop_reason(Some(reason)).to_string());
         }
         if let Some(usage) = event.get("usage") {
             self.absorb_usage(usage);
         }
-        self.final_chunk()
+        if reason.is_some() {
+            self.final_chunk()
+        } else {
+            String::new()
+        }
     }
 
     fn on_message_stop(&mut self) -> String {
@@ -345,6 +469,18 @@ impl AnthropicStreamTransformer {
         if cached.is_some() {
             self.cached_tokens = cached;
         }
+        for name in [
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_creation",
+            "server_tool_use",
+            "inference_geo",
+            "speed",
+        ] {
+            if let Some(value) = usage.get(name) {
+                self.detailed_usage.insert(name.to_string(), value.clone());
+            }
+        }
     }
 
     fn content_delta(&self, text: &str) -> String {
@@ -354,8 +490,45 @@ impl AnthropicStreamTransformer {
         )
     }
 
+    fn tool_start_delta(&self, index: u64, id: &str, name: &str) -> String {
+        self.chunk(
+            json!([{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""}
+                    }]
+                },
+                "finish_reason": Value::Null
+            }]),
+            None,
+        )
+    }
+
+    fn tool_arguments_delta(&self, index: u64, partial_json: &str) -> String {
+        self.chunk(
+            json!([{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "function": {"arguments": partial_json}
+                    }]
+                },
+                "finish_reason": Value::Null
+            }]),
+            None,
+        )
+    }
+
     /// The terminating chunk: finish reason plus the merged usage totals.
     fn final_chunk(&mut self) -> String {
+        if self.final_emitted {
+            return String::new();
+        }
         self.final_emitted = true;
         let finish = self
             .finish_reason
@@ -366,10 +539,23 @@ impl AnthropicStreamTransformer {
         let mut usage = json!({
             "prompt_tokens": input,
             "completion_tokens": output,
-            "total_tokens": input + output,
+            "total_tokens": input.saturating_add(output),
         });
         if let Some(cached) = self.cached_tokens {
             usage["prompt_tokens_details"] = json!({ "cached_tokens": cached });
+        }
+        if let Some(cache_write) = self
+            .detailed_usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            usage["prompt_tokens_details"]["cache_write_tokens"] = json!(cache_write);
+        }
+        for (name, value) in &self.detailed_usage {
+            usage[name] = value.clone();
+        }
+        if finish == "content_filter" && output == 0 {
+            usage["unbilled_refusal"] = Value::Bool(true);
         }
         self.chunk(
             json!([{ "index": 0, "delta": {}, "finish_reason": finish }]),
@@ -430,9 +616,11 @@ impl StreamFailure {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>;
 
 /// Driver phases for [`transform_body`].
+#[cfg(not(target_arch = "wasm32"))]
 enum Phase {
     /// Reading the upstream body.
     Body(ByteStream, Box<AnthropicStreamTransformer>),
@@ -450,6 +638,7 @@ enum Phase {
 /// looking like a completed response. (An outer layer that swallows the
 /// transport error still cannot make it look complete: `data: [DONE]` is never
 /// written once the stream has failed.)
+#[cfg(not(target_arch = "wasm32"))]
 pub fn transform_body(body: Body, created: i64) -> Body {
     let stream = futures_util::stream::unfold(
         Phase::Body(
@@ -476,8 +665,7 @@ pub fn transform_body(body: Body, created: i64) -> Body {
                         Some(Err(e)) => {
                             // The upstream connection broke mid-response: same
                             // rule as a bad event — make it visible.
-                            let out = transformer
-                                .fail(String::new(), StreamFailure::gateway(e.to_string()));
+                            let out = transformer.fail_transport(e.to_string());
                             return Some((
                                 Ok(Bytes::from(out.sse)),
                                 Phase::Abort(out.fatal.unwrap_or_default()),
@@ -735,7 +923,7 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let (sse, fatal) = run(raw.as_bytes(), 1);
-        assert!(fatal.is_none());
+        assert!(fatal.is_none(), "{fatal:?}");
         let out = chunks(&sse);
         let last = out.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "stop");
@@ -747,20 +935,68 @@ mod tests {
     #[test]
     fn cache_read_tokens_are_surfaced_without_inflating_prompt_tokens() {
         let raw = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5-20250929\",\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100}}}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":20,\"cache_creation\":{\"ephemeral_5m_input_tokens\":12,\"ephemeral_1h_input_tokens\":8},\"server_tool_use\":{\"web_search_requests\":2},\"inference_geo\":\"us\",\"speed\":\"fast\"}}}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":7}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let (sse, fatal) = run(raw.as_bytes(), 64);
-        assert!(fatal.is_none());
+        assert!(fatal.is_none(), "overflow stream failed: {fatal:?}");
         let out = chunks(&sse);
         let last = out.last().unwrap();
         assert_eq!(last["usage"]["prompt_tokens"], 5);
         assert_eq!(last["usage"]["prompt_tokens_details"]["cached_tokens"], 100);
+        assert_eq!(last["usage"]["cache_creation_input_tokens"], 20);
+        assert_eq!(
+            last["usage"]["cache_creation"]["ephemeral_1h_input_tokens"],
+            8
+        );
+        assert_eq!(last["usage"]["server_tool_use"]["web_search_requests"], 2);
+        assert_eq!(last["usage"]["inference_geo"], "us");
+        assert_eq!(last["usage"]["speed"], "fast");
         assert_eq!(
             last["choices"][0]["finish_reason"], "length",
             "max_tokens maps to length"
         );
+    }
+
+    #[test]
+    fn terminal_usage_totals_saturate_instead_of_overflowing() {
+        let raw = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_overflow\",\"model\":\"claude-sonnet-5\",\"usage\":{{\"input_tokens\":{}}}}}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            u64::MAX
+        );
+        let (sse, fatal) = run(raw.as_bytes(), 64);
+        assert!(fatal.is_none(), "overflow stream failed: {fatal:?}");
+        let out = chunks(&sse);
+        let terminal = out
+            .iter()
+            .find(|chunk| chunk.get("usage").is_some())
+            .expect("terminal usage chunk");
+        assert_eq!(terminal["usage"]["total_tokens"], u64::MAX);
+    }
+
+    #[test]
+    fn terminal_usage_preserves_geo_and_marks_only_pre_output_refusals_unbilled() {
+        for (output_tokens, expected_unbilled) in [(0, true), (1, false)] {
+            let raw = format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_refusal\",\"model\":\"claude-sonnet-5\",\"usage\":{{\"input_tokens\":100,\"inference_geo\":\"us\"}}}}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"refusal\"}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let (sse, fatal) = run(raw.as_bytes(), 7);
+            assert!(fatal.is_none(), "{fatal:?}");
+            let out = chunks(&sse);
+            let terminal = out
+                .iter()
+                .find(|chunk| chunk.get("usage").is_some())
+                .expect("terminal usage chunk");
+            assert_eq!(terminal["usage"]["inference_geo"], "us");
+            assert_eq!(
+                terminal["usage"]
+                    .get("unbilled_refusal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                expected_unbilled
+            );
+        }
     }
 
     #[test]
@@ -775,20 +1011,126 @@ mod tests {
     }
 
     #[test]
-    fn non_text_deltas_are_ignored_not_forwarded() {
-        // Tool-use JSON deltas have no OpenAI `delta.content` equivalent; they
-        // must not be forwarded as text.
+    fn tool_use_streams_as_openai_tool_calls_with_exact_arguments() {
         let raw = concat!(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5-20250929\",\"usage\":{\"input_tokens\":1}}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"Paris\\\"}\"}}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
-        let (sse, fatal) = run(raw.as_bytes(), 13);
+        let (sse, fatal) = run(raw.as_bytes(), 1);
         assert!(fatal.is_none());
         let out = chunks(&sse);
-        assert_eq!(out.len(), 2, "role chunk + final chunk only");
-        assert_eq!(out[1]["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(out[1]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(
+            out[1]["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "toolu_1"
+        );
+        assert_eq!(
+            out[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        let arguments = out[2..4]
+            .iter()
+            .map(|chunk| {
+                chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or_default()
+            })
+            .collect::<String>();
+        assert_eq!(arguments, r#"{"city":"Paris"}"#);
+        assert_eq!(out[4]["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(out[4]["usage"]["completion_tokens"], 9);
+        assert!(sse.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn parallel_tool_blocks_keep_independent_openai_indexes() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_p\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":4}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_a\",\"name\":\"alpha\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":7,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_b\",\"name\":\"beta\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":7,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"b\\\":2}\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":8}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (sse, fatal) = run(raw.as_bytes(), 2);
+        assert!(fatal.is_none(), "{fatal:?}");
+        let out = chunks(&sse);
+        assert_eq!(out[1]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(out[2]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(out[3]["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
+        assert_eq!(out[4]["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
+    }
+
+    #[test]
+    fn server_tool_json_deltas_are_ignored_without_breaking_following_text() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_server\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":6}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"weather\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"Result: \"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"sunny\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (sse, fatal) = run(raw.as_bytes(), 1);
+        assert!(
+            fatal.is_none(),
+            "server tools must not corrupt the stream: {fatal:?}"
+        );
+        let out = chunks(&sse);
+        let text = out
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+            .collect::<String>();
+        assert_eq!(text, "Result: sunny");
+        assert!(sse.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn mcp_tool_json_deltas_are_ignored_without_hiding_client_tool_calls() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mcp\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":6}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"mcp_tool_use\",\"id\":\"mcp_1\",\"name\":\"remote_search\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"weather\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_client\",\"name\":\"save_result\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"value\\\":1}\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (sse, fatal) = run(raw.as_bytes(), 1);
+        assert!(fatal.is_none(), "MCP arguments must be ignored: {fatal:?}");
+        let out = chunks(&sse);
+        let tool_calls = out
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"][0].as_object())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_calls.len(), 2, "client tool start + arguments only");
+        assert_eq!(tool_calls[0]["id"], "tool_client");
+        assert_eq!(tool_calls[1]["function"]["arguments"], r#"{"value":1}"#);
+    }
+
+    #[test]
+    fn multiple_message_deltas_emit_exactly_one_terminal_chunk() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_multi\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":3}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"model_context_window_exceeded\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (sse, fatal) = run(raw.as_bytes(), 4);
+        assert!(fatal.is_none(), "{fatal:?}");
+        let out = chunks(&sse);
+        assert_eq!(out.len(), 2, "role plus one terminal chunk, got {out:?}");
+        assert_eq!(out[1]["choices"][0]["finish_reason"], "length");
+        assert_eq!(out[1]["usage"]["completion_tokens"], 2);
+        assert_eq!(sse.matches("data: [DONE]").count(), 1);
     }
 
     #[tokio::test]

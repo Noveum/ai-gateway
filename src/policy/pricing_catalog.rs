@@ -17,7 +17,7 @@
 
 /// The rate card these rows came from. Recorded on every usage and
 /// reservation record so a billed amount can be traced back to it.
-pub const CATALOG_VERSION: &str = "2026.08.12";
+pub const CATALOG_VERSION: &str = "2026.08.21";
 
 /// One model's published rates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,7 +36,7 @@ pub struct CatalogRow {
     pub cache_write_1h_per_1m: Option<f64>,
 }
 
-/// 65 models the gateway prices from the catalog.
+/// Models the gateway prices from the catalog.
 pub const MODEL_ROWS: &[CatalogRow] = &[
     CatalogRow {
         id: "gpt-5.6-luna",
@@ -63,6 +63,15 @@ pub const MODEL_ROWS: &[CatalogRow] = &[
         output_per_1m: 30.0,
         cached_input_per_1m: Some(0.5),
         cache_write_per_1m: Some(6.25),
+        cache_write_1h_per_1m: None,
+    },
+    CatalogRow {
+        id: "gpt-5.6-cyber",
+        provider: "openai",
+        input_per_1m: 12.5,
+        output_per_1m: 75.0,
+        cached_input_per_1m: Some(1.25),
+        cache_write_per_1m: Some(15.625),
         cache_write_1h_per_1m: None,
     },
     CatalogRow {
@@ -192,6 +201,15 @@ pub const MODEL_ROWS: &[CatalogRow] = &[
         cache_write_1h_per_1m: Some(4.0),
     },
     CatalogRow {
+        id: "claude-opus-5",
+        provider: "anthropic",
+        input_per_1m: 5.0,
+        output_per_1m: 25.0,
+        cached_input_per_1m: Some(0.5),
+        cache_write_per_1m: Some(6.25),
+        cache_write_1h_per_1m: Some(10.0),
+    },
+    CatalogRow {
         id: "claude-opus-4-8",
         provider: "anthropic",
         input_per_1m: 5.0,
@@ -211,6 +229,15 @@ pub const MODEL_ROWS: &[CatalogRow] = &[
     },
     CatalogRow {
         id: "claude-opus-4-6",
+        provider: "anthropic",
+        input_per_1m: 5.0,
+        output_per_1m: 25.0,
+        cached_input_per_1m: Some(0.5),
+        cache_write_per_1m: Some(6.25),
+        cache_write_1h_per_1m: Some(10.0),
+    },
+    CatalogRow {
+        id: "claude-opus-4-5-20251101",
         provider: "anthropic",
         input_per_1m: 5.0,
         output_per_1m: 25.0,
@@ -247,6 +274,15 @@ pub const MODEL_ROWS: &[CatalogRow] = &[
     },
     CatalogRow {
         id: "claude-fable-5",
+        provider: "anthropic",
+        input_per_1m: 10.0,
+        output_per_1m: 50.0,
+        cached_input_per_1m: Some(1.0),
+        cache_write_per_1m: Some(12.5),
+        cache_write_1h_per_1m: Some(20.0),
+    },
+    CatalogRow {
+        id: "claude-mythos-5",
         provider: "anthropic",
         input_per_1m: 10.0,
         output_per_1m: 50.0,
@@ -625,8 +661,12 @@ pub const MODEL_ROWS: &[CatalogRow] = &[
     },
 ];
 
-/// Bare provider aliases resolved server-side, `(alias, concrete_id)`.
-pub const MODEL_ALIASES: &[(&str, &str)] = &[("gpt-5.6", "gpt-5.6-sol")];
+/// Exact provider aliases resolved before family matching, `(alias, concrete_id)`.
+pub const MODEL_ALIASES: &[(&str, &str)] = &[
+    ("gpt-5.6", "gpt-5.6-sol"),
+    ("daybreak-blue-latest", "gpt-5.6-sol"),
+    ("daybreak-red-latest", "gpt-5.6-cyber"),
+];
 
 /// A documented long-context tier: above `threshold_input_tokens` the WHOLE
 /// request bills at these rates instead of the model's base row.
@@ -646,24 +686,24 @@ pub const LONG_CONTEXT_ROWS: &[LongContextRow] = &[
         threshold_input_tokens: 272000,
         input_per_1m: 0.4,
         output_per_1m: 1.8,
-        cached_input_per_1m: None,
-        cache_write_per_1m: None,
+        cached_input_per_1m: Some(0.04),
+        cache_write_per_1m: Some(0.5),
     },
     LongContextRow {
         id: "gpt-5.6-terra",
         threshold_input_tokens: 272000,
         input_per_1m: 4.0,
         output_per_1m: 18.0,
-        cached_input_per_1m: None,
-        cache_write_per_1m: None,
+        cached_input_per_1m: Some(0.4),
+        cache_write_per_1m: Some(5.0),
     },
     LongContextRow {
         id: "gpt-5.6-sol",
         threshold_input_tokens: 272000,
         input_per_1m: 10.0,
         output_per_1m: 45.0,
-        cached_input_per_1m: None,
-        cache_write_per_1m: None,
+        cached_input_per_1m: Some(1.0),
+        cache_write_per_1m: Some(12.5),
     },
     LongContextRow {
         id: "gemini-2.5-pro",
@@ -715,9 +755,8 @@ pub const TOOL_FEES_USD_PER_1K_CALLS: &[(&str, f64)] = &[
     ("perplexity:sonar-reasoning-pro:search_high", 14.0),
 ];
 
-/// Providers whose response body carries a BILLED total in USD that may be
-/// trusted in place of the gateway's own arithmetic. Empty by design: no
-/// provider in this catalog returns one today (Perplexity explicitly
-/// disclaims the figure it does return). Adding an id here is what switches
-/// a provider onto the authoritative-total path.
-pub const AUTHORITATIVE_COST_PROVIDERS: &[&str] = &[];
+/// Providers whose response body carries a BILLED total that may be trusted in
+/// place of the gateway's own arithmetic. xAI documents
+/// `usage.cost_in_usd_ticks` as the exact per-request charge, inclusive of
+/// token discounts and server-side tools (1 USD = 10^10 ticks).
+pub const AUTHORITATIVE_COST_PROVIDERS: &[&str] = &["xai", "grok"];

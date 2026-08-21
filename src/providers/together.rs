@@ -4,7 +4,7 @@
 //! reuses the OpenAI metrics extractor (standard `usage` object), pricing via the
 //! shared table.
 
-use super::utils::log_tracking_headers;
+use super::utils::{log_tracking_headers, normalized_bearer_header};
 use super::Provider;
 use crate::error::AppError;
 use async_trait::async_trait;
@@ -65,24 +65,10 @@ impl Provider for TogetherProvider {
             .get(http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
         {
-            // Validate token format
-            if !auth.starts_with("Bearer ") {
-                error!(
-                    "Invalid authorization format for Together request - must start with 'Bearer '"
-                );
-                return Err(AppError::InvalidHeader);
-            }
-
-            // Validate token is not empty after "Bearer "
-            if auth.len() <= 7 {
-                error!("Empty Bearer token in Together authorization header");
-                return Err(AppError::InvalidHeader);
-            }
-
             debug!("Using provided authorization header for Together");
             headers.insert(
                 http::header::AUTHORIZATION,
-                http::header::HeaderValue::from_str(auth).map_err(|_| {
+                normalized_bearer_header(auth).map_err(|_| {
                     error!("Invalid characters in Together authorization header");
                     AppError::InvalidHeader
                 })?,
@@ -202,6 +188,8 @@ mod tests {
     fn process_headers_validates_bearer() {
         let p = TogetherProvider::new();
         assert!(p.process_headers(&hdr(Some("Bearer tok"))).is_ok());
+        let normalized = p.process_headers(&hdr(Some("bearer tok"))).unwrap();
+        assert_eq!(normalized.get("authorization").unwrap(), "Bearer tok");
         assert!(matches!(
             p.process_headers(&hdr(None)),
             Err(AppError::MissingApiKey)

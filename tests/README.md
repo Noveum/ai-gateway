@@ -220,9 +220,9 @@ This will provide more information about request processing and metric extractio
 The common test module provides a flexible way to customize test cases. You can adjust the test parameters using the fluent interface provided by `ProviderTestConfig`:
 
 ```rust
-let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-4")
+let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-5.6-luna")
     .with_prompt("Explain quantum computing in simple terms")
-    .with_max_tokens(200);
+    .with_max_completion_tokens(200);
 ```
 
 This allows you to test specific models or use cases with minimal code duplication.

@@ -123,10 +123,13 @@ impl SseFrameBuffer {
 }
 
 /// Authoritative token counts recovered from a provider response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ActualUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Full provider-aware price when detailed usage was available. `None`
+    /// retains the legacy two-token fallback for call sites without a provider.
+    pub cost_usd: Option<f64>,
 }
 
 /// The `(input, output)` token counts a `usage` object carries, each `None` when
@@ -156,14 +159,33 @@ pub fn usage_fields(usage: &Value) -> (Option<u32>, Option<u32>) {
 pub fn extract_actual_usage(body: &Value) -> Option<ActualUsage> {
     let usage = body.get("usage")?;
     let (input, output) = usage_fields(usage);
-    // A `usage` object with neither count is not usage at all.
-    if input.is_none() && output.is_none() {
+    // Both halves are required. Completing a reservation with an invented zero
+    // for either missing half releases headroom for spend the provider may
+    // still have billed; retaining the conservative hold is the safe outcome.
+    let (Some(input), Some(output)) = (input, output) else {
         return None;
-    }
+    };
     Some(ActualUsage {
-        input_tokens: input.unwrap_or(0),
-        output_tokens: output.unwrap_or(0),
+        input_tokens: input,
+        output_tokens: output,
+        cost_usd: None,
     })
+}
+
+/// Recover authoritative counts and price every usage dimension the provider
+/// reported (cache reads/writes, TTL tiers, server tools, and token output).
+pub fn extract_actual_usage_priced(
+    model: &str,
+    provider: &str,
+    body: &Value,
+) -> Option<ActualUsage> {
+    let mut actual = extract_actual_usage(body)?;
+    if let Some(declared) = crate::policy::pricing::parse_usage(model, provider, body) {
+        actual.input_tokens = declared.total_input_tokens();
+        actual.output_tokens = declared.output_tokens;
+        actual.cost_usd = Some(crate::policy::pricing::price_usage(model, &declared).total_usd);
+    }
+    Some(actual)
 }
 
 /// Recovers a stream's authoritative usage while its bytes flow past, unchanged,
@@ -190,6 +212,9 @@ pub struct StreamUsageScanner {
     frames: SseFrameBuffer,
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
+    /// Anthropic splits usage across events; OpenAI supplies it at the end.
+    /// Merge the raw fields so provider-aware pricing can see every dimension.
+    usage_fields: serde_json::Map<String, Value>,
     finished: bool,
 }
 
@@ -223,19 +248,36 @@ impl StreamUsageScanner {
 
     /// The usage this stream reported, or `None` when it is not authoritative.
     ///
-    /// **Output tokens are required.** An input-only report (an Anthropic
+    /// **Both token halves are required.** An input-only report (an Anthropic
     /// `message_start` from a stream that then died, say) tells us nothing about
-    /// what was generated, and completing a reservation with `output = 0` would
-    /// silently release the whole hold — undercharging by exactly the amount
-    /// that is in question. Those streams must keep the conservative estimate,
-    /// i.e. settle via `abandon`. Input tokens, by contrast, are safe to default
-    /// to 0 when only the output half was reported: the reservation is still
-    /// reconciled with a real, measured completion size.
+    /// what was generated; an output-only report does not reveal the billed
+    /// prompt. Completing either with an invented zero silently releases part
+    /// of the hold. Those streams must keep the conservative estimate via
+    /// `abandon`.
     pub fn usage(&self) -> Option<ActualUsage> {
         Some(ActualUsage {
-            input_tokens: self.input_tokens.unwrap_or(0),
+            input_tokens: self.input_tokens?,
             output_tokens: self.output_tokens?,
+            cost_usd: None,
         })
+    }
+
+    /// The authoritative stream usage, priced with the same detailed catalog
+    /// path as a buffered provider response.
+    pub fn usage_priced(&self, model: &str, provider: &str) -> Option<ActualUsage> {
+        let mut actual = self.usage()?;
+        if !self.usage_fields.is_empty() {
+            let body = serde_json::json!({
+                "usage": Value::Object(self.usage_fields.clone()),
+            });
+            if let Some(declared) = crate::policy::pricing::parse_usage(model, provider, &body) {
+                actual.input_tokens = declared.total_input_tokens();
+                actual.output_tokens = declared.output_tokens;
+                actual.cost_usd =
+                    Some(crate::policy::pricing::price_usage(model, &declared).total_usd);
+            }
+        }
+        Some(actual)
     }
 
     /// Parse one reassembled frame and fold whatever usage it carries into the
@@ -262,6 +304,11 @@ impl StreamUsageScanner {
             .into_iter()
             .flatten()
         {
+            if let Some(fields) = usage.as_object() {
+                for (name, value) in fields {
+                    self.usage_fields.insert(name.clone(), value.clone());
+                }
+            }
             let (input, output) = usage_fields(usage);
             if input.is_some() {
                 self.input_tokens = input;
@@ -320,6 +367,83 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         )
         .to_string()
+    }
+
+    #[test]
+    fn streamed_anthropic_usage_preserves_cache_and_server_tool_cost() {
+        let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cost\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":20,\"cache_creation\":{\"ephemeral_5m_input_tokens\":12,\"ephemeral_1h_input_tokens\":8},\"server_tool_use\":{\"web_search_requests\":2}}}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut scanner = StreamUsageScanner::new();
+        for bytes in raw.as_bytes().chunks(3) {
+            scanner.push(bytes);
+        }
+        scanner.finish();
+
+        let usage = scanner
+            .usage_priced("claude-sonnet-5", "anthropic")
+            .expect("terminal output usage is authoritative");
+        let expected_body = serde_json::json!({
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 20,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 12,
+                    "ephemeral_1h_input_tokens": 8
+                },
+                "server_tool_use": {"web_search_requests": 2}
+            }
+        });
+        let declared =
+            crate::policy::pricing::parse_usage("claude-sonnet-5", "anthropic", &expected_body)
+                .unwrap();
+        let expected = crate::policy::pricing::price_usage("claude-sonnet-5", &declared).total_usd;
+        assert_eq!(usage.input_tokens, declared.total_input_tokens());
+        assert_eq!(usage.output_tokens, 7);
+        assert!((usage.cost_usd.unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn streamed_xai_usage_prices_exact_ticks_or_hidden_reasoning_tokens() {
+        for (ticks, expected_output, expected_cost) in
+            [(Some(37_756_000_u64), 103, 0.0037756), (None, 103, 0.0)]
+        {
+            let mut usage = json!({
+                "prompt_tokens": 32,
+                "completion_tokens": 9,
+                "total_tokens": 135,
+                "completion_tokens_details": {"reasoning_tokens": 94}
+            });
+            if let Some(ticks) = ticks {
+                usage["cost_in_usd_ticks"] = json!(ticks);
+            }
+            let raw = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({
+                    "choices": [],
+                    "usage": usage
+                })
+            );
+            let mut scanner = StreamUsageScanner::new();
+            for bytes in raw.as_bytes().chunks(2) {
+                scanner.push(bytes);
+            }
+            scanner.finish();
+            let actual = scanner
+                .usage_priced("grok-4.6", "xai")
+                .expect("both token halves were reported");
+            assert_eq!(actual.input_tokens, 32);
+            assert_eq!(actual.output_tokens, expected_output);
+            if ticks.is_some() {
+                assert_eq!(actual.cost_usd, Some(expected_cost));
+            } else {
+                assert!(actual.cost_usd.is_some_and(|cost| cost > expected_cost));
+            }
+        }
     }
 
     /// Drive the scanner over `raw` in slices of `step` bytes.
@@ -404,6 +528,7 @@ mod tests {
         let want = ActualUsage {
             input_tokens: 11,
             output_tokens: 4,
+            cost_usd: None,
         };
         for step in 1..=bytes.len() {
             assert_eq!(scan(bytes, step), Some(want), "lost usage at step {step}");
@@ -419,6 +544,7 @@ mod tests {
         let want = ActualUsage {
             input_tokens: 11,
             output_tokens: 4,
+            cost_usd: None,
         };
         for step in 1..=bytes.len() {
             assert_eq!(scan(bytes, step), Some(want), "lost usage at step {step}");
@@ -442,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_output_report_is_authoritative_a_missing_one_is_not() {
+    fn an_explicit_zero_is_authoritative_but_a_missing_half_is_not() {
         // The provider explicitly said "0 completion tokens" — that is a real
         // measurement and must reconcile the reservation.
         let raw =
@@ -451,18 +577,13 @@ mod tests {
             scan(raw.as_bytes(), 3),
             Some(ActualUsage {
                 input_tokens: 7,
-                output_tokens: 0
+                output_tokens: 0,
+                cost_usd: None,
             })
         );
-        // Output reported without input still reconciles the half that matters.
+        // Output reported without input cannot reveal the billed prompt.
         let raw = "data: {\"usage\":{\"completion_tokens\":12}}\n\n";
-        assert_eq!(
-            scan(raw.as_bytes(), 3),
-            Some(ActualUsage {
-                input_tokens: 0,
-                output_tokens: 12
-            })
-        );
+        assert_eq!(scan(raw.as_bytes(), 3), None);
     }
 
     #[test]
@@ -475,7 +596,8 @@ mod tests {
             scan(raw.as_bytes(), 7),
             Some(ActualUsage {
                 input_tokens: 3,
-                output_tokens: 2
+                output_tokens: 2,
+                cost_usd: None,
             })
         );
     }
@@ -488,7 +610,8 @@ mod tests {
             scan(raw.as_bytes(), 2),
             Some(ActualUsage {
                 input_tokens: 5,
-                output_tokens: 6
+                output_tokens: 6,
+                cost_usd: None,
             })
         );
         // Multiple `data:` lines in one frame are joined with newlines.
@@ -497,7 +620,8 @@ mod tests {
             scan(raw.as_bytes(), 3),
             Some(ActualUsage {
                 input_tokens: 1,
-                output_tokens: 2
+                output_tokens: 2,
+                cost_usd: None,
             })
         );
     }
@@ -521,14 +645,16 @@ mod tests {
             })),
             Some(ActualUsage {
                 input_tokens: 123,
-                output_tokens: 45
+                output_tokens: 45,
+                cost_usd: None,
             })
         );
         assert_eq!(
             extract_actual_usage(&json!({"usage": {"input_tokens": 7, "output_tokens": 9}})),
             Some(ActualUsage {
                 input_tokens: 7,
-                output_tokens: 9
+                output_tokens: 9,
+                cost_usd: None,
             })
         );
         // Nothing authoritative → None, so the caller retains its estimate.
@@ -536,10 +662,22 @@ mod tests {
             json!({"choices": [{"message": {"content": "hi"}}]}),
             json!({"usage": {}}),
             json!({"usage": {"total_tokens": 10}}),
+            json!({"usage": {"prompt_tokens": 7}}),
+            json!({"usage": {"completion_tokens": 5}}),
             json!({"usage": null}),
             json!({}),
         ] {
             assert_eq!(extract_actual_usage(&body), None, "body: {body}");
+        }
+    }
+
+    #[test]
+    fn stream_usage_requires_both_authoritative_token_halves() {
+        for usage in [json!({"prompt_tokens": 7}), json!({"completion_tokens": 5})] {
+            let mut scanner = StreamUsageScanner::new();
+            scanner.push(format!("data: {}\n\n", json!({"usage": usage})).as_bytes());
+            scanner.finish();
+            assert_eq!(scanner.usage(), None, "usage: {usage}");
         }
     }
 

@@ -53,29 +53,35 @@
 //! refused: without a live-state backend they could only ever evaluate to
 //! "allow", and their `failClosed` setting would be neutralized along with them.
 
+use std::pin::Pin;
 use std::rc::Rc;
+use std::time::Duration;
 
 use futures::channel::oneshot;
+use futures_util::future::{select, Either};
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use worker::*;
 
 use crate::policy::decision::{Phase, PolicyDecision};
 use crate::policy::engine::EngineOptions;
-use crate::policy::metering::{extract_actual_usage, ActualUsage, StreamUsageScanner};
+use crate::policy::metering::{extract_actual_usage_priced, ActualUsage, StreamUsageScanner};
 use crate::policy::rules::LiveState;
 use crate::policy::synthetic::{block_body, block_status, policy_header_token, BlockResponseMode};
 use crate::policy::worker_remote::{
-    self, admit_request_body, estimate_input_tokens, force_include_usage,
-    resolve_max_output_tokens, Admission, AdmitRequest, BodyAdmission, Settlement, StreamOutcome,
-    WorkerRemoteConfig, ALLOW_UNGUARDED_START_VAR, API_KEY_VAR, API_URL_VAR,
-    MAX_OUTPUT_TOKEN_LIMIT, PROJECT_ID_VAR, TENANCY_VAR,
+    self, admit_request_body, force_include_usage, resolve_max_output_tokens, Admission,
+    AdmitRequest, BodyAdmission, Settlement, StreamOutcome, WorkerRemoteConfig,
+    ALLOW_UNGUARDED_START_VAR, API_KEY_VAR, API_URL_VAR, MAX_OUTPUT_TOKEN_LIMIT, PROJECT_ID_VAR,
+    TENANCY_VAR,
 };
 use crate::policy::PolicyEngine;
 use crate::routing::{
-    apply_input_transforms, apply_output_transforms, bedrock_converse_to_openai,
-    flatten_input_text, flatten_output_text, normalize_base_url, openai_to_bedrock_converse,
-    resolve_provider, transform_anthropic_to_openai_format, upstream_url_with_base,
+    apply_input_transforms, apply_output_transforms, authorization_bearer_token,
+    bedrock_converse_to_openai, estimate_admission_input_tokens, flatten_input_text,
+    flatten_output_text, normalize_base_url, openai_to_anthropic_messages,
+    openai_to_bedrock_converse, prepare_strict_admission_body, resolve_provider,
+    transform_anthropic_to_openai_format, upstream_url_with_base,
+    validate_strict_anthropic_base_url, validate_strict_openai_base_url, ANTHROPIC_BASE_URL_VAR,
     OPENAI_BASE_URL_VAR,
 };
 use crate::sigv4;
@@ -83,6 +89,11 @@ use crate::sigv4;
 /// Default Bedrock model + region (mirrors the native `BedrockProvider`).
 const BEDROCK_DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
 const BEDROCK_DEFAULT_REGION: &str = "us-east-1";
+/// The platform reaps a pending reservation after 15 minutes. End an edge
+/// provider call well before that lease can be released under a still-live SSE
+/// stream; Cloudflare otherwise permits incoming Worker requests indefinitely.
+const MAX_RESERVED_UPSTREAM_MS: u64 = 10 * 60 * 1_000;
+const UPSTREAM_TIMEOUT_VAR: &str = "NOVEUM_GUARD_WORKER_UPSTREAM_TIMEOUT_MS";
 
 /// AWS credentials for a Bedrock request, taken from `x-aws-*` headers.
 struct BedrockCreds {
@@ -96,8 +107,18 @@ struct BedrockCreds {
 /// via `x-aws-session-token`, which the native path does not).
 fn bedrock_credentials(req: &Request) -> Option<BedrockCreds> {
     let h = req.headers();
-    let access_key = h.get("x-aws-access-key-id").ok().flatten()?;
-    let secret_key = h.get("x-aws-secret-access-key").ok().flatten()?;
+    let access_key = h
+        .get("x-aws-access-key-id")
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let secret_key = h
+        .get("x-aws-secret-access-key")
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
     let session_token = h.get("x-aws-session-token").ok().flatten();
     let region = h
         .get("x-aws-region")
@@ -161,7 +182,22 @@ const REQUEST_SKIP_HEADERS: &[&str] = &[
     "connection",
     "transfer-encoding",
     "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
     "x-provider",
+    "x-noveum-api-key",
+    "x-noveum-guard-policy",
+    "x-noveum-guard-blocked",
+    "x-project-id",
+    "x-organization-id",
+    "x-organisation-id",
+    "x-user-id",
+    "x-experiment-id",
+    "cookie",
 ];
 
 /// Response headers we drop when re-emitting a buffered/transformed body (its
@@ -187,6 +223,32 @@ fn env_flag(env: &Env, key: &str, default: bool) -> bool {
             "false" | "0" | "no" | "off" | "disabled" | ""
         ),
         None => default,
+    }
+}
+
+fn reserved_upstream_deadline_ms(env: &Env) -> u64 {
+    let configured = env_value(env, UPSTREAM_TIMEOUT_VAR)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MAX_RESERVED_UPSTREAM_MS)
+        .min(MAX_RESERVED_UPSTREAM_MS);
+    Date::now().as_millis().saturating_add(configured)
+}
+
+fn remaining_until(deadline_ms: u64) -> Option<Duration> {
+    let remaining = deadline_ms.saturating_sub(Date::now().as_millis());
+    (remaining > 0).then(|| Duration::from_millis(remaining))
+}
+
+async fn before_upstream_deadline<T>(
+    deadline_ms: u64,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let remaining = remaining_until(deadline_ms)?;
+    futures_util::pin_mut!(future);
+    match select(future, Delay::from(remaining)).await {
+        Either::Left((value, _)) => Some(value),
+        Either::Right((_, _)) => None,
     }
 }
 
@@ -237,8 +299,21 @@ fn build_inline_engine(
 /// name is in `skip`.
 fn copy_headers_excluding(src: &Headers, skip: &[&str]) -> Result<Headers> {
     let out = Headers::new();
-    for (k, v) in src.entries() {
-        if skip.contains(&k.to_ascii_lowercase().as_str()) {
+    let entries = src.entries().collect::<Vec<_>>();
+    let connection_tokens = entries
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    for (k, v) in entries {
+        let lower = k.to_ascii_lowercase();
+        if skip.contains(&lower.as_str())
+            || lower.starts_with("x-noveum-")
+            || lower.starts_with("x-aws-")
+            || connection_tokens.iter().any(|token| token == &lower)
+        {
             continue;
         }
         out.set(&k, &v)?;
@@ -302,6 +377,58 @@ fn invalid_output_limit(key: &str) -> Result<Response> {
     }))?
     .with_headers(headers)
     .with_status(400))
+}
+
+/// A strict cost-cap reservation must cover the provider's whole possible
+/// completion. The configured 1,024-token fallback is useful for advisory
+/// estimates, but cannot make an otherwise unbounded request a hard cap.
+fn missing_strict_output_limit() -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    Ok(Response::from_json(&json!({
+        "error": {
+            "message": "a strict Nova Guard cost cap requires an explicit output limit (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`)",
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "missing_output_limit",
+        }
+    }))?
+    .with_headers(headers)
+    .with_status(400))
+}
+
+/// Provider-shaped 400 for a request whose provider-side input cannot be
+/// bounded before a strict cost-cap admission. Mirrors native middleware.
+fn invalid_strict_input(message: &str) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    Ok(Response::from_json(&json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "unsupported_strict_input",
+        }
+    }))?
+    .with_headers(headers)
+    .with_status(400))
+}
+
+fn transformed_body_too_large() -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    Ok(Response::from_json(&json!({
+        "error": {
+            "message": format!(
+                "transformed request body exceeds the {MAX_BODY}-byte gateway limit"
+            ),
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "request_too_large",
+        }
+    }))?
+    .with_headers(headers)
+    .with_status(413))
 }
 
 /// Read a response body with a hard byte cap. Reads incrementally so a chunked /
@@ -387,6 +514,8 @@ struct Pending {
     cfg: WorkerRemoteConfig,
     id: String,
     model: String,
+    provider: String,
+    upstream_deadline_ms: u64,
 }
 
 impl Pending {
@@ -423,7 +552,12 @@ impl Pending {
 /// `tx`; if the body is dropped first (client disconnect, isolate teardown) the
 /// sender drops with it and the receiver resolves to [`StreamOutcome::Dropped`],
 /// so the settlement future can never wait forever.
-fn tee_usage<S>(inner: S, tx: oneshot::Sender<StreamOutcome>) -> impl Stream<Item = Result<Vec<u8>>>
+fn tee_usage<S>(
+    inner: S,
+    tx: oneshot::Sender<StreamOutcome>,
+    model: String,
+    provider: String,
+) -> impl Stream<Item = Result<Vec<u8>>>
 where
     S: Stream<Item = Result<Vec<u8>>> + Unpin + 'static,
 {
@@ -431,6 +565,8 @@ where
         inner: S,
         scanner: StreamUsageScanner,
         tx: Option<oneshot::Sender<StreamOutcome>>,
+        model: String,
+        provider: String,
     }
 
     futures_util::stream::unfold(
@@ -438,6 +574,8 @@ where
             inner,
             scanner: StreamUsageScanner::new(),
             tx: Some(tx),
+            model,
+            provider,
         },
         |mut tee: Tee<S>| async move {
             match tee.inner.next().await {
@@ -452,10 +590,11 @@ where
                 None => {
                     tee.scanner.finish();
                     if let Some(tx) = tee.tx.take() {
-                        let _ = tx.send(match tee.scanner.usage() {
-                            Some(u) => StreamOutcome::Usage(u),
-                            None => StreamOutcome::EndedWithoutUsage,
-                        });
+                        let _ =
+                            tx.send(match tee.scanner.usage_priced(&tee.model, &tee.provider) {
+                                Some(u) => StreamOutcome::Usage(u),
+                                None => StreamOutcome::EndedWithoutUsage,
+                            });
                     }
                     None
                 }
@@ -468,22 +607,170 @@ where
 ///
 /// The settlement future is handed to `wait_until` **before** this returns, so
 /// the response never leaves the handler with an unowned promise behind it.
-fn metered_passthrough(mut resp: Response, pending: Pending, ctx: &Context) -> Result<Response> {
+type WorkerByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>>>>>;
+
+/// End an admitted provider body before the platform's 15-minute reservation
+/// lease can be reaped. The emitted transport error closes the client stream;
+/// `tee_usage` then abandons the reservation, retaining its conservative hold.
+fn deadline_stream<S>(inner: S, deadline_ms: u64) -> impl Stream<Item = Result<Vec<u8>>>
+where
+    S: Stream<Item = Result<Vec<u8>>> + Unpin + 'static,
+{
+    struct State<S> {
+        inner: S,
+        deadline_ms: u64,
+        timed_out: bool,
+    }
+
+    futures_util::stream::unfold(
+        State {
+            inner,
+            deadline_ms,
+            timed_out: false,
+        },
+        |mut state| async move {
+            if state.timed_out {
+                return None;
+            }
+            let Some(remaining) = remaining_until(state.deadline_ms) else {
+                state.timed_out = true;
+                return Some((
+                    Err(Error::RustError(
+                        "upstream stream exceeded the NovaGuard reservation lease budget"
+                            .to_string(),
+                    )),
+                    state,
+                ));
+            };
+            let next = state.inner.next();
+            futures_util::pin_mut!(next);
+            match select(next, Delay::from(remaining)).await {
+                Either::Left((item, _)) => item.map(|item| (item, state)),
+                Either::Right((_, _)) => {
+                    state.timed_out = true;
+                    Some((
+                        Err(Error::RustError(
+                            "upstream stream exceeded the NovaGuard reservation lease budget"
+                                .to_string(),
+                        )),
+                        state,
+                    ))
+                }
+            }
+        },
+    )
+}
+
+/// Drive the same pure Anthropic SSE state machine as the native Axum adapter
+/// over a Worker `Fetch` body. Error frames are flushed before a transport
+/// error, and `[DONE]` is emitted only for a complete `message_stop` stream.
+fn translate_anthropic_stream<S>(inner: S, created: i64) -> impl Stream<Item = Result<Vec<u8>>>
+where
+    S: Stream<Item = Result<Vec<u8>>> + Unpin + 'static,
+{
+    enum Translate<S> {
+        Body(S, crate::anthropic_stream::AnthropicStreamTransformer),
+        Abort(String),
+        Done,
+    }
+
+    futures_util::stream::unfold(
+        Translate::Body(
+            inner,
+            crate::anthropic_stream::AnthropicStreamTransformer::new(created),
+        ),
+        |state| async move {
+            match state {
+                Translate::Body(mut upstream, mut transformer) => loop {
+                    match upstream.next().await {
+                        Some(Ok(bytes)) => {
+                            let out = transformer.push(&bytes);
+                            if let Some(error) = out.fatal {
+                                return Some((Ok(out.sse.into_bytes()), Translate::Abort(error)));
+                            }
+                            if out.sse.is_empty() {
+                                continue;
+                            }
+                            return Some((
+                                Ok(out.sse.into_bytes()),
+                                Translate::Body(upstream, transformer),
+                            ));
+                        }
+                        Some(Err(error)) => {
+                            let out = transformer.fail_transport(format!("{error:?}"));
+                            return Some((
+                                Ok(out.sse.into_bytes()),
+                                Translate::Abort(out.fatal.unwrap_or_default()),
+                            ));
+                        }
+                        None => {
+                            let out = transformer.finish();
+                            return match out.fatal {
+                                Some(error) => {
+                                    Some((Ok(out.sse.into_bytes()), Translate::Abort(error)))
+                                }
+                                None if out.sse.is_empty() => None,
+                                None => Some((Ok(out.sse.into_bytes()), Translate::Done)),
+                            };
+                        }
+                    }
+                },
+                Translate::Abort(error) => Some((Err(Error::RustError(error)), Translate::Done)),
+                Translate::Done => None,
+            }
+        },
+    )
+}
+
+/// Re-stream an upstream event stream, optionally translating Anthropic's
+/// protocol before the existing usage tee. Translating first is essential: the
+/// scanner and the OpenAI client both consume the terminal OpenAI usage chunk.
+fn stream_passthrough(
+    mut resp: Response,
+    pending: Option<Pending>,
+    ctx: &Context,
+    translate_anthropic: bool,
+) -> Result<Response> {
     let status = resp.status_code();
     let headers = copy_headers_excluding(resp.headers(), RESPONSE_SKIP_HEADERS)?;
-    let stream = resp.stream()?;
+    let upstream: WorkerByteStream = match pending.as_ref() {
+        Some(hold) => Box::pin(deadline_stream(resp.stream()?, hold.upstream_deadline_ms)),
+        None => Box::pin(resp.stream()?),
+    };
+    let stream: WorkerByteStream = if translate_anthropic {
+        let created = (Date::now().as_millis() / 1000) as i64;
+        Box::pin(translate_anthropic_stream(upstream, created))
+    } else {
+        Box::pin(upstream)
+    };
 
-    let (tx, rx) = oneshot::channel::<StreamOutcome>();
-    let Pending { cfg, id, model } = pending;
-    ctx.wait_until(async move {
-        // `Err` = the sender was dropped with the body, i.e. the client vanished
-        // before the final frame.
-        let outcome = rx.await.unwrap_or(StreamOutcome::Dropped);
-        let settlement = worker_remote::settlement_for(outcome, &model, Some(new_event_id()));
-        worker_remote::settle(&cfg, &id, &settlement).await;
-    });
+    if let Some(pending) = pending {
+        let (tx, rx) = oneshot::channel::<StreamOutcome>();
+        let Pending {
+            cfg,
+            id,
+            model,
+            provider,
+            ..
+        } = pending;
+        let settlement_model = model.clone();
+        ctx.wait_until(async move {
+            // `Err` = the sender was dropped with the body, i.e. the client
+            // vanished before the final frame.
+            let outcome = rx.await.unwrap_or(StreamOutcome::Dropped);
+            let settlement =
+                worker_remote::settlement_for(outcome, &settlement_model, Some(new_event_id()));
+            worker_remote::settle(&cfg, &id, &settlement).await;
+        });
 
-    Ok(Response::from_stream(tee_usage(stream, tx))?
+        return Ok(
+            Response::from_stream(tee_usage(stream, tx, model, provider))?
+                .with_headers(headers)
+                .with_status(status),
+        );
+    }
+
+    Ok(Response::from_stream(stream)?
         .with_headers(headers)
         .with_status(status))
 }
@@ -679,6 +966,17 @@ async fn proxy(
         );
     }
 
+    let strict_input_required = engine.requires_bounded_json_input(None);
+    // A non-JSON request has no trustworthy model with which to prove it is
+    // outside a scoped strict cap, and its provider-side input cannot be
+    // bounded before admission. Advisory policies retain byte-for-byte proxy
+    // behavior; an enforcing/blocking strict cap fails this shape explicitly.
+    if strict_input_required && !is_json_req {
+        return invalid_strict_input(
+            "a strict Nova Guard cost cap supports only JSON /v1/chat/completions requests",
+        );
+    }
+
     // --- Request body, under a hard cap ------------------------------------
     //
     // Check the declared length before reading a byte, then enforce the same
@@ -706,36 +1004,200 @@ async fn proxy(
     // Parse JSON when we need to inspect (guard on), meter (admission), or
     // transform it (Bedrock converts OpenAI→Converse). A transparent proxy
     // forwards bytes byte-for-byte.
-    let mut body_json: Option<Value> = if (guard_active || stateful || is_bedrock) && is_json_req {
-        serde_json::from_slice(&body_bytes).ok()
-    } else {
-        None
-    };
+    let mut body_json: Option<Value> =
+        if (guard_active || stateful || is_bedrock || is_anthropic) && is_json_req {
+            serde_json::from_slice(&body_bytes).ok()
+        } else {
+            None
+        };
+    if strict_input_required && body_json.is_none() {
+        return invalid_strict_input(
+            "a strict Nova Guard cost cap requires a valid JSON request body",
+        );
+    }
     let model = body_json
         .as_ref()
         .and_then(|j| j.get("model"))
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+    if strict_input_required && model.trim().is_empty() {
+        return invalid_strict_input(
+            "a strict Nova Guard cost cap requires a non-empty model so policy scope and pricing can be resolved",
+        );
+    }
+
+    let bedrock_creds = if is_bedrock {
+        let Some(credentials) = bedrock_credentials(&req) else {
+            return error_response(
+                400,
+                "invalid_request_error",
+                "Bedrock requires x-aws-access-key-id and x-aws-secret-access-key headers",
+            );
+        };
+        Some(credentials)
+    } else {
+        None
+    };
+    if !is_anthropic && !is_bedrock {
+        let authorization = req.headers().get("authorization").ok().flatten();
+        let bearer = authorization
+            .as_deref()
+            .and_then(authorization_bearer_token);
+        if bearer.is_none() {
+            return error_response(
+                401,
+                "authentication_error",
+                "missing or invalid provider API key",
+            );
+        }
+    }
+
+    // Reject provider-local client errors before creating an admission hold.
+    // These failures prove the provider was never called, so reserving and then
+    // conservatively abandoning would consume cap headroom for invalid traffic.
+    let anthropic_api_key = if is_anthropic {
+        let bearer_key = req
+            .headers()
+            .get("authorization")
+            .ok()
+            .flatten()
+            .and_then(|auth| authorization_bearer_token(&auth).map(str::to_string));
+        let native_key = req
+            .headers()
+            .get("x-api-key")
+            .ok()
+            .flatten()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
+        let Some(api_key) = bearer_key.or(native_key) else {
+            return error_response(
+                401,
+                "authentication_error",
+                "missing or invalid Anthropic API key",
+            );
+        };
+        let Some(body) = body_json.as_ref() else {
+            return error_response(
+                400,
+                "invalid_request_error",
+                "Anthropic requires a JSON chat-completions request body",
+            );
+        };
+        if let Err(message) = openai_to_anthropic_messages(body.clone()) {
+            return error_response(400, "invalid_request_error", &message);
+        }
+        Some(api_key)
+    } else {
+        None
+    };
+
+    // Build the exact candidate that will be forwarded before admission.
+    // Policy replacements and forced stream usage can expand the body; a
+    // strict hold must reserve that post-transform request, not the caller's
+    // smaller original.
+    let mut forward_body_json = body_json.clone();
+    if guard_active {
+        if let Some(candidate) = forward_body_json.as_mut() {
+            apply_input_transforms(&engine, &model, candidate);
+        }
+    }
+    if bridge.is_some() && stateful {
+        if let Some(candidate) = forward_body_json.as_mut() {
+            force_include_usage(&provider, candidate);
+        }
+    }
+
+    // The Worker sends every stateful request through platform admission, but
+    // only a model-matching enforcing/blocking strict cap needs the bounded
+    // input/output contract. Advisory, shadow, flag-only and out-of-scope caps
+    // retain their broader compatibility surface.
+    let strict_cost_cap = engine.requires_explicit_output_limit(&model, None);
+    let mut maximum_output_tokens: Option<u64> = None;
+    let mut est_input_tokens: Option<u32> = None;
+    if bridge.is_some() && stateful {
+        if let Some(original) = body_json.as_ref() {
+            let max_out = match resolve_max_output_tokens(original) {
+                Ok(value) => value,
+                Err(key) => return invalid_output_limit(key),
+            };
+            if strict_cost_cap && max_out.is_none() {
+                console_warn!("Nova Guard: rejecting an unbounded request under a strict cost cap");
+                return missing_strict_output_limit();
+            }
+            maximum_output_tokens = max_out;
+        }
+        if let Some(candidate) = forward_body_json.as_mut() {
+            let estimate = if strict_cost_cap {
+                if provider.eq_ignore_ascii_case("openai") {
+                    let override_base = env_value(&env, OPENAI_BASE_URL_VAR);
+                    if let Err(message) = validate_strict_openai_base_url(override_base.as_deref())
+                    {
+                        return invalid_strict_input(&message);
+                    }
+                } else if provider.eq_ignore_ascii_case("anthropic") {
+                    let override_base = env_value(&env, ANTHROPIC_BASE_URL_VAR);
+                    if let Err(message) =
+                        validate_strict_anthropic_base_url(override_base.as_deref())
+                    {
+                        return invalid_strict_input(&message);
+                    }
+                }
+                match prepare_strict_admission_body(&provider, &path, candidate) {
+                    Ok(tokens) => tokens,
+                    Err(message) => return invalid_strict_input(&message),
+                }
+            } else {
+                estimate_admission_input_tokens(candidate, false)
+            };
+            est_input_tokens = Some(estimate);
+        }
+    }
+
+    // Re-validate the exact transformed Anthropic request before taking a
+    // hold. A deterministic converter error proves no upstream call occurred.
+    if is_anthropic {
+        if let Some(candidate) = forward_body_json.as_ref() {
+            if let Err(message) = openai_to_anthropic_messages(candidate.clone()) {
+                return error_response(400, "invalid_request_error", &message);
+            }
+        }
+    }
+
+    let body_rewritten = forward_body_json != body_json;
+    if body_rewritten {
+        let serialized = match forward_body_json.as_ref().map(serde_json::to_vec) {
+            Some(Ok(body)) => body,
+            Some(Err(error)) => {
+                return invalid_strict_input(&format!(
+                    "request body could not be serialized after Nova Guard transforms: {error}"
+                ))
+            }
+            None => Vec::new(),
+        };
+        if serialized.len() > MAX_BODY {
+            return transformed_body_too_large();
+        }
+    }
 
     // --- Admission + live state (platform-managed, stateful policies only) --
     let mut live_state: Option<LiveState> = None;
-    let mut est_input_tokens: Option<u32> = None;
     if let (Some(cfg), true) = (bridge.as_ref(), stateful) {
         live_state = worker_remote::live_state(cfg).await;
 
-        if let Some(j) = &body_json {
-            let est_in = estimate_input_tokens(&flatten_input_text(j));
-            est_input_tokens = Some(est_in);
-            // Untrusted client JSON — reject an unusable limit before it reaches
-            // the admission arithmetic (or the provider).
-            let max_out = match resolve_max_output_tokens(j) {
-                Ok(v) => v,
-                Err(key) => return invalid_output_limit(key),
-            };
-            // Unknown models reserve the defensive assumption, not $0 - the
-            // edge must not admit what the native path would refuse.
-            let est_cost = crate::policy::pricing::reserve_request_cost(&model, est_in, max_out);
+        if let (Some(candidate), Some(est_in)) = (&forward_body_json, est_input_tokens) {
+            // Reserve every billable request declaration as well as tokens, in
+            // exact parity with native admission. Unknown models still take
+            // the defensive catalog maximum rather than $0.
+            let declared_usage =
+                crate::policy::pricing::declared_request_usage(&provider, candidate, est_in);
+            let est_cost = crate::policy::pricing::reserve_request_breakdown(
+                &model,
+                est_in,
+                maximum_output_tokens,
+                &declared_usage,
+            )
+            .total_usd;
             let request = AdmitRequest {
                 // Fresh idempotency key per logical request; the client's own
                 // retries inside `admit` reuse it, so a transport failure
@@ -744,7 +1206,7 @@ async fn proxy(
                 provider: Some(provider.clone()),
                 model: model.clone(),
                 estimated_input_tokens: u64::from(est_in),
-                maximum_output_tokens: max_out
+                maximum_output_tokens: maximum_output_tokens
                     .unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
                 estimated_cost_usd: est_cost,
                 pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
@@ -755,6 +1217,8 @@ async fn proxy(
                         cfg: cfg.clone(),
                         id: res.id,
                         model: model.clone(),
+                        provider: provider.clone(),
+                        upstream_deadline_ms: reserved_upstream_deadline_ms(&env),
                     });
                 }
                 Admission::Blocked(decision) => {
@@ -769,16 +1233,11 @@ async fn proxy(
                     return guard_block_response(&provider, &model, &block, block_mode);
                 }
                 Admission::Unavailable(reason) => {
-                    // Never an implicit allow: apply `failClosed` exactly as an
-                    // unavailable `/state` would. This runtime routes EVERY
-                    // stateful policy through admission -- it has no in-process
-                    // ledger to fall back to -- so the fail-closed branch must
-                    // consider every cost cap, which is what a forced strict
-                    // override selects.
-                    match engine.admission_unavailable_decision(
-                        &reason,
-                        Some(crate::policy::config::CostEnforcementMode::Strict),
-                    ) {
+                    // Never an implicit allow for caps configured strict. The
+                    // Worker also sends advisory stateful traffic through the
+                    // bridge, but a transport optimization must not change an
+                    // advisory policy's fail-safety semantics.
+                    match engine.admission_unavailable_decision(&reason, None) {
                         Some(d) if d.is_blocking() => {
                             console_warn!(
                                 "Nova Guard: platform admission unavailable ({reason}); failing closed"
@@ -798,8 +1257,7 @@ async fn proxy(
         }
     }
 
-    // --- Nova Guard input phase (block, then redact/mask transforms) --------
-    let mut body_rewritten = false;
+    // --- Nova Guard input phase (block, then forward prepared candidate) ----
     if guard_active {
         if let Some(j) = &body_json {
             let input_text = flatten_input_text(j);
@@ -832,21 +1290,8 @@ async fn proxy(
                 return guard_block_response(&provider, &model, block, block_mode);
             }
         }
-        if let Some(j) = body_json.as_mut() {
-            body_rewritten = apply_input_transforms(&engine, &model, j);
-        }
     }
-
-    // While the platform is metering, ask OpenAI to append its terminal usage
-    // chunk to streaming responses. Without it a stream carries no token counts
-    // and every streamed request would settle at `input + max_tokens`.
-    if pending.is_some() {
-        if let Some(j) = body_json.as_mut() {
-            if force_include_usage(&provider, j) {
-                body_rewritten = true;
-            }
-        }
-    }
+    body_json = forward_body_json;
 
     // --- Build the outbound request (provider-specific routing/auth/body) ---
     let url: String;
@@ -855,12 +1300,9 @@ async fn proxy(
 
     if is_bedrock {
         // AWS Bedrock Converse, signed with SigV4 (temporary creds supported).
-        let Some(creds) = bedrock_credentials(&req) else {
-            return Response::error(
-                "Bedrock requires x-aws-access-key-id and x-aws-secret-access-key headers",
-                400,
-            );
-        };
+        let creds = bedrock_creds
+            .as_ref()
+            .expect("Bedrock credentials were validated before admission");
         let Some(body) = body_json.as_ref() else {
             return Response::error("Bedrock requires a JSON chat-completions body", 400);
         };
@@ -907,11 +1349,30 @@ async fn proxy(
         out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
         out_headers.delete("authorization")?;
         out_headers.set("anthropic-version", "2023-06-01")?;
-        if let Ok(Some(auth)) = req.headers().get("authorization") {
-            out_headers.set("x-api-key", auth.trim_start_matches("Bearer ").trim())?;
-        }
-        url = "https://api.anthropic.com/v1/messages".to_string();
-        forward_bytes = forward_body_bytes(body_rewritten, &body_json, &body_bytes);
+        let api_key = anthropic_api_key
+            .as_deref()
+            .expect("Anthropic authentication was validated before admission");
+        out_headers.set("x-api-key", api_key)?;
+        let Some(body) = body_json.take() else {
+            return error_response(
+                400,
+                "invalid_request_error",
+                "Anthropic requires a JSON chat-completions request body",
+            );
+        };
+        let body = match openai_to_anthropic_messages(body) {
+            Ok(body) => body,
+            Err(message) => return error_response(400, "invalid_request_error", &message),
+        };
+        forward_bytes = serde_json::to_vec(&body).map_err(Error::from)?;
+
+        let base = normalize_base_url(env_value(&env, ANTHROPIC_BASE_URL_VAR).as_deref())
+            .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+        let messages_url = format!("{base}/v1/messages");
+        url = match &query {
+            Some(q) => format!("{messages_url}?{q}"),
+            None => messages_url,
+        };
     } else {
         let route = route.expect("checked above");
         out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
@@ -938,7 +1399,21 @@ async fn proxy(
     init.with_body(Some(arr.into()));
     let out_req = Request::new_with_init(&url, &init)?;
     // If this fails, `handle`'s backstop abandons the reservation.
-    let mut resp = Fetch::Request(out_req).send().await?;
+    let fetch_request = Fetch::Request(out_req);
+    let fetch = fetch_request.send();
+    let mut resp = match pending.as_ref() {
+        Some(hold) => match before_upstream_deadline(hold.upstream_deadline_ms, fetch).await {
+            Some(result) => result?,
+            None => {
+                return error_response(
+                    504,
+                    "gateway_timeout",
+                    "upstream response headers exceeded the NovaGuard reservation lease budget",
+                )
+            }
+        },
+        None => fetch.await?,
+    };
 
     // --- Response phase ----------------------------------------------------
     let is_stream = resp
@@ -949,15 +1424,13 @@ async fn proxy(
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
 
-    // Streaming passes through untouched (matches native v1; Anthropic SSE stays
-    // in Anthropic shape, exactly like the native server). When a reservation is
-    // held, the bytes are teed on the way past so the terminal usage frame can
-    // reconcile it — still no buffering.
+    // Streaming remains incremental. Anthropic SSE is translated through the
+    // shared state machine into OpenAI chunks; all other provider bytes pass
+    // through unchanged. A held reservation tees the resulting bytes so the
+    // terminal usage frame can reconcile it without buffering.
     if is_stream {
-        return match pending.take() {
-            Some(p) => metered_passthrough(resp, p, ctx),
-            None => passthrough(resp),
-        };
+        let translate = is_anthropic && (200..300).contains(&resp.status_code());
+        return stream_passthrough(resp, pending.take(), ctx, translate);
     }
 
     // Non-streaming: buffer only when we must transform (Anthropic/Bedrock), run
@@ -993,8 +1466,22 @@ async fn proxy(
     let resp_headers = copy_headers_excluding(resp.headers(), RESPONSE_SKIP_HEADERS)?;
 
     // Read with a hard cap (covers chunked / missing Content-Length).
-    let bytes = match read_body_capped(&mut resp).await {
-        Ok(b) => b,
+    let read = read_body_capped(&mut resp);
+    let read_result = match pending.as_ref() {
+        Some(hold) => match before_upstream_deadline(hold.upstream_deadline_ms, read).await {
+            Some(result) => result,
+            None => {
+                return error_response(
+                    504,
+                    "gateway_timeout",
+                    "upstream response body exceeded the NovaGuard reservation lease budget",
+                )
+            }
+        },
+        None => read.await,
+    };
+    let bytes = match read_result {
+        Ok(body) => body,
         Err(()) => {
             if let Some(p) = pending.take() {
                 p.settle(
@@ -1029,7 +1516,7 @@ async fn proxy(
     // Read usage from the provider's own shape before any conversion, so a
     // dialect the OpenAI translation drops (Bedrock's camelCase counters) is
     // still recoverable; the converted body is preferred when it carries usage.
-    let raw_usage = extract_actual_usage(&out_json);
+    let raw_usage = extract_actual_usage_priced(&model, &provider, &out_json);
 
     // Convert provider-native responses to OpenAI shape for parity (only on 2xx;
     // error envelopes pass through unchanged).

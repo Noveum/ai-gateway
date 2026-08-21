@@ -4,7 +4,7 @@
 //! (the gateway speaks the OpenAI wire format natively) and extracts token usage
 //! + cost from the standard `usage` object via the shared pricing table.
 
-use super::utils::log_tracking_headers;
+use super::utils::{log_tracking_headers, normalized_bearer_header};
 use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
@@ -15,7 +15,7 @@ use std::time::Duration;
 use tracing::{debug, error};
 
 /// Provider adapter for OpenAI (`x-provider: openai`). Base URL
-/// `https://api.openai.com`; passes the Bearer token through unchanged.
+/// `https://api.openai.com`; validates and canonicalizes Bearer auth.
 pub struct OpenAIProvider {
     base_url: String,
 }
@@ -74,7 +74,7 @@ impl Provider for OpenAIProvider {
             debug!("Using provided authorization header");
             headers.insert(
                 http::header::AUTHORIZATION,
-                http::header::HeaderValue::from_str(auth).map_err(|_| {
+                normalized_bearer_header(auth).map_err(|_| {
                     error!("Failed to process authorization header");
                     AppError::InvalidHeader
                 })?,
@@ -223,6 +223,11 @@ mod tests {
         assert_eq!(
             out.get(http::header::CONTENT_TYPE).unwrap(),
             "application/json"
+        );
+        let lower = p.process_headers(&hdr(Some("bearer sk-test"))).unwrap();
+        assert_eq!(
+            lower.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-test"
         );
     }
 

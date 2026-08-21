@@ -1,5 +1,5 @@
 # Build stage
-# Rust 1.96 (>= the crate's MSRV of 1.91); 1.82 is too old — some transitive
+# Rust 1.96 (>= the crate's MSRV of 1.94.1); 1.82 is too old — some transitive
 # dependencies now ship `edition = "2024"` manifests that need Cargo >= 1.85.
 FROM --platform=linux/amd64 rust:1.96-slim-bookworm AS builder
 
@@ -54,4 +54,4 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /usr/src/app/target/x86_64-unknown-linux-gnu/release/noveum-ai-gateway /usr/local/bin/
 
 # Set the startup command
-CMD ["noveum-ai-gateway"] 
+CMD ["noveum-ai-gateway"]

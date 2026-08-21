@@ -8,6 +8,12 @@ use reqwest::{
 use serde_json::{json, Value};
 use std::env;
 
+#[derive(Clone, Copy)]
+enum OutputLimitField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
 /// Configuration for a provider test
 pub struct ProviderTestConfig {
     pub provider_name: String,
@@ -15,6 +21,7 @@ pub struct ProviderTestConfig {
     pub model: String,
     pub prompt: String,
     pub max_tokens: u32,
+    output_limit_field: OutputLimitField,
 }
 
 impl ProviderTestConfig {
@@ -25,6 +32,7 @@ impl ProviderTestConfig {
             model: model.to_string(),
             prompt: "Write a very short poem about Rust programming language".to_string(),
             max_tokens: 100,
+            output_limit_field: OutputLimitField::MaxTokens,
         }
     }
 
@@ -35,6 +43,13 @@ impl ProviderTestConfig {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self.output_limit_field = OutputLimitField::MaxTokens;
+        self
+    }
+
+    pub fn with_max_completion_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self.output_limit_field = OutputLimitField::MaxCompletionTokens;
         self
     }
 }
@@ -115,7 +130,7 @@ pub fn setup_test_headers(provider: &str, api_key: &str) -> HeaderMap {
 
 /// Create a request body for a provider test
 pub fn create_test_request_body(config: &ProviderTestConfig, stream: bool) -> Value {
-    json!({
+    let mut body = json!({
         "model": config.model,
         "messages": [
             {
@@ -123,9 +138,14 @@ pub fn create_test_request_body(config: &ProviderTestConfig, stream: bool) -> Va
                 "content": config.prompt
             }
         ],
-        "stream": stream,
-        "max_tokens": config.max_tokens
-    })
+        "stream": stream
+    });
+    let field = match config.output_limit_field {
+        OutputLimitField::MaxTokens => "max_tokens",
+        OutputLimitField::MaxCompletionTokens => "max_completion_tokens",
+    };
+    body[field] = json!(config.max_tokens);
+    body
 }
 
 /// Get API key for the provider
@@ -379,5 +399,15 @@ mod tests {
         state.process_line("data: [DONE]");
 
         assert_eq!(state.validate_complete(), Ok(()));
+    }
+
+    #[test]
+    fn request_body_can_select_max_completion_tokens_without_leaking_max_tokens() {
+        let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-5.6-luna")
+            .with_max_completion_tokens(16);
+        let body = create_test_request_body(&config, false);
+
+        assert_eq!(body["max_completion_tokens"], 16);
+        assert!(body.get("max_tokens").is_none());
     }
 }

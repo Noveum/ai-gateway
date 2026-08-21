@@ -40,6 +40,8 @@ Policies can come from either of two places:
 | `NOVEUM_GUARD_POLICIES_FILE` | _(unset)_ | Path to a `nova-guard.json` bundle. |
 | `NOVEUM_GUARD_POLICIES` | _(unset)_ | Inline JSON bundle (used if no file is set). |
 | `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` (HTTP 200 with a refusal completion) or `provider_error` (HTTP 403 with the provider's error envelope). |
+| `NOVEUM_GUARD_COST_ENFORCEMENT` | policy setting | Native gateway only: `strict` forces cost caps through platform-atomic admission; `advisory` forces the per-process ledger; unset lets each cap's `enforcementMode` decide. `strict` requires the platform bridge. |
+| `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Fallback completion estimate for advisory cost caps and rate-only admission. It is not a substitute for the explicit output limit required by an applicable enforcing/blocking strict cost cap. |
 
 When the engine is disabled or has zero active policies, the middleware
 short-circuits without buffering the body, so guardrails add **no overhead** when
@@ -153,15 +155,15 @@ text.
 `cost_cap` and `rate_limit` need a cross-request state backend (spend/rate
 counters) to evaluate. There are two cases:
 
-* **No backend** (local bundle only, or the Cloudflare Worker) — they cannot be
-  evaluated, so they **always fail open** (allow), and a `failClosed: true` on
-  those two types is neutralized at load time with a warning so a stale bundle
-  can't block 100% of traffic. The Worker refuses such a bundle outright with a
-  503 rather than accepting it and enforcing nothing.
+* **No backend** (a local bundle on the native gateway, or an inline Worker
+  bundle) — they cannot be evaluated, so the native engine **fails them open**
+  (allow) and neutralizes `failClosed: true` at load time with a warning. The
+  Worker refuses an inline bundle containing either stateful policy with a 503
+  rather than accepting it and enforcing nothing.
 * **Platform-managed Nova Guard** — live counters come from the Noveum platform,
-  so both types evaluate for real and `failClosed` is honored: a `/state`
-  outage, or a counter the policy needs that the response does not carry,
-  blocks.
+  so both types evaluate for real on the native gateway **and** Cloudflare
+  Worker. `failClosed` is honored: a `/state` outage, or a counter the policy
+  needs that the response does not carry, blocks.
 
 (The stateless policy types — regex, PII, secrets, banned substrings, model
 allowlist, JSON schema, token caps — enforce fully with no backend.)
@@ -241,20 +243,86 @@ platform call is made with the calling tenant's own credential.
   substituted, because that would let every project consume the whole
   organization allowance separately.
 * Admission is **estimate-based in both modes**, but only one of them holds
-  across replicas. A `cost_cap` with `enforcementMode: strict` (or a deployment
-  with `NOVEUM_GUARD_COST_ENFORCEMENT=strict`) reserves against the platform's
-  atomic admission API, so every replica shares one counter. An **advisory** cap
-  reserves only in the replica's own ledger, so the effective overshoot is
-  multiplied by replica count. See the README for the full comparison.
+  across replicas. A `cost_cap` with `enforcementMode: strict` (or, on the
+  native gateway, a deployment with
+  `NOVEUM_GUARD_COST_ENFORCEMENT=strict`) reserves against the platform's atomic
+  admission API, so every replica shares one counter. An **advisory** cap on the
+  native gateway reserves only in the replica's own ledger, so the effective
+  overshoot is multiplied by replica count. The Worker still calls the platform
+  admission bridge for stateful policies, but it does not promote an advisory,
+  shadow, non-blocking, or out-of-scope cap into the strict output-bound
+  contract.
 * In **shared** mode this is per derived tenant: each tenant gets its own
   engine, counters, ledger and reservations, so one tenant's traffic can neither
   consume nor observe another's headroom.
 
+### Strict caps and explicit output limits
+
+A hard cost cap cannot safely reserve an unbounded provider response against a
+heuristic. Before admission, the gateway therefore accepts these aliases:
+
+1. `max_tokens`
+2. `max_completion_tokens`
+3. `max_output_tokens`
+
+Every non-null alias must contain the same positive integer no greater than
+10,000,000. Conflicting aliases receive HTTP 400 before admission. Transparent
+OpenAI-compatible routes are rewritten to one `max_tokens` field equal to the
+admitted bound; Anthropic and Bedrock converters map the same bound to their
+native request field.
+
+| Policy state for the requested model | Unbounded request |
+|---|---|
+| `mode: enforce`, `action: block`, effective strict mode, model in `scopeToModels` (or no scope) | **HTTP 400** with `error.code: "missing_output_limit"`; no platform reservation and no provider call |
+| Advisory `cost_cap` | Allowed using `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` as the estimate; this is not a hard guarantee |
+| `rate_limit` only | Allowed; rate-only policies do not require an output bound and use the fallback where token estimation needs one |
+| Strict cap in `shadow` mode, disabled, or outside `scopeToModels` | Allowed; that cap is not an enforcing block for this request |
+
+The scope rows assume a parseable JSON body with a trustworthy `model`. If any
+enforcing/blocking strict cap is active, a multipart, binary, or otherwise
+non-JSON body cannot prove that it is out of scope and is rejected with HTTP 400
+before admission rather than silently bypassing the cap.
+
+On the native gateway, `NOVEUM_GUARD_COST_ENFORCEMENT=strict` selects strict
+handling deployment-wide, including for caps declared advisory;
+`NOVEUM_GUARD_COST_ENFORCEMENT=advisory` selects advisory handling even for a
+cap declared strict. The Cloudflare Worker uses each policy's
+`enforcementMode`; it does not implement this native deployment override.
+
+The strict input contract is deliberately narrower than transparent proxying.
+It accepts bounded JSON `/v1/chat/completions` with a non-empty model, a
+messages array, and one completion (`n`/`best_of` must be absent or `1`). It
+estimates the complete post-transform serialized body and rejects Responses or
+server-side conversation state, images, files, audio, remote search,
+server/MCP tools, Perplexity, and OpenRouter before admission. Client function
+tools remain supported on adapters that translate or transparently pass them;
+the Bedrock adapter does not yet translate tool use. Strict Bedrock admission
+accepts only catalogued commercial Claude direct/geographic/global model IDs
+and identifiable system inference profiles. Region-priced Nova/Titan models
+remain available under advisory policies but receive HTTP 400
+`unsupported_strict_input` before reservation under a strict cost cap. Direct
+OpenAI calls are pinned to `service_tier: "default"`; requested premium tiers
+are rejected.
+Advisory policies retain the broader pass-through surface.
+
+The output ceiling is only one part of a strict reservation. Provider-specific
+declarations that can raise the bill are included before admission. For
+Anthropic, any prompt-cache breakpoint reserves the entire estimated prompt as
+a first cache write at the longest declared TTL; `inference_geo: "us"` reserves
+1.1x, and omitting geo on an eligible model also reserves 1.1x because the
+workspace can select US-only inference. Opus 5/4.8 `speed: "fast"` reserves 2x;
+fast plus US geo reserves 2.2x. Cache controls, geo, speed, mixed-model
+`fallbacks`, constrained-model sampling, and Sonnet 5 thinking/prefill are
+validated before a reservation exists. See the
+[Anthropic contract](providers/anthropic.md).
+
 ## Streaming
 
-Streaming responses (`text/event-stream`) are passed through without
-output-phase enforcement in v1 (a limitation shared across LLM gateways).
-Input-phase enforcement and blocking still apply to streaming requests.
+Streaming responses (`text/event-stream`) skip output-phase enforcement in this
+release; input-phase enforcement and blocking still apply. OpenAI-compatible
+provider streams pass through incrementally. Successful Anthropic Messages
+streams are translated incrementally into OpenAI Chat Completions chunks before
+they reach the client, including function tool calls and terminal usage.
 
 ## Extending Nova Guard
 
@@ -269,7 +337,20 @@ no further changes.
 
 ## Cost / pricing
 
-Per-request cost is computed from the model pricing table in
-`src/policy/pricing.rs` (current as of June 2026; see the table's caveats on
-Gemini's >200K tier, cache-hit pricing, and provider-prefixed model ids). The
-table is single-sourced and reused by the provider metrics extractors.
+Per-request cost is computed from the model pricing catalog in
+`pricing/catalog.json`, mirrored by hand into
+`src/policy/pricing_catalog.rs`, and used by `src/policy/pricing.rs`. The catalog
+version is `2026.08.21`; it includes provider-prefixed model ids, cache
+dimensions, tool fees, long-context tiers in the runtime mirror, and supported
+request/response multipliers. Current OpenAI rows include GPT-5.6 Cyber at
+$12.50/$75 and published GPT-5.6 long-context cache rates. Current Anthropic
+rows include Sonnet 5 at the now
+permanent **$2 / million input** and **$10 / million output**, Opus 5 and the
+dated Opus 4.5 ID at $5/$25, and limited-availability Mythos 5 at $10/$50.
+Unknown models use the compiled runtime rows' derived $15/$75 maximum rather
+than $0. Missing billable
+dimensions use a conservative bound and mark the cost incomplete. A zero-output
+Anthropic pre-output refusal keeps token counts but settles at $0; partial-output
+refusals are billed normally. Rates remain policy estimates, not an invoice.
+See the [pricing guide](PRICING.md) and verify time-sensitive Anthropic values
+against [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
