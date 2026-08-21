@@ -245,10 +245,45 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
     );
 }
 
+#[derive(Default)]
+struct StreamingSmokeState {
+    data_chunks: Vec<Value>,
+    saw_done: bool,
+}
+
+impl StreamingSmokeState {
+    fn process_line(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if line == "data: [DONE]" {
+            self.saw_done = true;
+            return;
+        }
+        if let Some(json_str) = line.strip_prefix("data: ") {
+            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                self.data_chunks.push(json);
+            }
+        }
+    }
+
+    fn validate_complete(&self) -> Result<(), &'static str> {
+        if self.data_chunks.is_empty() {
+            return Err("No streaming data chunks received");
+        }
+        if !self.saw_done {
+            return Err("Streaming response ended without the required data: [DONE] marker");
+        }
+        Ok(())
+    }
+}
+
 /// Run a streaming test for a provider.
 ///
-/// Validates that the gateway streams an OpenAI-compatible SSE response and that
-/// non-empty content is reconstructable from the chunks.
+/// Validates that the gateway streams OpenAI-compatible JSON chunks and finishes
+/// with the protocol's `data: [DONE]` marker. A valid tool-call response may have
+/// no text content, so completion is defined by the SSE protocol, not text deltas.
 pub async fn run_streaming_test(config: &ProviderTestConfig) {
     let api_key = get_api_key(&config.api_key_env_var);
     let gateway_url = gateway_url();
@@ -287,33 +322,11 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
     );
 
     let mut stream = response.bytes_stream();
-    let mut stream_data: Vec<Value> = Vec::new();
-    let mut content = String::new();
+    let mut state = StreamingSmokeState::default();
 
     // Network chunks do not align to SSE event boundaries, so buffer raw bytes
     // and only parse complete lines (a `data:` line split across two chunks would
     // otherwise be dropped, making the test flaky).
-    let mut process_line = |line: &str| {
-        let line = line.trim();
-        if line.is_empty() || line == "data: [DONE]" {
-            return;
-        }
-        if let Some(json_str) = line.strip_prefix("data: ") {
-            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                if let Some(delta) = json
-                    .get("choices")
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    content.push_str(delta);
-                }
-                stream_data.push(json);
-            }
-        }
-    };
-
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.expect("Failed to read chunk");
@@ -321,22 +334,50 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
         // Drain complete lines (everything up to and including each '\n').
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            process_line(&String::from_utf8_lossy(&line_bytes));
+            state.process_line(&String::from_utf8_lossy(&line_bytes));
         }
     }
     // Handle any final line not terminated by a newline.
     if !buf.is_empty() {
-        process_line(&String::from_utf8_lossy(&buf));
+        state.process_line(&String::from_utf8_lossy(&buf));
     }
 
-    assert!(!stream_data.is_empty(), "No streaming data chunks received");
-    assert!(
-        !content.is_empty(),
-        "Reconstructed streaming content should not be empty"
-    );
+    state
+        .validate_complete()
+        .unwrap_or_else(|message| panic!("{message}"));
 
     println!(
         "Streaming test completed successfully for provider: {}",
         config.provider_name
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_smoke_rejects_a_stream_without_the_done_marker() {
+        let mut state = StreamingSmokeState::default();
+        state.process_line(r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#);
+
+        let message = state
+            .validate_complete()
+            .expect_err("a stream without data: [DONE] must fail the smoke test");
+        assert!(
+            message.contains("data: [DONE]"),
+            "failure should name the missing terminator, got: {message}"
+        );
+    }
+
+    #[test]
+    fn streaming_smoke_accepts_tool_calls_without_text_content() {
+        let mut state = StreamingSmokeState::default();
+        state.process_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
+        );
+        state.process_line("data: [DONE]");
+
+        assert_eq!(state.validate_complete(), Ok(()));
+    }
 }

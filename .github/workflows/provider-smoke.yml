@@ -28,9 +28,54 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run provider integration tests
-        run: cargo test --test run_integration_tests -- --nocapture
+      - name: Build gateway
+        run: cargo build --locked --bin noveum-ai-gateway
+
+      - name: Start gateway and run provider integration tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          gateway_log="${RUNNER_TEMP}/noveum-ai-gateway.log"
+          ./target/debug/noveum-ai-gateway >"${gateway_log}" 2>&1 &
+          gateway_pid=$!
+
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if kill -0 "${gateway_pid}" 2>/dev/null; then
+              kill "${gateway_pid}" 2>/dev/null || true
+              wait "${gateway_pid}" 2>/dev/null || true
+            fi
+            if (( status != 0 )); then
+              echo "::group::Gateway log"
+              cat "${gateway_log}" || true
+              echo "::endgroup::"
+            fi
+            exit "${status}"
+          }
+          trap cleanup EXIT
+
+          for attempt in {1..60}; do
+            if curl --fail --silent --show-error "${GATEWAY_URL}/health" >/dev/null; then
+              break
+            fi
+            if ! kill -0 "${gateway_pid}" 2>/dev/null; then
+              echo "Gateway exited before becoming healthy" >&2
+              exit 1
+            fi
+            if (( attempt == 60 )); then
+              echo "Gateway did not become healthy within 60 seconds" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          cargo test --locked --test run_integration_tests -- --nocapture --test-threads=1
         env:
+          GATEWAY_URL: http://127.0.0.1:3000
+          HOST: 127.0.0.1
+          PORT: "3000"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

@@ -64,7 +64,7 @@ For running tests, creating a `.env.test` file is recommended to keep your test 
 
 ### AWS Bedrock
 
-The AWS Bedrock integration test uses the Claude 3 Sonnet model (`anthropic.claude-3-sonnet-20240229-v1:0`) by default. Unlike other providers that use API keys, Bedrock uses AWS credentials for authentication:
+The AWS Bedrock integration test uses `amazon.titan-text-express-v1` by default. Unlike other providers that use API keys, Bedrock uses AWS credentials for authentication. The fixture is intentionally not changed without first verifying that the replacement model is enabled for the smoke-test AWS account.
 
 - **AWS_ACCESS_KEY_ID**: Your AWS access key with Bedrock permissions
 - **AWS_SECRET_ACCESS_KEY**: Your AWS secret key
@@ -82,7 +82,7 @@ The test validates that:
 First, start the AI Gateway in a separate terminal:
 
 ```bash
-cargo run
+cargo run --locked
 ```
 
 ### Using the Test Runner Script
@@ -112,7 +112,7 @@ If you prefer to run the tests manually:
 
 ```bash
 # Run all integration tests
-cargo test --test run_integration_tests -- --nocapture
+cargo test --locked --test run_integration_tests -- --nocapture --test-threads=1
 ```
 
 The `--nocapture` flag ensures that test output (e.g., request/response details) is printed to the console, which is helpful for debugging.
@@ -130,13 +130,13 @@ The `--nocapture` flag ensures that test output (e.g., request/response details)
 
 2. Start the gateway:
    ```bash
-   cargo run
+   cargo run --locked
    ```
 
 3. Run the integration tests:
    ```bash
    # Run all tests
-   cargo test --test run_integration_tests -- --nocapture
+   cargo test --locked --test run_integration_tests -- --nocapture --test-threads=1
    
    # Run tests for specific providers
    cargo test --test run_integration_tests openai -- --nocapture
@@ -173,13 +173,13 @@ use super::common::{ProviderTestConfig, run_non_streaming_test, run_streaming_te
 
 #[tokio::test]
 async fn test_groq_non_streaming() {
-    let config = ProviderTestConfig::new("groq", "GROQ_API_KEY", "llama2-70b-4096");
+    let config = ProviderTestConfig::new("groq", "GROQ_API_KEY", "openai/gpt-oss-20b");
     run_non_streaming_test(&config).await;
 }
 
 #[tokio::test]
 async fn test_groq_streaming() {
-    let config = ProviderTestConfig::new("groq", "GROQ_API_KEY", "llama2-70b-4096");
+    let config = ProviderTestConfig::new("groq", "GROQ_API_KEY", "openai/gpt-oss-20b");
     run_streaming_test(&config).await;
 }
 ```
@@ -225,4 +225,4 @@ let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-4")
     .with_max_tokens(200);
 ```
 
-This allows you to test specific models or use cases with minimal code duplication. 
+This allows you to test specific models or use cases with minimal code duplication.
