@@ -6,6 +6,8 @@
 
 **Gateway working branch:** `codex/pr30-release-blockers`
 
+**Companion app PR:** [Noveum/noveum-app-nextjs#544](https://github.com/Noveum/noveum-app-nextjs/pull/544)
+
 **Companion app branch:** `codex/pr30-platform-guardrails`
 
 ## Executive verdict
@@ -17,14 +19,16 @@ Cloudflare Workerd runtime, including atomic admission, strict cost limits,
 organization counters, request transforms, provider streaming, usage
 settlement, concurrency, and reservation cleanup.
 
-The GitHub PR as currently published is **not yet ready to approve or merge**.
-GitHub still points at remote commit `98a562f`, while the release-blocker fixes
-and companion app changes described here are local. Approval should happen only
-after both repositories are committed/pushed, the app-side changes are
-deployed, CI passes on the pushed SHA, and a fresh human/bot review is requested.
+At the start of this final publication pass, GitHub pointed at gateway commit
+`99c5fe3`, while the final cross-repository release fixes described here were
+still local. That published gateway SHA also had a failed supply-chain check for
+`h2 0.4.15`; this reviewed branch updates the lockfile to fixed `0.4.16`.
+Regardless of publication state, approval should happen only after CI passes on
+both final pushed SHAs, the companion app is deployed first, and a fresh
+human/bot review is requested.
 
 Cloudflare compatibility is proven by WASM compilation, pinned
-`worker-build 0.8.5`, Wrangler `4.120.0 deploy --dry-run`, and the full ten-phase
+`worker-build 0.8.5`, Wrangler `4.120.0 deploy --dry-run`, and the full 11-phase
 Workerd suite. A live Cloudflare deployment was intentionally not created, so
 this document does not claim production-edge deployment evidence.
 
@@ -60,12 +64,49 @@ Required behavior now implemented:
   Responses/conversation state, malformed or non-JSON bodies, remote media,
   file/audio/video/document inputs, server/MCP tools, provider search, premium
   service tiers, Perplexity, and OpenRouter.
-- Advisory, shadow, non-blocking, rate-only, and model-scope-miss policies retain
-  their broader proxy behavior; strict validation is not incorrectly applied
-  to them.
+- Advisory, shadow, and model-scope-miss cost policies are not accidentally
+  promoted to strict. When any stateful cost/rate policy is active, opaque or
+  malformed bodies are rejected because forwarding them without admission
+  would bypass the authoritative counters.
 - Provider-local deterministic validation and authentication errors happen
   before a reservation is created.
 - Unknown providers are rejected before `/state`, `/admit`, or provider fetch.
+
+### 1a. Shared-gateway authorization and admission match the platform
+
+Primary gateway files:
+
+- `src/policy/remote.rs`
+- `src/policy/middleware.rs`
+- `src/policy/engine.rs`
+- `src/policy/admission_wire.rs`
+- `src/worker_rt.rs`
+
+Primary companion-app files:
+
+- `packages/api/src/routes/v1/projects/router.ts`
+- `packages/api/src/routes/v1/guardrails/schemas.ts`
+- `packages/api/src/routes/v1/guardrails/admission-handlers.ts`
+- `packages/billing/src/guardrails-admission.ts`
+
+The original shared runtime cached the first caller's authorization-bearing
+clients by organization/project and reused them for later API keys selecting
+the same tenant. The corrected runtime caches per-credential clients by a full
+SHA-256 identity, bounds rotated-key runtimes to 64 with idle/LRU eviction, and
+still shares one tenant-wide pending-spend ledger so two valid keys cannot spend
+the same advisory headroom.
+
+The gateway now resolves credentials through
+`GET /api/v1/projects/guardrails/resolve`. The companion endpoint requires all
+three permissions synchronously: `projects:read`, `guardrails:read`, and
+`guardrails:ingest`. A read-only key is rejected before any provider request,
+rather than being allowed while asynchronous usage ingestion fails later.
+
+The atomic admission wire now carries optional `forceStrictCostCaps`. Stored
+strict cost caps and every rate limit participate by default; the native strict
+deployment override forces all applicable cost caps. Cost model scopes are
+matched exactly and case-insensitively on both sides. Admission-outage handling
+uses the same policy selection, including rate-limit `failClosed` behavior.
 
 Strict mode deliberately favors an explicit 400 over a false “hard cap.” The
 broader provider surface remains available under advisory policies.
@@ -91,6 +132,11 @@ uses unavailable/fail-closed semantics instead of silently enforcing the wrong
 counter. The platform admission path uses the policy source for the atomic
 counter key, and the companion patch filters `scopeToModels` by exact,
 case-insensitive model match before calculating reservation operations.
+
+The previously accepted but unimplemented `1d_calendar` window is now backed
+end to end. Redis admission and reads sum UTC-midnight through the current hour;
+the Postgres fallback sums from UTC midnight; both organization and project
+state expose the same key. The dashboard can create and edit this window.
 
 Production verification used two projects in the same organization. Their
 project counters remained distinct while the returned 30-day organization
@@ -292,8 +338,8 @@ same `$0.0000068` increment at project, organization, and model scope.
 
 | Gate | Result |
 |---|---|
-| Rust library tests | **478 passed, 0 failed** |
-| NovaGuard platform integration | **57 passed, 0 failed** |
+| Rust library tests | **479 passed, 0 failed** |
+| NovaGuard platform integration | **61 passed, 0 failed** |
 | Policy integration | **12 passed, 0 failed** |
 | Clippy, all targets/features, warnings denied | **Passed** |
 | Rust formatting and `git diff --check` | **Passed** |
@@ -301,7 +347,8 @@ same `$0.0000068` increment at project, organization, and model scope.
 | `wasm32-unknown-unknown`, no native defaults | **Passed** |
 | `worker-build 0.8.5 --release` | **Passed** |
 | Wrangler `4.120.0 deploy --dry-run` | **Passed** |
-| Ten-phase pinned Workerd E2E | **Passed** |
+| RustSec audit, with repository allowlist | **Passed** |
+| 11-phase pinned Workerd E2E | **Passed** |
 
 The Workerd matrix additionally proved:
 
@@ -313,27 +360,25 @@ The Workerd matrix additionally proved:
   aliases, Groq Compound, Gemini search/cached context, Mistral documents,
   Together video, media, MCP, Perplexity, OpenRouter, and unpriced custom bases;
 - 16-way multi-agent concurrency with no duplicate settlement or leaked hold;
+- rate-only opaque-input rejection and `/admit`-503 fail-closed/fail-open parity;
 - Worker deadline abandonment before lease expiry, followed by a successful new
   admission with zero reservation reaping.
 
-Final Workerd artifacts are preserved locally at:
-
-```text
-/private/var/folders/7d/c1z608491jq84m9f40phz5rh0000gn/T/tmp.wC71visuv5/
-```
-
 ### Companion Noveum app tree
 
-Focused Vitest coverage is **40/40 passing**:
+- API unit suite: **738 passed**, 27 integration-mode skips.
+- Real Redis guardrail integrations: **25/25 passed**.
+- Web suite: **391/391 passed**.
+- Telemetry suite: **133/133 passed**.
+- Focused guardrail/project router suite: **72/72 passed**.
+- API, web, and telemetry TypeScript checks: **Passed**.
+- Translation parity/usage, schema parity, Biome, comments, and diff checks:
+  **Passed**.
 
-- 19 pricing-table tests;
-- 15 price-calculation tests;
-- 6 model-scope admission tests.
-
-Changed pricing files type-check cleanly and Biome exits zero. Broader app tests
-in the isolated worktree are limited by absent generated Prisma/ClickHouse/RBAC
-dependencies; the failures occur during dependency collection, not in changed
-guardrail or pricing code.
+The app patch additionally preserves `enforcementMode` and `scopeToModels`
+through dashboard load/edit/save, adds a strict/advisory selector and model list,
+makes dry-run model-aware, and hardens pricing lookup against inherited object
+keys such as `__proto__` and `constructor`.
 
 ### Live provider and production checks
 
@@ -353,7 +398,9 @@ the one early diagnostic that did not follow this rule.
 
 ## Dependency and toolchain decision
 
-No dependency upgrade is required for this PR. The locked Worker stack is
+One transitive security update is required: `h2 0.4.15` is affected by
+RUSTSEC-2026-0258, so `Cargo.lock` is updated to `h2 0.4.16`. A fresh RustSec
+scan passes after that change. No broader library upgrade is needed. The locked Worker stack is
 coherent: `worker`, `worker-macros`, and `worker-sys 0.8.5`,
 `wasm-bindgen 0.2.126`, `worker-build 0.8.5`, Wrangler `4.120.0`, and Node 22 in
 CI. The final local Workerd run used Node `25.5.0` and Rust `1.96.0` without a
@@ -369,8 +416,11 @@ to work around a stale global installation would reduce reproducibility.
 
 At the last authoritative refresh:
 
-- PR #30 was open, non-draft, mergeable/clean, with no approval decision.
-- Remote checks were green on `98a562f`, not on this local release patch.
+- Gateway PR #30 was open, non-draft and mergeable, with no approval decision.
+- Companion app PR #544 was open as a draft and mergeable.
+- Gateway native, Worker, Docker, and CodeRabbit checks were green on
+  `99c5fe3`, but supply-chain failed on vulnerable `h2 0.4.15`. None of those
+  checks covers this final local release patch.
 - CodeRabbit's summary explicitly said reviews were paused after the commit
   influx; its green check is not a fresh review of this local tree.
 - There were 29 review threads: 19 resolved and 10 open.
@@ -383,15 +433,15 @@ run fresh checks, then reply with the exact test/evidence references.
 
 ## Required merge sequence
 
-1. Commit and push the gateway release-blocker patch.
-2. Commit the companion app changes as two reviewable units:
-   - guardrail model scoping/admission tests;
-   - TypeScript model/pricing parity.
-3. Merge/deploy the app-side change before or together with the gateway. Confirm
+1. Commit and push both release branches and link PR #30 to companion PR #544.
+2. Run all GitHub checks and request fresh review on both pushed SHAs.
+3. Merge/deploy the app-side change **before** the gateway. The new gateway
+   resolver intentionally fails closed until the companion endpoint exists.
+   Confirm
    the production `/state` and `/admit` paths still expose source-keyed
    organization counters and model-scoped operations.
-4. Run native CI, supply-chain/Docker checks, Worker build/dry-run, and the
-   provider-smoke workflow on the pushed gateway SHA.
+4. Run the provider-smoke workflow and a two-key/same-tenant plus
+   two-project/one-organization production probe after the app deploy.
 5. Run a live Cloudflare staging deployment if production-edge evidence is a
    release requirement.
 6. Request a fresh human and CodeRabbit review.
@@ -419,6 +469,12 @@ implemented here:
 - a repository-local Node lock for Wrangler and a dedicated minimum-Rust CI
   lane;
 - paid live Together, Fireworks, Bedrock, and a live Cloudflare staging matrix.
+- exact audit persistence for gateway `pricingVersion` and `costBreakdown`;
+- metering ownership for requests spanning advisory/strict policy hot swaps;
+- graceful-shutdown draining of detached exporters and shared tenant reporters;
+- Worker policy-refresh timeout, singleflight, and monotonic stale-write guard;
+- cross-replica atomic admission for native rate-only policies (current native
+  rate enforcement remains advisory and may overshoot during refresh windows).
 
 ## Security/operations note
 

@@ -466,8 +466,9 @@ pub enum CostEnforcementMode {
 ///
 /// Lives here rather than in [`crate::policy::admission`] (which re-exports it)
 /// because both sides of the admission decision must agree, and one of those
-/// sides — [`PolicyEngine::admission_unavailable_decision`](crate::policy::engine::PolicyEngine::admission_unavailable_decision)
-/// — is compiled for the wasm32 Worker, where the native admission client is not.
+/// sides agree. Admission-outage handling additionally mirrors the platform's
+/// wire contract in
+/// [`PolicyEngine::admission_unavailable_decision`](crate::policy::engine::PolicyEngine::admission_unavailable_decision).
 pub fn resolve_strict(override_mode: Option<CostEnforcementMode>, policy_strict: bool) -> bool {
     match override_mode {
         Some(CostEnforcementMode::Strict) => true,

@@ -414,6 +414,23 @@ fn invalid_strict_input(message: &str) -> Result<Response> {
     .with_status(400))
 }
 
+/// Provider-shaped 400 for a request an active cost/rate policy cannot admit
+/// and meter. Forwarding it would silently bypass the authoritative counters.
+fn invalid_stateful_input(message: &str) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    Ok(Response::from_json(&json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "unsupported_stateful_input",
+        }
+    }))?
+    .with_headers(headers)
+    .with_status(400))
+}
+
 fn transformed_body_too_large() -> Result<Response> {
     let headers = Headers::new();
     headers.set("content-type", "application/json")?;
@@ -967,14 +984,19 @@ async fn proxy(
     }
 
     let strict_input_required = engine.requires_bounded_json_input(None);
-    // A non-JSON request has no trustworthy model with which to prove it is
-    // outside a scoped strict cap, and its provider-side input cannot be
-    // bounded before admission. Advisory policies retain byte-for-byte proxy
-    // behavior; an enforcing/blocking strict cap fails this shape explicitly.
-    if strict_input_required && !is_json_req {
-        return invalid_strict_input(
-            "a strict Nova Guard cost cap supports only JSON /v1/chat/completions requests",
-        );
+    // A non-JSON request has no trustworthy model or token estimate. Every
+    // stateful request is routed through atomic admission, so forwarding this
+    // shape would silently bypass cost/rate counters.
+    if stateful && !is_json_req {
+        return if strict_input_required {
+            invalid_strict_input(
+                "a strict Nova Guard cost cap supports only JSON /v1/chat/completions requests",
+            )
+        } else {
+            invalid_stateful_input(
+                "Nova Guard cost/rate policies support only JSON /v1 requests because opaque bodies cannot be admitted and metered safely",
+            )
+        };
     }
 
     // --- Request body, under a hard cap ------------------------------------
@@ -1010,10 +1032,14 @@ async fn proxy(
         } else {
             None
         };
-    if strict_input_required && body_json.is_none() {
-        return invalid_strict_input(
-            "a strict Nova Guard cost cap requires a valid JSON request body",
-        );
+    if stateful && body_json.is_none() {
+        return if strict_input_required {
+            invalid_strict_input("a strict Nova Guard cost cap requires a valid JSON request body")
+        } else {
+            invalid_stateful_input(
+                "Nova Guard cost/rate policies require a valid JSON request body for admission and metering",
+            )
+        };
     }
     let model = body_json
         .as_ref()
@@ -1021,10 +1047,16 @@ async fn proxy(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    if strict_input_required && model.trim().is_empty() {
-        return invalid_strict_input(
-            "a strict Nova Guard cost cap requires a non-empty model so policy scope and pricing can be resolved",
-        );
+    if stateful && model.trim().is_empty() {
+        return if strict_input_required {
+            invalid_strict_input(
+                "a strict Nova Guard cost cap requires a non-empty model so policy scope and pricing can be resolved",
+            )
+        } else {
+            invalid_stateful_input(
+                "Nova Guard cost/rate policies require a non-empty model for admission and metering",
+            )
+        };
     }
 
     let bedrock_creds = if is_bedrock {
@@ -1210,6 +1242,9 @@ async fn proxy(
                     .unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
                 estimated_cost_usd: est_cost,
                 pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
+                // The Worker follows each policy's own enforcementMode. The
+                // deployment-wide strict override is native-only.
+                force_strict_cost_caps: false,
             };
             match worker_remote::admit(cfg, &request).await {
                 Admission::Allowed(res) => {
@@ -1237,7 +1272,7 @@ async fn proxy(
                     // Worker also sends advisory stateful traffic through the
                     // bridge, but a transport optimization must not change an
                     // advisory policy's fail-safety semantics.
-                    match engine.admission_unavailable_decision(&reason, None) {
+                    match engine.admission_unavailable_decision(&reason, &model, false) {
                         Some(d) if d.is_blocking() => {
                             console_warn!(
                                 "Nova Guard: platform admission unavailable ({reason}); failing closed"
@@ -1248,8 +1283,8 @@ async fn proxy(
                             "Nova Guard: platform admission unavailable ({reason}); failing open"
                         ),
                         None => console_warn!(
-                            "Nova Guard: platform admission unavailable ({reason}) and no cost \
-                             cap was routed through admission"
+                            "Nova Guard: platform admission unavailable ({reason}) and no \
+                             applicable stateful policy was routed through admission"
                         ),
                     }
                 }

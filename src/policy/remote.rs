@@ -517,16 +517,31 @@ pub struct ResolvedIdentity {
     pub projects: Vec<String>,
 }
 
-/// A short, non-reversible label for a credential, for cache keys and logs.
+/// Full, non-reversible identity used for authorization-bearing caches.
 ///
-/// The raw key is never used as a map key and never logged: a panic backtrace,
-/// a debug dump or a metrics label carrying live tenant credentials would be a
-/// far worse leak than the one this whole module exists to prevent.
-pub fn credential_fingerprint(secret: &str) -> String {
+/// It deliberately implements neither `Debug` nor `Display`: cache diagnostics
+/// use [`credential_fingerprint`] instead, so a full credential identity cannot
+/// accidentally become a log or metrics label.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct CredentialCacheKey([u8; 32]);
+
+pub(crate) fn credential_cache_key(secret: &str) -> CredentialCacheKey {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(secret.as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest);
+    CredentialCacheKey(key)
+}
+
+/// A short, non-reversible credential label for logs only.
+///
+/// Forty-eight bits are sufficient for human correlation but not for an
+/// authorization cache key; [`credential_cache_key`] is always used internally
+/// wherever a collision could otherwise reuse another caller's identity.
+pub fn credential_fingerprint(secret: &str) -> String {
+    let key = credential_cache_key(secret);
     let mut out = String::with_capacity(16);
-    for b in digest.iter().take(6) {
+    for b in key.0.iter().take(6) {
         out.push_str(&format!("{b:02x}"));
     }
     out
@@ -783,7 +798,9 @@ pub fn classify_resolution(status: u16, body: &[u8]) -> Result<ResolvedIdentity,
         },
         401 => Err(TenantRejection::InvalidCredential),
         403 => Err(TenantRejection::InsufficientScope(
-            "the platform refused the project listing with 403 (needs `projects:read`)".to_string(),
+            "the platform refused shared-gateway resolution with 403 (needs `projects:read`, \
+             `guardrails:read`, and `guardrails:ingest`)"
+                .to_string(),
         )),
         other => Err(TenantRejection::Unavailable(format!(
             "project listing returned {other}: {}",
@@ -816,7 +833,7 @@ pub struct TenantResolver {
     deny_ttl: Duration,
     budget: Duration,
     max_entries: usize,
-    slots: std::sync::Mutex<HashMap<String, Arc<ResolverSlot>>>,
+    slots: std::sync::Mutex<HashMap<CredentialCacheKey, Arc<ResolverSlot>>>,
 }
 
 impl TenantResolver {
@@ -847,13 +864,14 @@ impl TenantResolver {
 
     /// The platform call that establishes identity.
     ///
-    /// There is **no key-introspection endpoint** on the platform today, so the
-    /// gateway authenticates the credential by listing what it can see: the
-    /// listing is org-scoped by the key server-side, 401s an unknown or expired
-    /// key, and reports the `organizationId` the key belongs to. See
-    /// `docs/NOVA_GUARD.md` for the introspection endpoint this should become.
+    /// This is deliberately the guardrail-specific project resolver rather
+    /// than the general project listing. The platform protects it with every
+    /// permission a shared gateway needs (`projects:read`, `guardrails:read`,
+    /// and `guardrails:ingest`), so a read-only key is refused synchronously
+    /// before a provider call can escape while asynchronous usage batches are
+    /// being rejected.
     fn resolution_url(&self) -> String {
-        format!("{}/api/v1/projects", self.base_url)
+        format!("{}/api/v1/projects/guardrails/resolve", self.base_url)
     }
 
     /// Resolve `credential`, using the cache when it is fresh.
@@ -861,8 +879,9 @@ impl TenantResolver {
         &self,
         credential: &str,
     ) -> Result<Arc<ResolvedIdentity>, TenantRejection> {
+        let cache_key = credential_cache_key(credential);
         let fingerprint = credential_fingerprint(credential);
-        let slot = self.slot(&fingerprint);
+        let slot = self.slot(&cache_key);
         let mut entry = slot.entry.lock().await;
 
         if let Some((cached, at)) = entry.as_ref() {
@@ -905,9 +924,9 @@ impl TenantResolver {
         outcome
     }
 
-    fn slot(&self, fingerprint: &str) -> Arc<ResolverSlot> {
+    fn slot(&self, cache_key: &CredentialCacheKey) -> Arc<ResolverSlot> {
         let mut slots = self.slots.lock().expect("tenant resolver lock poisoned");
-        if let Some(slot) = slots.get(fingerprint) {
+        if let Some(slot) = slots.get(cache_key) {
             return slot.clone();
         }
         // Cheap bound: a flood of distinct invalid keys must not grow this map
@@ -923,7 +942,7 @@ impl TenantResolver {
         let slot = Arc::new(ResolverSlot {
             entry: Mutex::new(None),
         });
-        slots.insert(fingerprint.to_string(), slot.clone());
+        slots.insert(*cache_key, slot.clone());
         slot
     }
 
@@ -2093,6 +2112,55 @@ mod tests {
         assert_eq!(fp, credential_fingerprint("nv_supersecret"));
         assert_ne!(fp, credential_fingerprint("nv_supersecrey"));
         assert!(!fp.contains("supersecret"));
+    }
+
+    #[tokio::test]
+    async fn resolver_cache_never_aliases_credentials_with_the_same_log_fingerprint() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Precomputed birthday collision for the first 48 bits of SHA-256. The
+        // short value is safe as a log label, but it is not an authorization
+        // cache identity: the second key must still reach the platform and get
+        // its own organization/project result.
+        const FIRST: &str = "nv_collision_29875620495306";
+        const SECOND: &str = "nv_collision_23185314331057";
+        assert_ne!(FIRST, SECOND);
+        assert_eq!(
+            credential_fingerprint(FIRST),
+            credential_fingerprint(SECOND)
+        );
+
+        let server = MockServer::start().await;
+        for (key, org, project) in [
+            (FIRST, "org_first", "project_first"),
+            (SECOND, "org_second", "project_second"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/projects/guardrails/resolve"))
+                .and(header("authorization", format!("Bearer {key}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "id": project,
+                        "organizationId": org,
+                    }])),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let resolver = TenantResolver::with_timings(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+            64,
+        );
+        let first = resolver.resolve(FIRST).await.unwrap();
+        let second = resolver.resolve(SECOND).await.unwrap();
+        assert_eq!(first.organization_id, "org_first");
+        assert_eq!(second.organization_id, "org_second");
+        assert_eq!(second.projects, vec!["project_second"]);
     }
 
     #[test]

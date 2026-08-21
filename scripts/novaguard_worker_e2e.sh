@@ -934,8 +934,64 @@ refute_log "$TMP/p9-custom-base.log" "(mock anthropic)" \
   "custom-base rejection made zero Anthropic provider calls"
 
 # ---------------------------------------------------------------------------
-say "Phase 10 -- Worker deadline abandons a live stream before its platform lease"
-start_mock "$TMP/p10.log" MOCK_MAX_USD=10.0 MOCK_ENFORCEMENT_MODE=STRICT \
+say "Phase 10 -- a rate-only policy cannot be bypassed with opaque input"
+start_mock "$TMP/p10-rate-opaque.log" MOCK_POLICY_TYPE=RATE_LIMIT MOCK_MAX_REQUESTS=1
+start_wrangler
+RATE_OPAQUE_BODY="$TMP/p10-rate-opaque.body"
+RATE_OPAQUE_STATUS="$(curl -sS --max-time 30 -o "$RATE_OPAQUE_BODY" -w '%{http_code}' \
+  "http://127.0.0.1:$GATEWAY_PORT/v1/chat/completions" \
+  -H 'Authorization: Bearer sk-test' -H 'x-provider: openai' \
+  -H 'Content-Type: multipart/form-data; boundary=test' \
+  --data-binary $'--test\r\nopaque\r\n--test--\r\n')" || RATE_OPAQUE_STATUS="transport_error"
+[ "$RATE_OPAQUE_STATUS" = "400" ] \
+  && grep -q '"code":"unsupported_stateful_input"' "$RATE_OPAQUE_BODY" \
+  && pass "rate-only opaque input was rejected deterministically" \
+  || { fail "rate-only opaque input expected HTTP 400 unsupported_stateful_input, got HTTP $RATE_OPAQUE_STATUS"; cat "$RATE_OPAQUE_BODY"; }
+RATE_OPAQUE_STATS="$(curl -sf "http://127.0.0.1:$MOCK_PORT/__mock/stats")" || RATE_OPAQUE_STATS=""
+if [ -z "$RATE_OPAQUE_STATS" ]; then
+  fail "the mock statistics endpoint did not answer after the rate-only rejection"
+else
+  expect_stat "$RATE_OPAQUE_STATS" counters.admitRequests 0 \
+    "opaque rate-only input was rejected before /admit"
+  expect_stat "$RATE_OPAQUE_STATS" counters.providerOpenaiBuffered 0 \
+    "opaque rate-only input never reached the provider"
+  expect_stat "$RATE_OPAQUE_STATS" reservations.total 0 \
+    "opaque rate-only input created no reservation"
+fi
+refute_log "$TMP/p10-rate-opaque.log" "POST /admit" \
+  "rate-only opaque rejection made zero admission calls"
+refute_log "$TMP/p10-rate-opaque.log" "(mock provider)" \
+  "rate-only opaque rejection made zero provider calls"
+
+# Admission is authoritative for rate limits too. A 503 must take the rate
+# policy's own failClosed decision, independent of cost-cap enforcement mode.
+start_mock "$TMP/p10-rate-503-closed.log" MOCK_POLICY_TYPE=RATE_LIMIT \
+  MOCK_MAX_REQUESTS=1 MOCK_FAIL_CLOSED=true MOCK_ADMIT_UNAVAILABLE=1
+start_wrangler
+RATE_CLOSED_BODY="$(openai_buffered_request rate-admit-closed)"
+grep -q 'failing closed' <<<"$RATE_CLOSED_BODY" \
+  && pass "rate-only admission 503 honored failClosed=true" \
+  || { fail "rate-only failClosed=true did not refuse the request"; echo "$RATE_CLOSED_BODY" | head -c 400; }
+expect_log "$TMP/p10-rate-503-closed.log" "POST /admit -> 503" \
+  "rate-only fail-closed request reached atomic admission"
+refute_log "$TMP/p10-rate-503-closed.log" "(mock provider)" \
+  "rate-only failClosed=true prevented provider execution"
+
+start_mock "$TMP/p10-rate-503-open.log" MOCK_POLICY_TYPE=RATE_LIMIT \
+  MOCK_MAX_REQUESTS=1 MOCK_FAIL_CLOSED=false MOCK_ADMIT_UNAVAILABLE=1
+start_wrangler
+RATE_OPEN_BODY="$(openai_buffered_request rate-admit-open)"
+grep -q '"choices"' <<<"$RATE_OPEN_BODY" \
+  && pass "rate-only admission 503 honored failClosed=false" \
+  || { fail "rate-only failClosed=false did not reach the provider"; echo "$RATE_OPEN_BODY" | head -c 400; }
+expect_log "$TMP/p10-rate-503-open.log" "POST /admit -> 503" \
+  "rate-only fail-open request reached atomic admission"
+expect_log "$TMP/p10-rate-503-open.log" "(mock provider)" \
+  "rate-only failClosed=false allowed provider execution"
+
+# ---------------------------------------------------------------------------
+say "Phase 11 -- Worker deadline abandons a live stream before its platform lease"
+start_mock "$TMP/p11.log" MOCK_MAX_USD=10.0 MOCK_ENFORCEMENT_MODE=STRICT \
   MOCK_RESERVATION_LEASE_MS=3000 MOCK_STREAM_DELAY_MS=1000 \
   MOCK_STREAM_PROMPT_TOKENS=11 MOCK_STREAM_COMPLETION_TOKENS=4
 E2E_UPSTREAM_TIMEOUT_MS=300
@@ -986,7 +1042,7 @@ if (( LEASE_ELAPSED_MS < 3000 )); then
 else
   fail "abandon missed the 3,000ms platform lease (${LEASE_ELAPSED_MS}ms)"
 fi
-expect_log "$TMP/p10.log" "/abandon -> 202" \
+expect_log "$TMP/p11.log" "/abandon -> 202" \
   "the deadline settled through the platform abandon endpoint"
 
 # A second request starts before the first lease could expire. It must obtain a
@@ -1032,7 +1088,7 @@ else
   expect_stat "$LEASE_FINAL_STATS" reservations.expired 0 \
     "neither reservation expired underneath a live call"
 fi
-refute_log "$TMP/p10.log" "REAP reservation=" \
+refute_log "$TMP/p11.log" "REAP reservation=" \
   "no active reservation was reaped during the deadline regression"
 
 # ---------------------------------------------------------------------------

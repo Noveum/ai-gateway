@@ -568,49 +568,61 @@ impl PolicyEngine {
 
     /// The decision to apply when platform **admission** could not be evaluated.
     ///
-    /// Considers **exactly the caps that were routed through admission**, by
-    /// re-running the routing predicate itself ([`resolve_strict`]) per cap,
-    /// with the deployment-wide `NOVEUM_GUARD_COST_ENFORCEMENT` override the
-    /// caller routed with:
-    ///
-    /// * `Some(Strict)` — every active `cost_cap` went through admission, so
-    ///   every one is considered here, whatever its own `enforcementMode`;
-    /// * `Some(Advisory)` — admission is never called, so this branch is
-    ///   unreachable and nothing is considered;
-    /// * `None` — only the caps that themselves declare
-    ///   `enforcementMode: strict`.
-    ///
-    /// Filtering on `enforcement_mode == Strict` alone would be wrong in the
-    /// first case, letting an override-routed advisory cap fail **open**;
-    /// dropping the filter would be wrong in the third, over-blocking a
-    /// genuinely advisory cap that never touched admission.
+    /// Considers **exactly the checks the platform put in this admission
+    /// request**. By contract, the platform always evaluates every active
+    /// `rate_limit`, but evaluates a `cost_cap` only when either the policy is
+    /// strict or the native deployment explicitly sent
+    /// `forceStrictCostCaps: true`. Model-scoped cost caps are considered only
+    /// for the same model the platform received.
     ///
     /// Per considered cap the fail-closed/fail-open computation is the one an
     /// unavailable `/state` uses
     /// ([`PolicyEngine::unavailable_state_decision`]): a `failClosed` policy
     /// blocks, everything else allows with the explicit reason recorded.
     ///
-    /// Returns the blocking decision if any considered cap fails closed, else
-    /// the first fail-open decision (whose `reason` names the outage), else
-    /// `None` when no cap was routed through admission at all.
+    /// Returns the blocking decision if any considered policy fails closed,
+    /// else the first fail-open decision (whose `reason` names the outage),
+    /// else `None` when the platform had no applicable stateful check.
     pub fn admission_unavailable_decision(
         &self,
         reason: &str,
-        override_mode: Option<CostEnforcementMode>,
+        model: &str,
+        force_strict_cost_caps: bool,
     ) -> Option<PolicyDecision> {
         let state = self.state.load();
         let mut fail_open: Option<PolicyDecision> = None;
         for cc in state.cost_caps.iter().filter(|cc| {
-            resolve_strict(
-                override_mode,
-                cc.config.enforcement_mode == CostEnforcementMode::Strict,
-            )
+            (force_strict_cost_caps || cc.config.enforcement_mode == CostEnforcementMode::Strict)
+                && cost_cap_applies_to_model(cc, model)
         }) {
             let d = self.unavailable_decision_with_reason(
                 &cc.meta,
                 "cost_cap",
                 cc.config.action,
                 true,
+                &format!("platform admission unavailable ({reason})"),
+            );
+            if d.is_blocking() {
+                return Some(d);
+            }
+            fail_open.get_or_insert(d);
+        }
+
+        for rl in &state.rate_limits {
+            // The platform admission schema constrains rate-limit actions to
+            // BLOCK. Keep the configured action when present so the gateway
+            // remains honest if that contract ever broadens; an empty window
+            // list is rejected upstream, and BLOCK is the safe fallback.
+            let action = rl
+                .config
+                .windows
+                .first()
+                .map_or(PolicyAction::Block, |window| window.action);
+            let d = self.unavailable_decision_with_reason(
+                &rl.meta,
+                "rate_limit",
+                action,
+                false,
                 &format!("platform admission unavailable ({reason})"),
             );
             if d.is_blocking() {
@@ -1257,7 +1269,7 @@ mod tests {
         assert!(!unset_mode_fail_closed.requires_explicit_output_limit("gpt-4o", None));
 
         let forced = unset_mode_fail_closed
-            .admission_unavailable_decision("503", Some(CostEnforcementMode::Strict))
+            .admission_unavailable_decision("503", "gpt-4o", true)
             .expect("a cap routed through admission by the override must be considered");
         assert!(
             forced.is_blocking(),
@@ -1272,17 +1284,9 @@ mod tests {
 
         assert!(
             unset_mode_fail_closed
-                .admission_unavailable_decision("503", Some(CostEnforcementMode::Advisory))
+                .admission_unavailable_decision("503", "gpt-4o", false)
                 .is_none(),
-            "an advisory override never calls admission, so nothing is considered"
-        );
-
-        assert!(
-            unset_mode_fail_closed
-                .admission_unavailable_decision("503", None)
-                .is_none(),
-            "with no override an advisory cap never reached admission; blocking it \
-             would over-block"
+            "without forceStrictCostCaps the platform excludes advisory caps"
         );
 
         let self_declared_strict = backed_engine(
@@ -1295,13 +1299,13 @@ mod tests {
         assert!(!self_declared_strict
             .requires_explicit_output_limit("gpt-4o", Some(CostEnforcementMode::Advisory)));
         let by_policy = self_declared_strict
-            .admission_unavailable_decision("503", None)
+            .admission_unavailable_decision("503", "gpt-4o", false)
             .expect("a self-declared strict cap is considered with no override");
         assert!(by_policy.is_blocking());
         assert_eq!(by_policy.policy_id, "strict-cap");
 
         let rate_only = backed_engine(
-            r#"{"policies":[{"name":"rate","type":"rate_limit","mode":"enforce",
+            r#"{"policies":[{"name":"rate","type":"rate_limit","mode":"enforce","failClosed":true,
             "config":{"windows":[{"period":"1m","maxRequests":5,"action":"block"}]}}]}"#,
         );
         assert!(
@@ -1309,9 +1313,17 @@ mod tests {
             "a strict deployment override must not turn a rate-only policy into a cost cap"
         );
         assert!(!rate_only.requires_bounded_json_input(Some(CostEnforcementMode::Strict)));
+        let unavailable_rate = rate_only
+            .admission_unavailable_decision("503", "gpt-4o", false)
+            .expect("the platform admission endpoint always evaluates rate limits");
+        assert!(
+            unavailable_rate.is_blocking(),
+            "a failClosed rate limit must never become an implicit allow"
+        );
+        assert_eq!(unavailable_rate.policy_type, "rate_limit");
 
         let scoped = backed_engine(
-            r#"{"policies":[{"name":"scoped","type":"cost_cap","mode":"enforce",
+            r#"{"policies":[{"name":"scoped","type":"cost_cap","mode":"enforce","failClosed":true,
             "config":{"window":"30d_rolling","maxUsd":100.0,"action":"block",
             "enforcementMode":"strict","scopeToModels":["GPT-4O"]}}]}"#,
         );
@@ -1324,6 +1336,16 @@ mod tests {
             !scoped.requires_explicit_output_limit("claude-sonnet-5", None),
             "a model outside scope must not be rejected"
         );
+        assert!(
+            scoped
+                .admission_unavailable_decision("503", "claude-sonnet-5", false)
+                .is_none(),
+            "outage handling must not apply a strict cap to a model the platform filtered out"
+        );
+        assert!(scoped
+            .admission_unavailable_decision("503", "GPT-4O", false)
+            .expect("model matching is case-insensitive")
+            .is_blocking());
 
         let shadow = backed_engine(
             r#"{"policies":[{"name":"shadow","type":"cost_cap","mode":"shadow",
@@ -1347,10 +1369,7 @@ mod tests {
             "config":{"window":"30d_rolling","maxUsd":100000.0,"action":"block"}}]}"#,
         );
         let d = e
-            .admission_unavailable_decision(
-                "admission unavailable (503)",
-                Some(CostEnforcementMode::Strict),
-            )
+            .admission_unavailable_decision("admission unavailable (503)", "gpt-4o", true)
             .expect("considered under the strict override");
         assert!(!d.is_blocking(), "not failClosed, so it must fail open");
         assert!(

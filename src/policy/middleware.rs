@@ -122,6 +122,25 @@ fn invalid_strict_input_response(message: impl Into<String>) -> Response {
         .expect("static error response is valid")
 }
 
+/// Provider-shaped 400 for a request that an active cost/rate policy cannot
+/// admit or meter. Passing an opaque body through would make the request
+/// invisible to the authoritative counters and turn the policy into a bypass.
+fn invalid_stateful_input_response(message: impl Into<String>) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message.into(),
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "unsupported_stateful_input",
+        }
+    });
+    Response::builder()
+        .status(axum::http::StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static error response is valid")
+}
+
 fn transformed_body_too_large_response() -> Response {
     let body = serde_json::json!({
         "error": {
@@ -198,13 +217,22 @@ pub async fn guard_middleware(
         .as_ref()
         .and_then(|client| client.mode_override());
     let strict_input_required = engine.requires_bounded_json_input(admission_mode_override);
+    let stateful_input_required = engine.stateful_policy_count() > 0;
 
     // An opaque POST cannot prove its model scope or bound provider-side input.
-    // Advisory policies preserve the historical pass-through behavior.
-    if is_proxy_post(&req) && strict_input_required && !is_guardable(&req) {
-        return invalid_strict_input_response(
-            "a strict Nova Guard cost cap supports only JSON /v1/chat/completions requests",
-        );
+    // More generally, no stateful cost/rate policy can atomically count an
+    // opaque request. Passing it through would make multipart/binary traffic an
+    // unlimited counter bypass.
+    if is_proxy_post(&req) && stateful_input_required && !is_guardable(&req) {
+        return if strict_input_required {
+            invalid_strict_input_response(
+                "a strict Nova Guard cost cap supports only JSON /v1/chat/completions requests",
+            )
+        } else {
+            invalid_stateful_input_response(
+                "Nova Guard cost/rate policies support only JSON /v1 requests because opaque bodies cannot be admitted and metered safely",
+            )
+        };
     }
 
     // Only inspect JSON POST bodies on the proxy path.
@@ -228,10 +256,16 @@ pub async fn guard_middleware(
     };
 
     let json: Option<Value> = serde_json::from_slice(&bytes).ok();
-    if strict_input_required && json.is_none() {
-        return invalid_strict_input_response(
-            "a strict Nova Guard cost cap requires a valid JSON request body",
-        );
+    if stateful_input_required && json.is_none() {
+        return if strict_input_required {
+            invalid_strict_input_response(
+                "a strict Nova Guard cost cap requires a valid JSON request body",
+            )
+        } else {
+            invalid_stateful_input_response(
+                "Nova Guard cost/rate policies require a valid JSON request body for admission and metering",
+            )
+        };
     }
     let model = json
         .as_ref()
@@ -239,10 +273,16 @@ pub async fn guard_middleware(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    if strict_input_required && model.trim().is_empty() {
-        return invalid_strict_input_response(
-            "a strict Nova Guard cost cap requires a non-empty model so policy scope and pricing can be resolved",
-        );
+    if stateful_input_required && model.trim().is_empty() {
+        return if strict_input_required {
+            invalid_strict_input_response(
+                "a strict Nova Guard cost cap requires a non-empty model so policy scope and pricing can be resolved",
+            )
+        } else {
+            invalid_stateful_input_response(
+                "Nova Guard cost/rate policies require a non-empty model for admission and metering",
+            )
+        };
     }
 
     // Provider-local validation must happen before atomic admission. Once a
@@ -463,6 +503,10 @@ pub async fn guard_middleware(
                 // schedule the gateway applies with no deploy, so without this
                 // a hold cannot be reproduced after the fact.
                 pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
+                force_strict_cost_caps: matches!(
+                    client.mode_override(),
+                    Some(crate::policy::config::CostEnforcementMode::Strict)
+                ),
             };
             match client.admit(&admit).await {
                 crate::policy::admission::Admission::Allowed(res) => {
@@ -491,7 +535,15 @@ pub async fn guard_middleware(
                 crate::policy::admission::Admission::Unavailable(reason) => {
                     // Never an implicit allow. Apply `failClosed` exactly as an
                     // unavailable `/state` would.
-                    match engine.admission_unavailable_decision(&reason, client.mode_override()) {
+                    let force_strict_cost_caps = matches!(
+                        client.mode_override(),
+                        Some(crate::policy::config::CostEnforcementMode::Strict)
+                    );
+                    match engine.admission_unavailable_decision(
+                        &reason,
+                        &model,
+                        force_strict_cost_caps,
+                    ) {
                         Some(d) if d.is_blocking() => {
                             warn!(
                                 provider = %provider, model = %model, policy = %d.policy_id,
@@ -507,7 +559,7 @@ pub async fn guard_middleware(
                         ),
                         None => warn!(
                             provider = %provider, model = %model, reason = %reason,
-                            "Nova Guard: platform admission unavailable and no cost cap was routed through admission"
+                            "Nova Guard: platform admission unavailable and no applicable stateful policy was routed through admission"
                         ),
                     }
                 }
@@ -1222,18 +1274,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::policy::remote::{
-    select_tenant, GuardTenancy, RemoteConfig, SharedTenancyConfig, TenantId, TenantRejection,
-    TenantResolver, ROUTING_ORG_HEADERS, ROUTING_PROJECT_HEADER, TENANT_CREDENTIAL_HEADER,
-    TENANT_IDLE_TTL,
+    credential_cache_key, select_tenant, CredentialCacheKey, GuardTenancy, RemoteConfig,
+    SharedTenancyConfig, TenantId, TenantRejection, TenantResolver, ROUTING_ORG_HEADERS,
+    ROUTING_PROJECT_HEADER, TENANT_CREDENTIAL_HEADER, TENANT_IDLE_TTL,
 };
 
-/// One tenant's complete, isolated enforcement runtime.
+/// A single organization/project can legitimately rotate several API keys, but
+/// retaining a poller, live-state cache and usage queue for every historical
+/// key would make one hot tenant an unbounded resource sink.
+const TENANT_CREDENTIAL_RUNTIME_MAX: usize = 64;
+
+/// One caller credential's complete remote-client runtime for a derived tenant.
+///
+/// The policy/state data belongs to the tenant, but every HTTP client in this
+/// object carries authentication. It therefore cannot be reused by a different
+/// credential that happens to resolve to the same organization/project.
 struct TenantRuntime {
     guard: GuardState,
     /// Per-tenant policy poller. Aborted when the tenant is evicted, so a
     /// shared gateway does not accumulate one polling task per tenant it has
     /// ever seen.
     _poller: AbortOnDrop,
+}
+
+struct CredentialRuntimeEntry {
+    runtime: Arc<TenantRuntime>,
+    last_used_ms: u64,
+    access_order: u64,
 }
 
 /// Aborts its task on drop.
@@ -1245,10 +1312,12 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Per-tenant slot: an async mutex single-flights the (network-bound) first
-/// build for one tenant without blocking any other tenant.
+/// Per-tenant slot. Authorization-bearing runtimes are isolated per caller
+/// credential, while the in-process pending ledger remains tenant-wide so two
+/// keys for one project cannot each spend the same advisory headroom.
 struct TenantSlot {
-    runtime: tokio::sync::Mutex<Option<Arc<TenantRuntime>>>,
+    runtimes: tokio::sync::Mutex<HashMap<CredentialCacheKey, CredentialRuntimeEntry>>,
+    pending: Arc<crate::policy::remote::PendingSpend>,
     last_used: AtomicU64,
 }
 
@@ -1261,6 +1330,7 @@ pub struct SharedTenancy {
     allow_unguarded_start: bool,
     slots: std::sync::Mutex<HashMap<TenantId, Arc<TenantSlot>>>,
     started: Instant,
+    runtime_access: AtomicU64,
 }
 
 impl SharedTenancy {
@@ -1280,6 +1350,7 @@ impl SharedTenancy {
             allow_unguarded_start,
             slots: std::sync::Mutex::new(HashMap::new()),
             started: Instant::now(),
+            runtime_access: AtomicU64::new(0),
         }
     }
 
@@ -1329,10 +1400,34 @@ impl SharedTenancy {
         credential: &str,
     ) -> Result<Arc<TenantRuntime>, TenantRejection> {
         let slot = self.slot(tenant);
-        slot.last_used.store(self.now_ms(), Ordering::Relaxed);
-        let mut current = slot.runtime.lock().await;
-        if let Some(rt) = current.as_ref() {
-            return Ok(rt.clone());
+        let now = self.now_ms();
+        let access_order = self.runtime_access.fetch_add(1, Ordering::Relaxed);
+        slot.last_used.store(now, Ordering::Relaxed);
+        let credential_key = credential_cache_key(credential);
+        let mut runtimes = slot.runtimes.lock().await;
+        let idle_ttl = u64::try_from(TENANT_IDLE_TTL.as_millis()).unwrap_or(u64::MAX);
+        runtimes.retain(|_, entry| now.saturating_sub(entry.last_used_ms) < idle_ttl);
+        if let Some(entry) = runtimes.get_mut(&credential_key) {
+            entry.last_used_ms = now;
+            entry.access_order = access_order;
+            return Ok(entry.runtime.clone());
+        }
+        if runtimes.len() >= TENANT_CREDENTIAL_RUNTIME_MAX {
+            let lru = runtimes
+                .iter()
+                .min_by(|(a_key, a), (b_key, b)| {
+                    a.access_order
+                        .cmp(&b.access_order)
+                        .then_with(|| a_key.cmp(b_key))
+                })
+                .map(|(key, _)| *key);
+            if let Some(lru) = lru {
+                runtimes.remove(&lru);
+                debug!(
+                    tenant = %tenant,
+                    "Nova Guard: evicting a rotated tenant credential runtime"
+                );
+            }
         }
 
         // Cold tenant: fetch ITS policy set with the caller's own credential.
@@ -1361,7 +1456,7 @@ impl SharedTenancy {
                     cfg.clone(),
                 ))),
                 usage: Some(crate::policy::usage::UsageReporter::spawn(cfg.clone())),
-                pending: Arc::new(crate::policy::remote::PendingSpend::new()),
+                pending: slot.pending.clone(),
                 admission: Some(Arc::new(crate::policy::admission::AdmissionClient::new(
                     cfg,
                     self.cost_mode,
@@ -1370,11 +1465,20 @@ impl SharedTenancy {
             _poller: AbortOnDrop(poller),
         });
         info!(
-            tenant = %tenant, policies = runtime.guard.engine.active_policy_count(),
-            "Nova Guard: warmed an isolated enforcement runtime for a tenant"
+            tenant = %tenant,
+            credential = %crate::policy::remote::credential_fingerprint(credential),
+            policies = runtime.guard.engine.active_policy_count(),
+            "Nova Guard: warmed an isolated enforcement runtime for a tenant credential"
         );
-        *current = Some(runtime.clone());
-        drop(current);
+        runtimes.insert(
+            credential_key,
+            CredentialRuntimeEntry {
+                runtime: runtime.clone(),
+                last_used_ms: now,
+                access_order,
+            },
+        );
+        drop(runtimes);
         self.evict();
         Ok(runtime)
     }
@@ -1385,7 +1489,8 @@ impl SharedTenancy {
             return slot.clone();
         }
         let slot = Arc::new(TenantSlot {
-            runtime: tokio::sync::Mutex::new(None),
+            runtimes: tokio::sync::Mutex::new(HashMap::new()),
+            pending: Arc::new(crate::policy::remote::PendingSpend::new()),
             last_used: AtomicU64::new(self.now_ms()),
         });
         slots.insert(tenant.clone(), slot.clone());

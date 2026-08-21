@@ -65,6 +65,14 @@ fn cost_cap_payload(max_usd: f64) -> Value {
     }]})
 }
 
+fn rate_limit_payload(max_requests: u64) -> Value {
+    json!({"policies":[{
+        "policyId":"pol_rate","name":"Request rate","type":"RATE_LIMIT",
+        "enabled":true,"failClosed":true,
+        "config":{"windows":[{"period":"1m","maxRequests":max_requests,"action":"BLOCK"}]}
+    }]})
+}
+
 /// Stub upstream: echoes the request body back as a 200. Only reached when the
 /// guard allows the request.
 async fn echo_handler(body: Bytes) -> Response {
@@ -1146,6 +1154,68 @@ fn chat_request(body: &Value) -> Request<Body> {
         .header("authorization", "Bearer sk-test")
         .body(Body::from(serde_json::to_vec(body).unwrap()))
         .unwrap()
+}
+
+/// A stateful rate policy cannot safely treat an opaque request as invisible:
+/// doing so forwards it without `/admit`, so request counters never advance and
+/// the limit can be bypassed forever with multipart/binary traffic. Reject the
+/// unsupported shape deterministically before either admission or provider IO.
+#[tokio::test]
+async fn stateful_rate_policy_rejects_opaque_or_malformed_input_before_provider() {
+    let server = MockServer::start().await;
+    mount_state_zero(&server).await;
+    mount_admit_allowed(&server, "must-not-be-created").await;
+
+    let bundle = translate_bundle(&rate_limit_payload(1)).unwrap();
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let hits = upstream_hits.clone();
+    let handler = move || {
+        let hits = hits.clone();
+        async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            usage_handler().await
+        }
+    };
+    let app = Router::new()
+        .route("/v1/audio/transcriptions", post(handler.clone()))
+        .route("/v1/chat/completions", post(handler))
+        .layer(from_fn_with_state(
+            strict_guard_state(&server.uri(), &bundle),
+            guard_middleware,
+        ));
+
+    let multipart = Request::builder()
+        .method("POST")
+        .uri("/v1/audio/transcriptions")
+        .header("content-type", "multipart/form-data; boundary=test")
+        .header("authorization", "Bearer sk-provider-test")
+        .body(Body::from("--test\r\nopaque\r\n--test--\r\n"))
+        .unwrap();
+    let malformed = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-provider-test")
+        .body(Body::from("{not-json"))
+        .unwrap();
+
+    for request in [multipart, malformed] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["code"], "unsupported_stateful_input");
+    }
+
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+    assert!(
+        wait_for_path_suffix(&server, "/admit", 1, Duration::from_millis(100))
+            .await
+            .is_empty(),
+        "unsupported stateful requests must be rejected before admission"
+    );
 }
 
 /// Upstream that answers with a provider-shaped body carrying real token counts.
@@ -3242,6 +3312,7 @@ const ORG_A: &str = "org_alpha";
 const ORG_B: &str = "org_beta";
 const KEY_A: &str = "nv_key_alpha";
 const KEY_B: &str = "nv_key_beta";
+const KEY_A_SECOND: &str = "nv_key_alpha_second";
 /// A third organization with exactly ONE project, for the "no routing header"
 /// case (a key entitled to several projects has nothing to default to).
 const ORG_SOLO: &str = "org_solo";
@@ -3268,11 +3339,34 @@ async fn mount_identity(server: &MockServer, key: &str, org: &str, projects: &[&
         .map(|p| json!({"id": p, "name": p, "organizationId": org}))
         .collect();
     Mock::given(method("GET"))
-        .and(match_path("/api/v1/projects"))
+        // Shared-gateway resolution is also the synchronous permission probe:
+        // the platform protects this endpoint with projects:read,
+        // guardrails:read and guardrails:ingest. A read-only key must fail here
+        // before any provider call can escape unmetered.
+        .and(match_path("/api/v1/projects/guardrails/resolve"))
         .and(match_header("authorization", bearer(key).as_str()))
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(server)
         .await;
+}
+
+/// Wait until `key` has touched `path`, accounting for the asynchronous usage
+/// reporter without sleeping a fixed amount on a loaded CI host.
+async fn wait_for_key_path(server: &MockServer, key: &str, path: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if paths_for_key(server, key)
+            .await
+            .iter()
+            .any(|seen| seen == path)
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Stub one project's policy set, live state and usage sink — all matched on
@@ -3526,6 +3620,165 @@ async fn shared_mode_isolates_two_organizations_with_two_projects_each() {
 }
 
 #[tokio::test]
+async fn shared_mode_uses_each_same_tenant_callers_own_platform_credential() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "20");
+    let server = MockServer::start().await;
+
+    // Both credentials are legitimately entitled to the exact same derived
+    // tenant. The authorization identity is nevertheless per credential: no
+    // policy/state/usage client created for the first key may service the
+    // second key's request.
+    for key in [KEY_A, KEY_A_SECOND] {
+        mount_identity(&server, key, ORG_A, &["proj_a1"]).await;
+        mount_project(
+            &server,
+            key,
+            "proj_a1",
+            shared_cost_cap(100.0),
+            spend_state(0.0),
+        )
+        .await;
+    }
+
+    let (app, shared) = shared_stack(&server.uri());
+
+    for key in [KEY_A, KEY_A_SECOND] {
+        let response = app
+            .clone()
+            .oneshot(tenant_request(Some(key), Some("proj_a1"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body_string(response).await;
+        assert!(
+            wait_for_key_path(
+                &server,
+                key,
+                &tenant_usage_path("proj_a1"),
+                Duration::from_secs(3),
+            )
+            .await,
+            "same-tenant caller {key} never used its own credential for usage"
+        );
+    }
+
+    // It is one tenant for cache/ledger isolation purposes, even though its two
+    // authorization identities require distinct remote clients.
+    assert_eq!(shared.warm_tenants(), 1);
+    for key in [KEY_A, KEY_A_SECOND] {
+        let paths = paths_for_key(&server, key).await;
+        assert!(
+            paths.iter().any(|p| p == &policies_path("proj_a1")),
+            "same-tenant caller {key} borrowed another key's policy client: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == &tenant_state_path("proj_a1")),
+            "same-tenant caller {key} borrowed another key's state client: {paths:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_mode_same_tenant_credentials_share_the_pending_ledger() {
+    std::env::set_var("NOVEUM_GUARD_USAGE_FLUSH_MS", "20");
+    let server = MockServer::start().await;
+    let one_per_minute = json!({"policies":[{
+        "policyId":"pol_rl","name":"one per minute","type":"RATE_LIMIT",
+        "enabled":true,"failClosed":true,
+        "config":{"windows":[{"period":"1m","maxRequests":1,"action":"BLOCK"}]}
+    }]});
+    for key in [KEY_A, KEY_A_SECOND] {
+        mount_identity(&server, key, ORG_A, &["proj_a1"]).await;
+        mount_project(
+            &server,
+            key,
+            "proj_a1",
+            one_per_minute.clone(),
+            spend_state(0.0),
+        )
+        .await;
+    }
+
+    let (app, _) = shared_stack(&server.uri());
+    let first = app
+        .clone()
+        .oneshot(tenant_request(Some(KEY_A), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert!(!blocked(&first));
+    let _ = body_string(first).await;
+
+    let second = app
+        .oneshot(tenant_request(Some(KEY_A_SECOND), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert!(
+        blocked(&second),
+        "a second credential for the same tenant received a fresh pending ledger"
+    );
+}
+
+#[tokio::test]
+async fn shared_mode_bounds_rotated_credential_runtimes_inside_a_hot_tenant() {
+    let server = MockServer::start().await;
+    let resolver_path = "/api/v1/projects/guardrails/resolve";
+    Mock::given(method("GET"))
+        .and(match_path(resolver_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "id":"proj_a1","organizationId":ORG_A
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(match_path(policies_path("proj_a1")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"policies":[]})))
+        .mount(&server)
+        .await;
+
+    let (app, shared) = shared_stack(&server.uri());
+    let first_key = "nv_rotated_00";
+    // The production cache permits 64 credential runtimes per tenant. A long-
+    // lived project can rotate beyond that without retaining an unbounded set
+    // of pollers/reporters. Reusing the least-recent key must therefore build a
+    // fresh runtime rather than finding the original one still resident.
+    for i in 0..65 {
+        let key = format!("nv_rotated_{i:02}");
+        let response = app
+            .clone()
+            .oneshot(tenant_request(Some(&key), Some("proj_a1"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "rotation {i}");
+    }
+    assert_eq!(shared.warm_tenants(), 1);
+
+    let response = app
+        .oneshot(tenant_request(Some(first_key), Some("proj_a1"), None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let first_policy_fetches = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| {
+            request.url.path() == policies_path("proj_a1")
+                && request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value == bearer(first_key))
+        })
+        .count();
+    assert_eq!(
+        first_policy_fetches, 2,
+        "the first rotated credential runtime was retained without a bound"
+    );
+}
+
+#[tokio::test]
 async fn shared_mode_keeps_reservations_per_tenant() {
     // Reservations are the other half of "counters": a request admitted for org
     // B must not consume org A's remaining allowance. Both tenants get the same
@@ -3699,7 +3952,7 @@ async fn shared_mode_fails_closed_on_an_unusable_credential() {
     // Anything else presenting itself at the identity endpoint is rejected,
     // exactly as the platform rejects an unknown, expired or revoked key.
     Mock::given(method("GET"))
-        .and(match_path("/api/v1/projects"))
+        .and(match_path("/api/v1/projects/guardrails/resolve"))
         .respond_with(ResponseTemplate::new(401).set_body_json(
             json!({"success":false,"error":{"code":"INVALID_API_KEY","message":"invalid"}}),
         ))
@@ -3760,7 +4013,7 @@ async fn shared_mode_fails_closed_when_identity_cannot_be_verified() {
     // The platform is up but broken (5xx). "Unknown" must never mean "allowed",
     // and must never be cached as a denial either.
     Mock::given(method("GET"))
-        .and(match_path("/api/v1/projects"))
+        .and(match_path("/api/v1/projects/guardrails/resolve"))
         .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
         .mount(&server)
         .await;

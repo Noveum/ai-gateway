@@ -36,6 +36,8 @@ hermetically, with the gateway's provider base-URL overrides pointed here):
 Config via env:
   MOCK_PORT              (default 8787)
   MOCK_MAX_USD           cost_cap maxUsd            (default 0.01)
+  MOCK_POLICY_TYPE       COST_CAP | RATE_LIMIT       (default COST_CAP)
+  MOCK_MAX_REQUESTS      rate_limit maxRequests      (default 1)
   MOCK_WINDOW            cost_cap window            (default 1d_rolling)
   MOCK_SEED_USD          initial cost in the window (default 0.0)
   MOCK_FAIL_CLOSED       policy failClosed          (default true)
@@ -89,6 +91,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("MOCK_PORT", "8787"))
 MAX_USD = float(os.environ.get("MOCK_MAX_USD", "0.01"))
+POLICY_TYPE = os.environ.get("MOCK_POLICY_TYPE", "COST_CAP").strip().upper()
+if POLICY_TYPE not in ("COST_CAP", "RATE_LIMIT"):
+    raise ValueError("MOCK_POLICY_TYPE must be COST_CAP or RATE_LIMIT")
+MAX_REQUESTS = int(os.environ.get("MOCK_MAX_REQUESTS", "1"))
+if MAX_REQUESTS <= 0:
+    raise ValueError("MOCK_MAX_REQUESTS must be positive")
 WINDOW = os.environ.get("MOCK_WINDOW", "1d_rolling")
 FAIL_CLOSED = os.environ.get("MOCK_FAIL_CLOSED", "true").lower() in ("1", "true", "yes")
 EVENTS_FILE = os.environ.get("MOCK_EVENTS_FILE", "")
@@ -183,23 +191,40 @@ COST_CAP_CONFIG = dict(
     **({"scopeToModels": SCOPE_TO_MODELS} if SCOPE_TO_MODELS else {}),
 )
 
-POLICIES = {
-    "policies": [
-        {
-            "policyId": "pol_mock_cost_cap",
-            "name": "E2E daily cost cap",
-            "type": "COST_CAP",
-            "enabled": True,
-            "failClosed": FAIL_CLOSED,
-            # Deprecated/null on the real backend; gateway should still ENFORCE.
-            # The env switch exists only to exercise explicit SHADOW/OFF payloads.
-            "mode": POLICY_MODE,
-            "priority": 10,
-            "source": POLICY_SOURCE,
-            "config": COST_CAP_CONFIG,
-        }
-    ]
-}
+if POLICY_TYPE == "RATE_LIMIT":
+    PRIMARY_POLICY = {
+        "policyId": "pol_mock_rate_limit",
+        "name": "E2E request rate limit",
+        "type": "RATE_LIMIT",
+        "enabled": True,
+        "failClosed": FAIL_CLOSED,
+        "mode": POLICY_MODE,
+        "priority": 10,
+        "source": POLICY_SOURCE,
+        "config": {
+            "windows": [{
+                "period": "1m",
+                "maxRequests": MAX_REQUESTS,
+                "action": "BLOCK",
+            }],
+        },
+    }
+else:
+    PRIMARY_POLICY = {
+        "policyId": "pol_mock_cost_cap",
+        "name": "E2E daily cost cap",
+        "type": "COST_CAP",
+        "enabled": True,
+        "failClosed": FAIL_CLOSED,
+        # Deprecated/null on the real backend; gateway should still ENFORCE.
+        # The env switch exists only to exercise explicit SHADOW/OFF payloads.
+        "mode": POLICY_MODE,
+        "priority": 10,
+        "source": POLICY_SOURCE,
+        "config": COST_CAP_CONFIG,
+    }
+
+POLICIES = {"policies": [PRIMARY_POLICY]}
 if EXPAND_REDACT_WITH_LEN:
     POLICIES["policies"].append({
         "policyId": "pol_mock_expand_input",
@@ -388,8 +413,8 @@ class Handler(BaseHTTPRequestHandler):
             if NO_POLICIES:
                 log("GET /effective -> 200 (no policies)")
             else:
-                log("GET /effective -> 200 (%d policies, maxUsd=%s, failClosed=%s)"
-                    % (len(POLICIES["policies"]), MAX_USD, FAIL_CLOSED))
+                log("GET /effective -> 200 (%d policies, type=%s, maxUsd=%s, failClosed=%s)"
+                    % (len(POLICIES["policies"]), POLICY_TYPE, MAX_USD, FAIL_CLOSED))
             return self._send(200, POLICIES, {"ETag": POLICIES_ETAG, "Cache-Control": "private, max-age=30"})
         if self.path.endswith("/policies/state"):
             if STATE_UNAVAILABLE:

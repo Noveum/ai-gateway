@@ -108,6 +108,11 @@ pub struct AdmitRequest {
     /// carry it (`usage.rs`), so a reservation omitting it was the one gap in
     /// the audit trail between estimating a cost and settling it.
     pub pricing_version: Option<String>,
+    /// Native deployment override: when true, the platform evaluates every
+    /// applicable cost cap atomically even if its stored `enforcementMode` is
+    /// advisory. Omitted/false leaves cost-cap selection to each policy. Rate
+    /// limits always participate in platform admission.
+    pub force_strict_cost_caps: bool,
 }
 
 impl AdmitRequest {
@@ -126,6 +131,9 @@ impl AdmitRequest {
         }
         if let Some(pv) = &self.pricing_version {
             v["pricingVersion"] = Value::from(pv.as_str());
+        }
+        if self.force_strict_cost_caps {
+            v["forceStrictCostCaps"] = Value::Bool(true);
         }
         v
     }
@@ -483,6 +491,7 @@ mod tests {
             maximum_output_tokens: 4096,
             estimated_cost_usd: 0.0051552,
             pricing_version: Some("2026.08.12".into()),
+            force_strict_cost_caps: true,
         }
         .to_json();
         assert_eq!(v["requestId"], "req-1");
@@ -495,6 +504,10 @@ mod tests {
             v["pricingVersion"], "2026.08.12",
             "a hold must record the catalog its estimate was priced with"
         );
+        assert_eq!(
+            v["forceStrictCostCaps"], true,
+            "a native strict deployment override must be explicit on the wire"
+        );
 
         let v = AdmitRequest {
             request_id: "req-2".into(),
@@ -504,12 +517,17 @@ mod tests {
             maximum_output_tokens: 0,
             estimated_cost_usd: f64::NAN,
             pricing_version: None,
+            force_strict_cost_caps: false,
         }
         .to_json();
         assert!(v.get("provider").is_none(), "provider is optional");
         assert!(
             v.get("pricingVersion").is_none(),
             "an absent pricing version is OMITTED, never serialized as null"
+        );
+        assert!(
+            v.get("forceStrictCostCaps").is_none(),
+            "policy-controlled/default admission omits the optional override"
         );
         assert_eq!(v["estimatedCostUsd"], 0.0, "NaN must not become null");
     }
