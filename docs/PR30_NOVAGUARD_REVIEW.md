@@ -1,10 +1,11 @@
 # PR #30 NovaGuard release review
 
-**Review date:** 2026-08-21
+**Review date:** 2026-08-23
 
 **Gateway PR:** [Noveum/ai-gateway#30](https://github.com/Noveum/ai-gateway/pull/30)
 
-**Gateway working branch:** `codex/pr30-release-blockers`
+**Gateway working branch:** `codex/pr30-release-blockers` (published to PR head
+`feat/novaguard-platform-bridge`)
 
 **Companion app PR:** [Noveum/noveum-app-nextjs#544](https://github.com/Noveum/noveum-app-nextjs/pull/544)
 
@@ -19,16 +20,15 @@ Cloudflare Workerd runtime, including atomic admission, strict cost limits,
 organization counters, request transforms, provider streaming, usage
 settlement, concurrency, and reservation cleanup.
 
-At the start of this final publication pass, GitHub pointed at gateway commit
-`99c5fe3`, while the final cross-repository release fixes described here were
-still local. That published gateway SHA also had a failed supply-chain check for
-`h2 0.4.15`; this reviewed branch updates the lockfile to fixed `0.4.16`.
-Regardless of publication state, approval should happen only after CI passes on
-both final pushed SHAs, the companion app is deployed first, and a fresh
-human/bot review is requested.
+At the start of this blocker-fix pass, GitHub pointed at gateway commit
+`a0e93f8` and companion-app commit `5b7b14d`; their published checks were green,
+but they did not include the final Worker cache/configuration, pricing,
+model-scope-contract, and workflow-hardening changes described here. Approval
+should happen only after CI passes on both final pushed SHAs, the companion app
+is deployed first, and a fresh human/bot review is requested.
 
 Cloudflare compatibility is proven by WASM compilation, pinned
-`worker-build 0.8.5`, Wrangler `4.120.0 deploy --dry-run`, and the full 11-phase
+`worker-build 0.8.5`, Wrangler `4.120.0 deploy --dry-run`, and the full 13-phase
 Workerd suite. A live Cloudflare deployment was intentionally not created, so
 this document does not claim production-edge deployment evidence.
 
@@ -188,7 +188,7 @@ Primary files:
 - `src/policy/metering.rs`
 - `docs/PRICING.md`
 
-Catalog version `2026.08.21` now covers current model IDs, aliases, cache rates,
+Catalog version `2026.08.23` now covers current model IDs, aliases, cache rates,
 long-context tiers, tool/search fees, and provider multipliers used by this PR.
 Request admission reserves declared cache/tool premiums, while completion uses
 provider-reported detailed usage. Important fixes include:
@@ -279,7 +279,7 @@ TypeScript pricing table. Amounts are USD per one million tokens.
 |---|---:|---:|---:|---:|---:|---:|
 | OpenAI | `gpt-5.6-luna` | $0.20 | $1.20 | $0.02 | $0.25 | — |
 | OpenAI | `gpt-5.6-terra` | $2.00 | $12.00 | $0.20 | $2.50 | — |
-| OpenAI | `gpt-5.6-sol` | $5.00 | $30.00 | $0.50 | $6.25 | — |
+| OpenAI | `gpt-5.6-sol` | $4.00 | $20.00 | $0.40 | $5.00 | — |
 | OpenAI | `gpt-5.6-cyber` | $12.50 | $75.00 | $1.25 | $15.625 | — |
 | Anthropic | `claude-sonnet-5` | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
 | Anthropic | `claude-opus-5` | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
@@ -289,6 +289,10 @@ TypeScript pricing table. Amounts are USD per one million tokens.
 Aliases include `gpt-5.6 -> gpt-5.6-sol`,
 `daybreak-blue-latest -> gpt-5.6-sol`, and
 `daybreak-red-latest -> gpt-5.6-cyber`.
+
+OpenAI states that Sol's Standard promotion is available at least through
+November 21, 2026. Because it gives neither an exact end date nor replacement
+rates, the catalog has no speculative rollback schedule.
 
 Anthropic's current first-party pricing page and release notes state that
 Sonnet 5's `$2/$10` rate became the standard rate and the previously planned
@@ -326,7 +330,7 @@ Real-key examples observed during this review:
 |---|---:|---:|
 | GPT-5.6 Luna, 10 input + 4 output | `10*$0.20/M + 4*$1.20/M` | `$0.0000068` |
 | GPT-5.6 Terra, 10 input + 4 output | `10*$2/M + 4*$12/M` | `$0.000068` |
-| GPT-5.6 Sol, 10 input + 4 output | `10*$5/M + 4*$30/M` | `$0.00017` |
+| GPT-5.6 Sol, 10 input + 4 output | `10*$4/M + 4*$20/M` | `$0.00012` |
 | Sonnet 5 forced tool, buffered, 604 input + 35 output | `604*$2/M + 35*$10/M` | `$0.001558` |
 
 The production organization-counter probe used the Luna call and observed the
@@ -338,7 +342,7 @@ same `$0.0000068` increment at project, organization, and model scope.
 
 | Gate | Result |
 |---|---|
-| Rust library tests | **479 passed, 0 failed** |
+| Rust library tests | **486 passed, 0 failed** |
 | NovaGuard platform integration | **61 passed, 0 failed** |
 | Policy integration | **12 passed, 0 failed** |
 | Clippy, all targets/features, warnings denied | **Passed** |
@@ -348,7 +352,7 @@ same `$0.0000068` increment at project, organization, and model scope.
 | `worker-build 0.8.5 --release` | **Passed** |
 | Wrangler `4.120.0 deploy --dry-run` | **Passed** |
 | RustSec audit, with repository allowlist | **Passed** |
-| 11-phase pinned Workerd E2E | **Passed** |
+| 13-phase pinned Workerd E2E | **Passed** |
 
 The Workerd matrix additionally proved:
 
@@ -362,14 +366,19 @@ The Workerd matrix additionally proved:
 - 16-way multi-agent concurrency with no duplicate settlement or leaked hold;
 - rate-only opaque-input rejection and `/admit`-503 fail-closed/fail-open parity;
 - Worker deadline abandonment before lease expiry, followed by a successful new
-  admission with zero reservation reaping.
+  admission with zero reservation reaping;
+- request-scoped `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS=128000` parity between
+  `/admit` and the Anthropic `max_tokens` forwarded upstream;
+- binding-only policy-engine recompilation and monotonic cache replacement, so
+  an unchanged ETag or a delayed older refresh cannot restore stale enforcement.
 
 ### Companion Noveum app tree
 
-- API unit suite: **738 passed**, 27 integration-mode skips.
-- Real Redis guardrail integrations: **25/25 passed**.
+- API unit suite: **738 passed**, 29 integration-mode skips (the 27 Redis
+  guardrail cases below were run separately against a real Redis instance).
+- Real Redis guardrail integrations: **27/27 passed**.
 - Web suite: **391/391 passed**.
-- Telemetry suite: **133/133 passed**.
+- Telemetry suite: **136/136 passed**.
 - Focused guardrail/project router suite: **72/72 passed**.
 - API, web, and telemetry TypeScript checks: **Passed**.
 - Translation parity/usage, schema parity, Biome, comments, and diff checks:
@@ -398,9 +407,9 @@ the one early diagnostic that did not follow this rule.
 
 ## Dependency and toolchain decision
 
-One transitive security update is required: `h2 0.4.15` is affected by
-RUSTSEC-2026-0258, so `Cargo.lock` is updated to `h2 0.4.16`. A fresh RustSec
-scan passes after that change. No broader library upgrade is needed. The locked Worker stack is
+The published branch already contains the required transitive security update
+from vulnerable `h2 0.4.15` to fixed `h2 0.4.16`; fresh `cargo audit` and
+`cargo deny` scans pass. No broader library upgrade is needed. The locked Worker stack is
 coherent: `worker`, `worker-macros`, and `worker-sys 0.8.5`,
 `wasm-bindgen 0.2.126`, `worker-build 0.8.5`, Wrangler `4.120.0`, and Node 22 in
 CI. The final local Workerd run used Node `25.5.0` and Rust `1.96.0` without a
@@ -417,10 +426,11 @@ to work around a stale global installation would reduce reproducibility.
 At the last authoritative refresh:
 
 - Gateway PR #30 was open, non-draft and mergeable, with no approval decision.
-- Companion app PR #544 was open as a draft and mergeable.
-- Gateway native, Worker, Docker, and CodeRabbit checks were green on
-  `99c5fe3`, but supply-chain failed on vulnerable `h2 0.4.15`. None of those
-  checks covers this final local release patch.
+- Companion app PR #544 was open, non-draft and mergeable, with no approval
+  decision.
+- Gateway native, Worker, supply-chain, Docker, and CodeRabbit status checks
+  were green on `a0e93f8`. None of those checks covers this final local release
+  patch.
 - CodeRabbit's summary explicitly said reviews were paused after the commit
   influx; its green check is not a fresh review of this local tree.
 - There were 29 review threads: 19 resolved and 10 open.
