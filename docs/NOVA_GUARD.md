@@ -340,10 +340,11 @@ no further changes.
 Per-request cost is computed from the model pricing catalog in
 `pricing/catalog.json`, mirrored by hand into
 `src/policy/pricing_catalog.rs`, and used by `src/policy/pricing.rs`. The catalog
-version is `2026.08.21`; it includes provider-prefixed model ids, cache
-dimensions, tool fees, long-context tiers in the runtime mirror, and supported
-request/response multipliers. Current OpenAI rows include GPT-5.6 Cyber at
-$12.50/$75 and published GPT-5.6 long-context cache rates. Current Anthropic
+version is `2026.08.23`; it includes provider-prefixed model ids, cache
+dimensions, tool fees, long-context tiers in both runtime mirrors, and supported
+request/response multipliers. Current OpenAI rows include GPT-5.6 Sol's $4/$20
+promotional Standard card, GPT-5.6 Cyber at $12.50/$75, and published GPT-5.6
+long-context cache rates. Current Anthropic
 rows include Sonnet 5 at the now
 permanent **$2 / million input** and **$10 / million output**, Opus 5 and the
 dated Opus 4.5 ID at $5/$25, and limited-availability Mythos 5 at $10/$50.

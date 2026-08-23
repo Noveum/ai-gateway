@@ -17,7 +17,7 @@
 
 /// The rate card these rows came from. Recorded on every usage and
 /// reservation record so a billed amount can be traced back to it.
-pub const CATALOG_VERSION: &str = "2026.08.21";
+pub const CATALOG_VERSION: &str = "2026.08.23";
 
 /// One model's published rates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,10 +59,10 @@ pub const MODEL_ROWS: &[CatalogRow] = &[
     CatalogRow {
         id: "gpt-5.6-sol",
         provider: "openai",
-        input_per_1m: 5.0,
-        output_per_1m: 30.0,
-        cached_input_per_1m: Some(0.5),
-        cache_write_per_1m: Some(6.25),
+        input_per_1m: 4.0,
+        output_per_1m: 20.0,
+        cached_input_per_1m: Some(0.4),
+        cache_write_per_1m: Some(5.0),
         cache_write_1h_per_1m: None,
     },
     CatalogRow {
@@ -700,10 +700,10 @@ pub const LONG_CONTEXT_ROWS: &[LongContextRow] = &[
     LongContextRow {
         id: "gpt-5.6-sol",
         threshold_input_tokens: 272000,
-        input_per_1m: 10.0,
-        output_per_1m: 45.0,
-        cached_input_per_1m: Some(1.0),
-        cache_write_per_1m: Some(12.5),
+        input_per_1m: 8.0,
+        output_per_1m: 30.0,
+        cached_input_per_1m: Some(0.8),
+        cache_write_per_1m: Some(10.0),
     },
     LongContextRow {
         id: "gemini-2.5-pro",

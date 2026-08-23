@@ -1,6 +1,6 @@
 # Model pricing and Nova Guard cost accounting
 
-The gateway's checked-in pricing catalog is version **`2026.08.21`**. All token
+The gateway's checked-in pricing catalog is version **`2026.08.23`**. All token
 rates are USD per 1,000,000 tokens. Nova Guard uses these rates to reserve and
 settle cost-cap usage; they are policy estimates, not a provider invoice.
 
@@ -49,7 +49,7 @@ provider-reported charge. For `xai` / `grok`, a supplied
 USD and documents the total as including cache discounts and server-side tools.
 When that field is absent, the gateway falls back to catalog arithmetic. No
 other provider is configured as an authoritative cost source in catalog version
-`2026.08.21`.
+`2026.08.23`.
 
 ## Lookup and defensive pricing
 
@@ -156,11 +156,16 @@ respectively; `—` means the dimension is not present for that row.
 |---|---:|---:|---:|---:|
 | `gpt-5.6-luna` | $0.20 | $1.20 | $0.02 | $0.25 |
 | `gpt-5.6-terra` | $2.00 | $12.00 | $0.20 | $2.50 |
-| `gpt-5.6-sol` | $5.00 | $30.00 | $0.50 | $6.25 |
+| `gpt-5.6-sol` | $4.00 | $20.00 | $0.40 | $5.00 |
 | `gpt-5.6-cyber` | $12.50 | $75.00 | $1.25 | $15.625 |
 
 The current `gpt-5.6` and `daybreak-blue-latest` aliases resolve to
 `gpt-5.6-sol`; `daybreak-red-latest` resolves to `gpt-5.6-cyber`.
+
+OpenAI describes the GPT-5.6 Sol Standard rates above as promotional and
+available **at least through November 21, 2026**. It has not published an exact
+end date or replacement rates, so the catalog carries the promotion as the
+current rate and intentionally has no scheduled rollback.
 
 ### Current Anthropic rows
 
@@ -186,16 +191,14 @@ When total input exceeds the threshold, the whole request uses the tier row:
 |---|---:|---:|---:|---:|---:|
 | `gpt-5.6-luna` | >272,000 | $0.40 | $1.80 | $0.04 | $0.50 |
 | `gpt-5.6-terra` | >272,000 | $4.00 | $18.00 | $0.40 | $5.00 |
-| `gpt-5.6-sol` | >272,000 | $10.00 | $45.00 | $1.00 | $12.50 |
+| `gpt-5.6-sol` | >272,000 | $8.00 | $30.00 | $0.80 | $10.00 |
 | `gemini-2.5-pro` | >200,000 | $2.50 | $15.00 | $0.25 | $0.00 |
 | `grok-4.3` | >200,000 | $2.50 | $5.00 | $0.40 | $0.00 |
 
 Long-context rows are encoded under `longContext` in `pricing/catalog.json` and
-mirrored into the Rust runtime table. The platform TypeScript table currently
-has a flat base/cache-rate schema and does not apply the gateway's long-context
-tier, so telemetry recomputed outside the gateway can differ above a threshold.
-Adding platform tier support requires an explicit cross-repository change; do
-not imply parity from the flat base row alone.
+mirrored into both the Rust runtime table and the platform TypeScript pricing
+table. Both select the long-context row only when total input is greater than
+the documented threshold; the exact threshold remains on the short rate.
 
 ## Anthropic request limitations that protect cost accuracy
 

@@ -42,7 +42,7 @@ compatible proxy or a test server.
 Examples below use `claude-sonnet-5`, an active Claude API model ID in
 [Anthropic's current model table](https://platform.claude.com/docs/en/about-claude/models/overview).
 The gateway does not restrict requests to this list, but Nova Guard catalog
-version `2026.08.21` includes these current high-value rows:
+version `2026.08.23` includes these current high-value rows:
 
 | Model | Availability note | Input | Output | Cache hit | 5m write | 1h write |
 |---|---|---:|---:|---:|---:|---:|

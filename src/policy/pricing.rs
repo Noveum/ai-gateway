@@ -1599,7 +1599,7 @@ mod tests {
     fn catalog_hits_are_not_priced_as_assumed() {
         for (model, expected_input) in [
             ("gpt-4o", 2.50),
-            ("gpt-5.6", 5.00),
+            ("gpt-5.6", 4.00),
             ("gpt-4o-2024-11-20", 2.50),
             ("gpt-5.6-luna-2026-05-01", 0.20),
         ] {
@@ -1619,7 +1619,7 @@ mod tests {
             price_for_context("gpt-5.6-sol", 300_000)
                 .price()
                 .input_per_1m,
-            10.00
+            8.00
         );
         assert_eq!(
             price_at("claude-sonnet-5", 0, at("2026-08-11T00:00:00Z")),
@@ -1707,7 +1707,7 @@ mod tests {
         let terra = lookup("gpt-5.6-terra").unwrap();
         assert_eq!((terra.input_per_1m, terra.output_per_1m), (2.00, 12.00));
         let sol = lookup("gpt-5.6-sol").unwrap();
-        assert_eq!((sol.input_per_1m, sol.output_per_1m), (5.00, 30.00));
+        assert_eq!((sol.input_per_1m, sol.output_per_1m), (4.00, 20.00));
         let sonnet5 = lookup_at("claude-sonnet-5", 0, at("2026-08-11T00:00:00Z")).unwrap();
         assert_eq!((sonnet5.input_per_1m, sonnet5.output_per_1m), (2.00, 10.00));
         for (model, expected) in [
@@ -1748,11 +1748,11 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_6_standard_rates_match_official_model_pages() {
+    fn gpt_5_6_standard_rates_match_official_pricing_page() {
         for (model, input, output) in [
             ("gpt-5.6-luna", 0.20, 1.20),
             ("gpt-5.6-terra", 2.00, 12.00),
-            ("gpt-5.6-sol", 5.00, 30.00),
+            ("gpt-5.6-sol", 4.00, 20.00),
         ] {
             let p = lookup(model).unwrap();
             assert_eq!(
@@ -1760,6 +1760,67 @@ mod tests {
                 (input, output),
                 "{model} standard rate"
             );
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_sol_promotional_short_context_costs_and_reserves_sixty_cents() {
+        for model in ["gpt-5.6-sol", "gpt-5.6", "daybreak-blue-latest"] {
+            let cost = estimate_cost(model, 100_000, 10_000);
+            let estimated = estimate_request_cost(model, 100_000, Some(10_000)).unwrap();
+            let reserved = reserve_request_cost(model, 100_000, Some(10_000));
+
+            assert!((cost - 0.60).abs() < 1e-12, "{model} cost {cost}");
+            assert!(
+                (estimated - 0.60).abs() < 1e-12,
+                "{model} estimated {estimated}"
+            );
+            assert!(
+                (reserved - 0.60).abs() < 1e-12,
+                "{model} reserved {reserved}"
+            );
+            assert!((reserved - 0.80).abs() > 1e-12, "stale Sol reservation");
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_sol_switches_token_and_cache_rates_only_above_272k() {
+        let at_threshold = rates_at("gpt-5.6-sol", 272_000, at("2026-08-23T00:00:00Z"))
+            .expect("Sol short-context rates");
+        assert_eq!(
+            (
+                at_threshold.input_per_1m,
+                at_threshold.cached_input_per_1m,
+                at_threshold.cache_write_per_1m,
+                at_threshold.output_per_1m,
+            ),
+            (4.00, Some(0.40), Some(5.00), 20.00)
+        );
+
+        let above_threshold = rates_at("gpt-5.6-sol", 272_001, at("2026-08-23T00:00:00Z"))
+            .expect("Sol long-context rates");
+        assert_eq!(
+            (
+                above_threshold.input_per_1m,
+                above_threshold.cached_input_per_1m,
+                above_threshold.cache_write_per_1m,
+                above_threshold.output_per_1m,
+            ),
+            (8.00, Some(0.80), Some(10.00), 30.00)
+        );
+    }
+
+    #[test]
+    fn gpt_5_6_sol_aliases_keep_short_and_long_context_parity() {
+        for input_tokens in [272_000, 272_001] {
+            let canonical = rates_at("gpt-5.6-sol", input_tokens, at("2026-08-23T00:00:00Z"));
+            for alias in ["gpt-5.6", "daybreak-blue-latest"] {
+                assert_eq!(
+                    rates_at(alias, input_tokens, at("2026-08-23T00:00:00Z")),
+                    canonical,
+                    "{alias} at {input_tokens} input tokens"
+                );
+            }
         }
     }
 
@@ -1940,12 +2001,12 @@ mod tests {
     #[test]
     fn bare_gpt_5_6_alias_resolves_to_sol() {
         let alias = lookup("gpt-5.6").unwrap();
-        assert_eq!((alias.input_per_1m, alias.output_per_1m), (5.00, 30.00));
+        assert_eq!((alias.input_per_1m, alias.output_per_1m), (4.00, 20.00));
         assert_eq!(alias, lookup("gpt-5.6-sol").unwrap());
         assert_ne!(alias, lookup("gpt-5").unwrap());
         assert_eq!(lookup("GPT-5.6").unwrap(), alias);
         let r = estimate_request_cost("gpt-5.6", 6, Some(8)).unwrap();
-        let expected = (6.0 / 1e6) * 5.00 + (8.0 / 1e6) * 30.00;
+        let expected = (6.0 / 1e6) * 4.00 + (8.0 / 1e6) * 20.00;
         assert!(
             (r - expected).abs() < 1e-12,
             "alias reserved {r} vs {expected}"
@@ -1953,7 +2014,7 @@ mod tests {
         let stale = estimate_request_cost("gpt-5", 6, Some(8)).unwrap();
         assert!(r > stale * 2.0);
         let hi = lookup_for_context("gpt-5.6", 300_000).unwrap();
-        assert_eq!((hi.input_per_1m, hi.output_per_1m), (10.00, 45.00));
+        assert_eq!((hi.input_per_1m, hi.output_per_1m), (8.00, 30.00));
     }
 
     #[test]
@@ -1961,7 +2022,7 @@ mod tests {
         for (model, std_rates, hi_rates) in [
             ("gpt-5.6-luna", (0.20, 1.20), (0.40, 1.80)),
             ("gpt-5.6-terra", (2.00, 12.00), (4.00, 18.00)),
-            ("gpt-5.6-sol", (5.00, 30.00), (10.00, 45.00)),
+            ("gpt-5.6-sol", (4.00, 20.00), (8.00, 30.00)),
         ] {
             let at_threshold = lookup_for_context(model, 272_000).unwrap();
             assert_eq!(
@@ -2015,7 +2076,7 @@ mod tests {
         for (model, expected) in [
             ("gpt-5.6-luna", 0.1218),
             ("gpt-5.6-terra", 1.2180),
-            ("gpt-5.6-sol", 3.0450),
+            ("gpt-5.6-sol", 2.4300),
         ] {
             let c = estimate_cost(model, 300_000, 1_000);
             assert!(
@@ -2428,7 +2489,7 @@ mod tests {
         for (model, cached, write) in [
             ("gpt-5.6-luna", Some(0.02), Some(0.25)),
             ("gpt-5.6-terra", Some(0.20), Some(2.50)),
-            ("gpt-5.6-sol", Some(0.50), Some(6.25)),
+            ("gpt-5.6-sol", Some(0.40), Some(5.00)),
             ("gpt-5", Some(0.125), Some(0.0)),
             ("gpt-4.1", Some(0.50), Some(0.0)),
             ("gpt-4o", Some(1.25), Some(0.0)),
@@ -2556,7 +2617,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!((sol.cache_write_usd - 0.625).abs() < 1e-12);
+        assert!((sol.cache_write_usd - 0.50).abs() < 1e-12);
         assert!(sol.is_complete);
         let four_o = price_usage(
             "gpt-4o",
@@ -2955,7 +3016,7 @@ mod tests {
         for (model, cached_input, cache_write) in [
             ("gpt-5.6-luna", 0.04, 0.50),
             ("gpt-5.6-terra", 0.40, 5.00),
-            ("gpt-5.6-sol", 1.00, 12.50),
+            ("gpt-5.6-sol", 0.80, 10.00),
         ] {
             let rates = rates_at(model, 272_001, at("2026-08-21T00:00:00Z")).unwrap();
             assert_eq!(rates.cached_input_per_1m, Some(cached_input), "{model}");
@@ -2974,11 +3035,11 @@ mod tests {
         );
         assert!(b.is_complete);
         assert!(b.missing_dimensions.is_empty());
-        assert!((b.uncached_input_usd - 2.00).abs() < 1e-12);
-        assert!((b.cache_read_usd - 0.05).abs() < 1e-12);
-        assert!((b.cache_write_usd - 0.625).abs() < 1e-12);
-        assert!((b.output_usd - 0.045).abs() < 1e-12);
-        assert!((b.total_usd - 2.72).abs() < 1e-12);
+        assert!((b.uncached_input_usd - 1.60).abs() < 1e-12);
+        assert!((b.cache_read_usd - 0.04).abs() < 1e-12);
+        assert!((b.cache_write_usd - 0.50).abs() < 1e-12);
+        assert!((b.output_usd - 0.03).abs() < 1e-12);
+        assert!((b.total_usd - 2.17).abs() < 1e-12);
 
         // Below the threshold the published short-context rate applies again.
         let short = price_usage(
@@ -2990,7 +3051,7 @@ mod tests {
             },
         );
         assert!(short.is_complete);
-        assert!((short.cache_read_usd - (1_000.0 / 1e6) * 0.50).abs() < 1e-12);
+        assert!((short.cache_read_usd - (1_000.0 / 1e6) * 0.40).abs() < 1e-12);
     }
 
     #[test]

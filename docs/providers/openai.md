@@ -13,10 +13,16 @@ gateway's versioned [pricing catalog](../PRICING.md).
 
 - `gpt-5.6-luna` — $0.20/M input, $1.20/M output at standard short-context rates
 - `gpt-5.6-terra` — $2/M input, $12/M output
-- `gpt-5.6-sol` — $5/M input, $30/M output
+- `gpt-5.6-sol` — promotional Standard rates of $4/M input, $0.40/M cached
+  input, $5/M cache writes, and $20/M output; above 272K input, the whole
+  request uses $8/$0.80/$10/$30 respectively
 - `gpt-5.6-cyber` — $12.50/M input, $75/M output
 - `gpt-5.6` and `daybreak-blue-latest` resolve to Sol for pricing;
   `daybreak-red-latest` resolves to Cyber
+
+OpenAI says the Sol promotion is available at least through November 21, 2026.
+It has not published an exact end date or replacement rates, so Nova Guard does
+not schedule a rollback.
 
 The catalog also contains the supported GPT-4.x, reasoning, embedding, image,
 and audio rows listed in [Pricing](../PRICING.md). A model that OpenAI still

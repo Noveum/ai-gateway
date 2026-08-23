@@ -1,5 +1,5 @@
 {
-  "version": "2026.08.21",
+  "version": "2026.08.23",
 	"units": "USD per 1,000,000 tokens",
 	"notes": [
 		"SINGLE SOURCE OF TRUTH for LLM rates. The gateway's Rust table (src/policy/pricing_catalog.rs) and the platform's TypeScript table (packages/telemetry/src/pricing/generated/index.ts) are hand-maintained copies of these rows. Edit this file first, then mirror the same change into both tables by hand.",
@@ -7,6 +7,7 @@
 		"cacheWritePer1m is the rate for tokens written to the cache at the provider's DEFAULT TTL. 0.0 means the provider documents no cache-write charge. null means unknown.",
 		"cacheWrite1hPer1m is Anthropic's 1-hour-TTL cache write (2x base). null when the provider has a single write rate.",
 		"Gemini charges cached content as storage per hour rather than per written token; no response field reports that time, so it is out of scope for per-request costing and cacheWritePer1m is 0.0.",
+		"GPT-5.6 Sol Standard rates are promotional and available at least through November 21, 2026. No rollback is scheduled because OpenAI has not published an exact end date or replacement rates.",
 		"legacy: true marks rows carried over verbatim from the platform's pre-catalog table. Their base rates are unverified and they carry no cache dimensions."
 	],
   "authoritativeCostProviders": ["xai", "grok"],
@@ -45,11 +46,11 @@
 		{
 			"id": "gpt-5.6-sol",
 			"provider": "openai",
-			"inputPer1m": 5.0,
-			"outputPer1m": 30.0,
-			"averagePer1m": 17.5,
-			"cachedInputPer1m": 0.5,
-			"cacheWritePer1m": 6.25,
+			"inputPer1m": 4.0,
+			"outputPer1m": 20.0,
+			"averagePer1m": 12.0,
+			"cachedInputPer1m": 0.4,
+			"cacheWritePer1m": 5.0,
 			"cacheWrite1hPer1m": null,
 			"cachedInputBasis": "published",
 			"platformKey": "gpt-5.6-sol",
@@ -2464,10 +2465,10 @@
     {
       "id": "gpt-5.6-sol",
       "thresholdInputTokens": 272000,
-      "inputPer1m": 10.0,
-      "outputPer1m": 45.0,
-      "cachedInputPer1m": 1.0,
-      "cacheWritePer1m": 12.5,
+      "inputPer1m": 8.0,
+      "outputPer1m": 30.0,
+      "cachedInputPer1m": 0.8,
+      "cacheWritePer1m": 10.0,
       "source": "https://developers.openai.com/api/docs/pricing"
     },
 		{
