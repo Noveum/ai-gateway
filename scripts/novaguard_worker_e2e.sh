@@ -115,7 +115,7 @@ start_mock() {
   MOCK_PID=$!
   disown "$MOCK_PID" 2>/dev/null   # keep phase restarts from printing job-control noise
   for _ in $(seq 1 40); do
-    curl -sf -o /dev/null "http://127.0.0.1:$MOCK_PORT/api/v1/projects/p/policies/effective" && return 0
+    curl -sf -o /dev/null "http://127.0.0.1:$MOCK_PORT/__mock/stats" && return 0
     sleep 0.25
   done
   echo "mock platform did not come up; see $log" >&2
@@ -126,6 +126,7 @@ start_wrangler() {
   local openai_base_url="${E2E_OPENAI_BASE_URL:-http://127.0.0.1:$MOCK_PORT}"
   local anthropic_base_url="${E2E_ANTHROPIC_BASE_URL:-http://127.0.0.1:$MOCK_PORT}"
   local upstream_timeout_ms="${E2E_UPSTREAM_TIMEOUT_MS:-600000}"
+  local assumed_output_tokens="${E2E_ASSUMED_OUTPUT_TOKENS:-1024}"
   if [ -n "$WRANGLER_PID" ]; then
     kill "$WRANGLER_PID" 2>/dev/null
     wait "$WRANGLER_PID" 2>/dev/null
@@ -142,6 +143,7 @@ start_wrangler() {
     --var "OPENAI_BASE_URL:$openai_base_url" \
     --var "ANTHROPIC_BASE_URL:$anthropic_base_url" \
     --var "NOVEUM_GUARD_WORKER_UPSTREAM_TIMEOUT_MS:$upstream_timeout_ms" \
+    --var "NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS:$assumed_output_tokens" \
     >"$TMP/wrangler.log" 2>&1 &
   WRANGLER_PID=$!
   for _ in $(seq 1 240); do
@@ -447,6 +449,26 @@ anthropic_buffered_request() {
         {"role":"user","content":"buffered multi-agent request"}
       ]
     }'
+}
+
+anthropic_unbounded_request() {
+  curl -sS --max-time 30 \
+    "http://127.0.0.1:$GATEWAY_PORT/v1/chat/completions" \
+    -H 'Authorization: Bearer sk-ant-test' -H 'x-provider: anthropic' \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "model":"claude-sonnet-5",
+      "messages":[{"role":"user","content":"binding default"}]
+    }'
+}
+
+cache_race_request() {
+  local model="$1"
+  curl -sS --max-time 30 \
+    "http://127.0.0.1:$GATEWAY_PORT/v1/chat/completions" \
+    -H 'Authorization: Bearer sk-test' -H 'x-provider: openai' \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"race-block-me\"}]}"
 }
 
 command -v node >/dev/null || { echo "node not on PATH (set NODE_BIN_DIR)" >&2; exit 1; }
@@ -1090,6 +1112,53 @@ else
 fi
 refute_log "$TMP/p11.log" "REAP reservation=" \
   "no active reservation was reaped during the deadline regression"
+
+# ---------------------------------------------------------------------------
+say "Phase 12 -- Worker output-token binding drives admission and Anthropic defaults"
+start_mock "$TMP/p12.log" MOCK_MAX_USD=100.0 MOCK_ENFORCEMENT_MODE=ADVISORY \
+  MOCK_PROMPT_TOKENS=11 MOCK_COMPLETION_TOKENS=4
+E2E_ASSUMED_OUTPUT_TOKENS=128000
+start_wrangler
+unset E2E_ASSUMED_OUTPUT_TOKENS
+BODY="$(anthropic_unbounded_request)"
+grep -q '"choices"' <<<"$BODY" \
+  && pass "unbounded Anthropic request completed with the Worker binding default" \
+  || { fail "the output-token binding probe failed"; echo "$BODY"; }
+OUTPUT_BINDING_STATS="$(curl -sf "http://127.0.0.1:$MOCK_PORT/__mock/stats")" || OUTPUT_BINDING_STATS=""
+if [ -n "$OUTPUT_BINDING_STATS" ] && python3 -c '
+import json, sys
+admits = json.loads(sys.argv[1])["admitBodies"]
+assert len(admits) == 1, admits
+assert admits[0]["maximumOutputTokens"] == 128000, admits[0]
+' "$OUTPUT_BINDING_STATS"; then
+  pass "Worker /admit used maximumOutputTokens=128000"
+else
+  fail "Worker /admit ignored NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS=128000"
+fi
+expect_log "$TMP/p12.log" "max_tokens=128000" \
+  "outbound Anthropic request used max_tokens=128000"
+
+# ---------------------------------------------------------------------------
+say "Phase 13 -- a delayed old policy refresh cannot roll back a faster new one"
+start_mock "$TMP/p13.log" MOCK_POLICY_RACE=1 MOCK_POLICY_RACE_OLD_DELAY_MS=500
+start_wrangler
+cache_race_request cache-race-first >"$TMP/p13-first.body" &
+RACE_FIRST_PID=$!
+sleep 0.05
+cache_race_request cache-race-second >"$TMP/p13-second.body" &
+RACE_SECOND_PID=$!
+wait "$RACE_FIRST_PID" || fail "the delayed cache-race request failed"
+wait "$RACE_SECOND_PID" || fail "the fast cache-race request failed"
+RACE_FINAL_BODY="$(cache_race_request cache-race-final)"
+grep -q '"x_noveum_guard"' <<<"$RACE_FINAL_BODY" \
+  && pass "the newer blocking policy remained in the isolate cache" \
+  || { fail "the delayed old response rolled the policy cache back"; echo "$RACE_FINAL_BODY"; }
+expect_log "$TMP/p13.log" "GET /effective -> 200 OLD after 500ms delay" \
+  "the old refresh was deterministically delayed"
+expect_log "$TMP/p13.log" "GET /effective -> 200 NEW immediately" \
+  "the newer refresh completed first"
+refute_log "$TMP/p13.log" "model=cache-race-final" \
+  "the final probe was blocked before reaching the provider"
 
 # ---------------------------------------------------------------------------
 say "Result"

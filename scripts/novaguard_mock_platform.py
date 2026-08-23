@@ -75,6 +75,11 @@ Config via env:
                          service may reap it (default 900000, matching 15m)
   MOCK_PROVIDER_DELAY_MS hold each mock provider request open for this many ms,
                          making concurrent-client overlap observable (default 0)
+  MOCK_POLICY_RACE       make the first effective-policy response an old empty
+                         bundle after a delay and the second a newer blocking
+                         bundle immediately, for deterministic cache-race tests
+  MOCK_POLICY_RACE_OLD_DELAY_MS
+                         delay for the old response above (default 500)
 
 Every request is logged to stderr; received usage events are printed (and, when
 MOCK_EVENTS_FILE is set, appended as JSON lines so a test harness can assert on
@@ -124,6 +129,8 @@ STREAM_NO_USAGE = os.environ.get("MOCK_STREAM_NO_USAGE", "0").lower() in ("1", "
 NO_POLICIES = os.environ.get("MOCK_NO_POLICIES", "0").lower() in ("1", "true", "yes")
 PROVIDER_DELAY_MS = int(os.environ.get("MOCK_PROVIDER_DELAY_MS", "0"))
 POLICY_MODE = os.environ.get("MOCK_POLICY_MODE", "").strip().upper() or None
+POLICY_RACE = os.environ.get("MOCK_POLICY_RACE", "0").lower() in ("1", "true", "yes")
+POLICY_RACE_OLD_DELAY_MS = int(os.environ.get("MOCK_POLICY_RACE_OLD_DELAY_MS", "500"))
 SCOPE_TO_MODELS = [
     model.strip()
     for model in os.environ.get("MOCK_SCOPE_TO_MODELS", "").split(",")
@@ -167,6 +174,7 @@ _stats = {
     "settlementCancelled": 0,
     "settlementIdempotent": 0,
     "httpErrors": 0,
+    "policyFetchRequests": 0,
 }
 
 def _empty_scope():
@@ -252,6 +260,27 @@ POLICIES_ETAG = '"mock-%s"' % hashlib.sha1(
     json.dumps(POLICIES, sort_keys=True).encode()
 ).hexdigest()[:16]
 
+POLICY_RACE_OLD = {"policies": []}
+POLICY_RACE_NEW = {
+    "policies": [{
+        "policyId": "pol_cache_race_new",
+        "name": "E2E cache race winner",
+        "type": "REGEX_MATCH",
+        "enabled": True,
+        "failClosed": True,
+        "mode": "ENFORCE",
+        "priority": 1,
+        "source": "project",
+        "config": {
+            "phase": "input",
+            "patterns": [{"name": "race-marker", "regex": "race-block-me"}],
+            "action": "BLOCK",
+        },
+    }]
+}
+POLICY_RACE_OLD_ETAG = '"cache-race-old"'
+POLICY_RACE_NEW_ETAG = '"cache-race-new"'
+
 # --- Reservations ----------------------------------------------------------
 #
 # The real admission API holds ONE authoritative counter, so a reservation is
@@ -290,6 +319,7 @@ def log(*a):
 def bump_stat(name):
     with _stats_lock:
         _stats[name] += 1
+        return _stats[name]
 
 
 def provider_started():
@@ -407,6 +437,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/__mock/stats":
             return self._send(200, stats_snapshot(), {"Cache-Control": "no-store"})
         if self.path.endswith("/policies/effective"):
+            fetch_number = bump_stat("policyFetchRequests")
+            if POLICY_RACE:
+                if fetch_number == 1:
+                    log("GET /effective -> 200 OLD after %dms delay" % POLICY_RACE_OLD_DELAY_MS)
+                    time.sleep(POLICY_RACE_OLD_DELAY_MS / 1000.0)
+                    return self._send(200, POLICY_RACE_OLD, {"ETag": POLICY_RACE_OLD_ETAG})
+                log("GET /effective -> 200 NEW immediately")
+                return self._send(200, POLICY_RACE_NEW, {"ETag": POLICY_RACE_NEW_ETAG})
             if self.headers.get("If-None-Match") == POLICIES_ETAG:
                 log("GET /effective -> 304 (unchanged)")
                 return self._send(304, headers={"ETag": POLICIES_ETAG})

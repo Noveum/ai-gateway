@@ -1234,6 +1234,22 @@ fn validate_anthropic_cache_controls(
 
 /// Convert an OpenAI Chat Completions request into Anthropic's Messages shape.
 pub fn openai_to_anthropic_messages(body: Value) -> Result<Value, String> {
+    openai_to_anthropic_messages_with_assumed_output_tokens(
+        body,
+        crate::policy::pricing::assumed_output_tokens(),
+    )
+}
+
+/// Convert an OpenAI request while supplying the runtime-specific completion
+/// assumption used only when the caller omitted every output-limit spelling.
+/// Native callers use [`openai_to_anthropic_messages`], which retains the
+/// process `std::env` behavior; the Worker passes its request-scoped `Env`
+/// binding so a binding-only deployment is visible without restarting an
+/// isolate.
+pub fn openai_to_anthropic_messages_with_assumed_output_tokens(
+    body: Value,
+    assumed_output_tokens: u64,
+) -> Result<Value, String> {
     let mut body = body;
     let object = body
         .as_object_mut()
@@ -1364,7 +1380,7 @@ pub fn openai_to_anthropic_messages(body: Value) -> Result<Value, String> {
         );
         break;
     }
-    let max_tokens = max_tokens.unwrap_or_else(crate::policy::pricing::assumed_output_tokens);
+    let max_tokens = max_tokens.unwrap_or(assumed_output_tokens);
 
     if let Some(n) = object.get("n") {
         if n.as_u64() != Some(1) {
@@ -2950,6 +2966,30 @@ mod tests {
         .unwrap();
         assert_eq!(responses_alias["max_tokens"], 33);
         assert!(responses_alias.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn anthropic_conversion_accepts_a_worker_specific_default_output_limit() {
+        let converted = openai_to_anthropic_messages_with_assumed_output_tokens(
+            json!({
+                "model": "claude-sonnet-5",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            128_000,
+        )
+        .expect("the Worker default produces a valid Anthropic request");
+        assert_eq!(converted["max_tokens"], 128_000);
+
+        let explicit = openai_to_anthropic_messages_with_assumed_output_tokens(
+            json!({
+                "model": "claude-sonnet-5",
+                "max_completion_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            128_000,
+        )
+        .expect("an explicit client limit remains valid");
+        assert_eq!(explicit["max_tokens"], 64);
     }
 
     #[test]

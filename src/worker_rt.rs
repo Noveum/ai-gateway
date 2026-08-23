@@ -69,20 +69,20 @@ use crate::policy::metering::{extract_actual_usage_priced, ActualUsage, StreamUs
 use crate::policy::rules::LiveState;
 use crate::policy::synthetic::{block_body, block_status, policy_header_token, BlockResponseMode};
 use crate::policy::worker_remote::{
-    self, admit_request_body, force_include_usage, resolve_max_output_tokens, Admission,
-    AdmitRequest, BodyAdmission, Settlement, StreamOutcome, WorkerRemoteConfig,
-    ALLOW_UNGUARDED_START_VAR, API_KEY_VAR, API_URL_VAR, MAX_OUTPUT_TOKEN_LIMIT, PROJECT_ID_VAR,
-    TENANCY_VAR,
+    self, admit_request_body, assumed_output_tokens_from_value, force_include_usage,
+    resolve_max_output_tokens, Admission, AdmitRequest, BodyAdmission, Settlement, StreamOutcome,
+    WorkerRemoteConfig, ALLOW_UNGUARDED_START_VAR, API_KEY_VAR, API_URL_VAR,
+    ASSUMED_OUTPUT_TOKENS_VAR, MAX_OUTPUT_TOKEN_LIMIT, PROJECT_ID_VAR, TENANCY_VAR,
 };
 use crate::policy::PolicyEngine;
 use crate::routing::{
     apply_input_transforms, apply_output_transforms, authorization_bearer_token,
     bedrock_converse_to_openai, estimate_admission_input_tokens, flatten_input_text,
-    flatten_output_text, normalize_base_url, openai_to_anthropic_messages,
-    openai_to_bedrock_converse, prepare_strict_admission_body, resolve_provider,
-    transform_anthropic_to_openai_format, upstream_url_with_base,
-    validate_strict_anthropic_base_url, validate_strict_openai_base_url, ANTHROPIC_BASE_URL_VAR,
-    OPENAI_BASE_URL_VAR,
+    flatten_output_text, normalize_base_url,
+    openai_to_anthropic_messages_with_assumed_output_tokens, openai_to_bedrock_converse,
+    prepare_strict_admission_body, resolve_provider, transform_anthropic_to_openai_format,
+    upstream_url_with_base, validate_strict_anthropic_base_url, validate_strict_openai_base_url,
+    ANTHROPIC_BASE_URL_VAR, OPENAI_BASE_URL_VAR,
 };
 use crate::sigv4;
 
@@ -224,6 +224,10 @@ fn env_flag(env: &Env, key: &str, default: bool) -> bool {
         ),
         None => default,
     }
+}
+
+fn worker_assumed_output_tokens(env: &Env) -> u64 {
+    assumed_output_tokens_from_value(env_value(env, ASSUMED_OUTPUT_TOKENS_VAR).as_deref())
 }
 
 fn reserved_upstream_deadline_ms(env: &Env) -> u64 {
@@ -875,6 +879,7 @@ async fn proxy(
             return unsupported_guard_config(&message);
         }
     };
+    let assumed_output_tokens = worker_assumed_output_tokens(&env);
 
     let provider = req
         .headers()
@@ -1116,7 +1121,10 @@ async fn proxy(
                 "Anthropic requires a JSON chat-completions request body",
             );
         };
-        if let Err(message) = openai_to_anthropic_messages(body.clone()) {
+        if let Err(message) = openai_to_anthropic_messages_with_assumed_output_tokens(
+            body.clone(),
+            assumed_output_tokens,
+        ) {
             return error_response(400, "invalid_request_error", &message);
         }
         Some(api_key)
@@ -1190,7 +1198,10 @@ async fn proxy(
     // hold. A deterministic converter error proves no upstream call occurred.
     if is_anthropic {
         if let Some(candidate) = forward_body_json.as_ref() {
-            if let Err(message) = openai_to_anthropic_messages(candidate.clone()) {
+            if let Err(message) = openai_to_anthropic_messages_with_assumed_output_tokens(
+                candidate.clone(),
+                assumed_output_tokens,
+            ) {
                 return error_response(400, "invalid_request_error", &message);
             }
         }
@@ -1223,10 +1234,11 @@ async fn proxy(
             // the defensive catalog maximum rather than $0.
             let declared_usage =
                 crate::policy::pricing::declared_request_usage(&provider, candidate, est_in);
+            let reservation_output_tokens = maximum_output_tokens.unwrap_or(assumed_output_tokens);
             let est_cost = crate::policy::pricing::reserve_request_breakdown(
                 &model,
                 est_in,
-                maximum_output_tokens,
+                Some(reservation_output_tokens),
                 &declared_usage,
             )
             .total_usd;
@@ -1238,8 +1250,7 @@ async fn proxy(
                 provider: Some(provider.clone()),
                 model: model.clone(),
                 estimated_input_tokens: u64::from(est_in),
-                maximum_output_tokens: maximum_output_tokens
-                    .unwrap_or_else(crate::policy::pricing::assumed_output_tokens),
+                maximum_output_tokens: reservation_output_tokens,
                 estimated_cost_usd: est_cost,
                 pricing_version: Some(crate::policy::pricing::CATALOG_VERSION.to_string()),
                 // The Worker follows each policy's own enforcementMode. The
@@ -1395,7 +1406,10 @@ async fn proxy(
                 "Anthropic requires a JSON chat-completions request body",
             );
         };
-        let body = match openai_to_anthropic_messages(body) {
+        let body = match openai_to_anthropic_messages_with_assumed_output_tokens(
+            body,
+            assumed_output_tokens,
+        ) {
             Ok(body) => body,
             Err(message) => return error_response(400, "invalid_request_error", &message),
         };

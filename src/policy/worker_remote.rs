@@ -46,8 +46,15 @@
 //! secret set *means*, not because they share code), the tenancy refusal, the
 //! request-path heuristics, and the `worker::Fetch` I/O.
 
+#[cfg(any(target_arch = "wasm32", test))]
+use std::rc::Rc;
+
 use serde_json::{json, Value};
 
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::policy::config::PolicyBundle;
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::policy::engine::{EngineOptions, PolicyEngine};
 use crate::policy::metering::ActualUsage;
 
 pub use crate::policy::platform::{API_KEY_VAR, PROJECT_ID_VAR, TENANCY_VAR};
@@ -57,6 +64,8 @@ pub const API_URL_VAR: &str = "NOVEUM_API_URL";
 /// Emergency override: serve traffic when the *first* policy fetch fails.
 /// Mirrors `remote::ALLOW_UNGUARDED_START_VAR` on the native side.
 pub const ALLOW_UNGUARDED_START_VAR: &str = "NOVEUM_GUARD_ALLOW_UNGUARDED_START";
+/// Completion-size assumption for requests without an explicit output limit.
+pub const ASSUMED_OUTPUT_TOKENS_VAR: &str = "NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS";
 
 /// Default platform base URL when [`API_URL_VAR`] is unset.
 pub const DEFAULT_API_URL: &str = "https://api.noveum.ai";
@@ -66,9 +75,224 @@ pub const DEFAULT_API_URL: &str = "https://api.noveum.ai";
 /// JSON, not a real completion budget.
 pub const MAX_OUTPUT_TOKEN_LIMIT: u64 = 10_000_000;
 
+/// Parse the Worker binding that mirrors the native process environment knob.
+/// Invalid, blank and non-positive values retain the established shared default,
+/// exactly as [`crate::policy::pricing::assumed_output_tokens`] does natively.
+pub fn assumed_output_tokens_from_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(crate::policy::pricing::DEFAULT_ASSUMED_OUTPUT_TOKENS)
+}
+
 /// The `max_tokens`-style keys a chat-completions body may carry, in the order
 /// the gateway honors them.
 const OUTPUT_LIMIT_KEYS: [&str; 3] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+
+// ---------------------------------------------------------------------------
+// Per-isolate policy cache core
+// ---------------------------------------------------------------------------
+
+/// The compile-time inputs that are not present in the platform bundle.
+///
+/// Cloudflare may reuse an isolate after a binding-only deployment, so the
+/// bundle ETag alone is not a valid identity for a compiled [`PolicyEngine`].
+/// See <https://developers.cloudflare.com/workers/runtime-apis/bindings/#making-changes-to-bindings>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_arch = "wasm32", test))]
+struct EngineOptionsIdentity {
+    enabled: bool,
+    block_mode: crate::policy::synthetic::BlockResponseMode,
+    fail_open_default: bool,
+    live_state_backed: bool,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl From<&EngineOptions> for EngineOptionsIdentity {
+    fn from(options: &EngineOptions) -> Self {
+        Self {
+            enabled: options.enabled,
+            block_mode: options.block_mode,
+            fail_open_default: options.fail_open_default,
+            live_state_backed: options.live_state_backed,
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+struct CachedPolicies {
+    key: String,
+    bundle: PolicyBundle,
+    engine: Rc<PolicyEngine>,
+    options: EngineOptionsIdentity,
+    etag: Option<String>,
+    fetched_ms: f64,
+    last_error_ms: Option<f64>,
+}
+
+#[derive(Clone)]
+#[cfg(any(target_arch = "wasm32", test))]
+struct PolicyCacheView {
+    bundle: PolicyBundle,
+    engine: Rc<PolicyEngine>,
+    etag: Option<String>,
+    fetched_ms: f64,
+    last_error_ms: Option<f64>,
+    recompiled: bool,
+}
+
+/// Isolate-local cache with a monotonic compare-and-swap generation.
+///
+/// Workers run a single-threaded event loop, but multiple requests interleave
+/// whenever one awaits `fetch()`. A later refresh can therefore complete before
+/// an earlier one. Only a generation newer than the last applied mutation may
+/// replace this cache; a delayed old response is still usable by its own request
+/// but cannot roll the isolate back. See
+/// <https://developers.cloudflare.com/workers/reference/how-workers-works/#distributed-execution>.
+#[derive(Default)]
+#[cfg(any(target_arch = "wasm32", test))]
+struct PolicyCache {
+    current: Option<CachedPolicies>,
+    next_generation: u64,
+    applied_generation: u64,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl PolicyCache {
+    fn next_generation(&mut self) -> u64 {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("a Worker isolate cannot start 2^64 policy refreshes");
+        self.next_generation
+    }
+
+    fn supersede_in_flight(&mut self) {
+        self.applied_generation = self.next_generation();
+    }
+
+    fn begin_refresh(&mut self) -> u64 {
+        self.next_generation()
+    }
+
+    /// Snapshot a same-project cache entry for one request. Binding-only option
+    /// changes synchronously recompile the retained raw bundle and supersede any
+    /// older in-flight fetch before freshness/backoff can return the engine.
+    fn cached(
+        &mut self,
+        key: &str,
+        options: &EngineOptions,
+        _now_ms: f64,
+    ) -> Option<PolicyCacheView> {
+        let identity = EngineOptionsIdentity::from(options);
+        let recompiled = self
+            .current
+            .as_ref()
+            .is_some_and(|entry| entry.key == key && entry.options != identity);
+        if recompiled {
+            self.supersede_in_flight();
+            let entry = self
+                .current
+                .as_mut()
+                .expect("the option mismatch came from this cache entry");
+            entry.engine = Rc::new(PolicyEngine::from_bundle(&entry.bundle, options.clone()));
+            entry.options = identity;
+        }
+
+        self.current
+            .as_ref()
+            .filter(|entry| entry.key == key)
+            .map(|entry| PolicyCacheView {
+                bundle: entry.bundle.clone(),
+                engine: entry.engine.clone(),
+                etag: entry.etag.clone(),
+                fetched_ms: entry.fetched_ms,
+                last_error_ms: entry.last_error_ms,
+                recompiled,
+            })
+    }
+
+    fn may_apply(&mut self, generation: u64) -> bool {
+        if generation <= self.applied_generation {
+            return false;
+        }
+        self.applied_generation = generation;
+        true
+    }
+
+    /// Compile a modified response for the current request, then install it only
+    /// if no newer response or binding-only recompile already won the cache CAS.
+    fn refresh_modified(
+        &mut self,
+        generation: u64,
+        key: &str,
+        bundle: PolicyBundle,
+        options: EngineOptions,
+        etag: Option<String>,
+        now_ms: f64,
+    ) -> (Rc<PolicyEngine>, bool) {
+        let identity = EngineOptionsIdentity::from(&options);
+        let engine = Rc::new(PolicyEngine::from_bundle(&bundle, options));
+        let applied = self.may_apply(generation);
+        if applied {
+            self.current = Some(CachedPolicies {
+                key: key.to_string(),
+                bundle,
+                engine: engine.clone(),
+                options: identity,
+                etag,
+                fetched_ms: now_ms,
+                last_error_ms: None,
+            });
+        }
+        (engine, applied)
+    }
+
+    /// Apply a 304 to the exact raw-bundle snapshot whose ETag was sent. The
+    /// snapshot is request-local so a superseded response never borrows a newer
+    /// binding's engine by accident.
+    fn refresh_not_modified(
+        &mut self,
+        generation: u64,
+        key: &str,
+        cached: &PolicyCacheView,
+        now_ms: f64,
+    ) -> (Rc<PolicyEngine>, bool) {
+        let engine = cached.engine.clone();
+        let applied = self.may_apply(generation);
+        if applied {
+            let options = self
+                .current
+                .as_ref()
+                .filter(|entry| entry.key == key)
+                .map(|entry| entry.options);
+            if let Some(options) = options {
+                self.current = Some(CachedPolicies {
+                    key: key.to_string(),
+                    bundle: cached.bundle.clone(),
+                    engine: engine.clone(),
+                    options,
+                    etag: cached.etag.clone(),
+                    fetched_ms: now_ms,
+                    last_error_ms: None,
+                });
+            }
+        }
+        (engine, applied)
+    }
+
+    /// Backoff is cache metadata, not a policy generation. A failed newer fetch
+    /// does not suppress a still-running older success, but an error older than
+    /// an already-applied success cannot mark that success unhealthy.
+    fn refresh_failed(&mut self, generation: u64, key: &str, now_ms: f64) {
+        if generation <= self.applied_generation {
+            return;
+        }
+        if let Some(entry) = self.current.as_mut().filter(|entry| entry.key == key) {
+            entry.last_error_ms = Some(now_ms);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -425,7 +649,6 @@ mod wasm_io {
     use super::*;
 
     use std::cell::RefCell;
-    use std::rc::Rc;
     use std::time::Duration;
 
     use futures_util::future::{select, Either};
@@ -434,8 +657,6 @@ mod wasm_io {
         Result,
     };
 
-    use crate::policy::config::PolicyBundle;
-    use crate::policy::engine::{EngineOptions, PolicyEngine};
     use crate::policy::platform;
     use crate::policy::rules::LiveState;
 
@@ -478,14 +699,6 @@ mod wasm_io {
         js_sys::Date::new_0().to_iso_string().into()
     }
 
-    struct CachedPolicies {
-        key: String,
-        engine: Rc<PolicyEngine>,
-        etag: Option<String>,
-        fetched_ms: f64,
-        last_error_ms: Option<f64>,
-    }
-
     struct CachedState {
         key: String,
         state: Option<LiveState>,
@@ -494,11 +707,12 @@ mod wasm_io {
         last_error_ms: Option<f64>,
     }
 
-    // The Workers runtime is single-threaded per isolate, so a thread-local is
-    // the whole of the concurrency story. Every borrow below is released before
-    // an `await`; nothing holds a `RefCell` guard across a suspension point.
+    // Cloudflare can interleave multiple requests in this single-threaded
+    // isolate whenever one awaits. The RefCells are safe because every borrow is
+    // dropped before suspension; PolicyCache's generations provide the separate
+    // ordering guarantee across those suspension points.
     thread_local! {
-        static POLICY_CACHE: RefCell<Option<CachedPolicies>> = const { RefCell::new(None) };
+        static POLICY_CACHE: RefCell<PolicyCache> = RefCell::new(PolicyCache::default());
         static STATE_CACHE: RefCell<Option<CachedState>> = const { RefCell::new(None) };
     }
 
@@ -559,34 +773,31 @@ mod wasm_io {
         let key = cfg.cache_key();
         let now = now_ms();
 
-        // Snapshot what we know, then drop the borrow before any await.
-        let (cached, etag, fresh, backing_off) = POLICY_CACHE.with(|c| {
-            let c = c.borrow();
-            match c.as_ref().filter(|p| p.key == key) {
-                Some(p) => (
-                    Some(p.engine.clone()),
-                    p.etag.clone(),
-                    now - p.fetched_ms < POLICY_TTL_MS,
-                    p.last_error_ms.is_some_and(|t| now - t < ERROR_BACKOFF_MS),
-                ),
-                None => (None, None, false, false),
+        // Bindings are request-scoped and may change without an isolate restart.
+        // `cached` recompiles the retained raw bundle before freshness/backoff is
+        // considered whenever those compile-time options change.
+        let cached = POLICY_CACHE.with(|cache| cache.borrow_mut().cached(&key, &opts, now));
+        if let Some(cached) = &cached {
+            if cached.recompiled {
+                for rejected in cached.engine.rejected_policies() {
+                    console_error!("Nova Guard: platform policy rejected: {rejected}");
+                }
             }
-        });
-        if let Some(engine) = &cached {
+            let fresh = now - cached.fetched_ms < POLICY_TTL_MS;
+            let backing_off = cached
+                .last_error_ms
+                .is_some_and(|timestamp| now - timestamp < ERROR_BACKOFF_MS);
             if fresh || backing_off {
-                return Ok(engine.clone());
+                return Ok(cached.engine.clone());
             }
         }
 
-        let outcome = send(
-            cfg,
-            Method::Get,
-            &cfg.policies_url(),
-            None,
-            etag.as_deref().filter(|_| cached.is_some()),
-        )
-        .await
-        .map_err(|e| format!("policies fetch failed: {e}"));
+        let generation = POLICY_CACHE.with(|cache| cache.borrow_mut().begin_refresh());
+        let etag = cached.as_ref().and_then(|cached| cached.etag.clone());
+
+        let outcome = send(cfg, Method::Get, &cfg.policies_url(), None, etag.as_deref())
+            .await
+            .map_err(|e| format!("policies fetch failed: {e}"));
 
         let parsed: core::result::Result<Option<(PolicyBundle, Option<String>)>, String> =
             match outcome {
@@ -608,46 +819,45 @@ mod wasm_io {
         match parsed {
             // 304: the cached set is still current; reset its freshness clock.
             Ok(None) => {
-                let engine = cached.ok_or_else(|| {
+                let cached = cached.as_ref().ok_or_else(|| {
                     "policies fetch returned 304 with no cached policy set".to_string()
                 })?;
-                POLICY_CACHE.with(|c| {
-                    if let Some(p) = c.borrow_mut().as_mut().filter(|p| p.key == key) {
-                        p.fetched_ms = now_ms();
-                        p.last_error_ms = None;
-                    }
+                let (engine, _applied) = POLICY_CACHE.with(|cache| {
+                    cache
+                        .borrow_mut()
+                        .refresh_not_modified(generation, &key, cached, now_ms())
                 });
                 Ok(engine)
             }
             Ok(Some((bundle, new_etag))) => {
-                let engine = Rc::new(PolicyEngine::from_bundle(&bundle, opts));
+                let (engine, _applied) = POLICY_CACHE.with(|cache| {
+                    cache.borrow_mut().refresh_modified(
+                        generation,
+                        &key,
+                        bundle,
+                        opts,
+                        new_etag,
+                        now_ms(),
+                    )
+                });
                 for rejected in engine.rejected_policies() {
                     console_error!("Nova Guard: platform policy rejected: {rejected}");
                 }
-                POLICY_CACHE.with(|c| {
-                    *c.borrow_mut() = Some(CachedPolicies {
-                        key: key.clone(),
-                        engine: engine.clone(),
-                        etag: new_etag,
-                        fetched_ms: now_ms(),
-                        last_error_ms: None,
-                    });
-                });
                 Ok(engine)
             }
             Err(e) => {
-                POLICY_CACHE.with(|c| {
-                    if let Some(p) = c.borrow_mut().as_mut().filter(|p| p.key == key) {
-                        p.last_error_ms = Some(now_ms());
-                    }
+                POLICY_CACHE.with(|cache| {
+                    cache
+                        .borrow_mut()
+                        .refresh_failed(generation, &key, now_ms());
                 });
                 match cached {
                     // Keep enforcing what we last knew; say so loudly.
-                    Some(engine) => {
+                    Some(cached) => {
                         console_warn!(
                             "Nova Guard: platform policy refresh failed ({e}); keeping the last known policy set"
                         );
-                        Ok(engine)
+                        Ok(cached.engine)
                     }
                     None => Err(e),
                 }
@@ -866,6 +1076,127 @@ pub use wasm_io::{admit, effective_engine, live_state, settle};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_test_bundle() -> crate::policy::config::PolicyBundle {
+        crate::policy::config::PolicyBundle::from_json_str(
+            r#"{
+                "policies": [{
+                    "id": "cache-block",
+                    "name": "cache block",
+                    "type": "regex_match",
+                    "enabled": true,
+                    "mode": "enforce",
+                    "config": {
+                        "phase": "input",
+                        "patterns": [{"name": "blocked", "regex": "blocked"}],
+                        "action": "block"
+                    }
+                }]
+            }"#,
+        )
+        .expect("cache test bundle parses")
+    }
+
+    fn cache_test_options(enabled: bool) -> crate::policy::engine::EngineOptions {
+        crate::policy::engine::EngineOptions {
+            enabled,
+            live_state_backed: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn worker_assumed_output_token_binding_uses_a_positive_integer_or_the_native_default() {
+        assert_eq!(assumed_output_tokens_from_value(Some("128000")), 128_000);
+        assert_eq!(assumed_output_tokens_from_value(Some(" 2048 ")), 2_048);
+        for invalid in [None, Some(""), Some("0"), Some("-1"), Some("many")] {
+            assert_eq!(
+                assumed_output_tokens_from_value(invalid),
+                crate::policy::pricing::DEFAULT_ASSUMED_OUTPUT_TOKENS,
+                "binding {invalid:?} must retain the established native default"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_only_false_to_true_recompiles_the_raw_bundle_even_on_304() {
+        let key = "platform/project";
+        let disabled = cache_test_options(false);
+        let enabled = cache_test_options(true);
+        let mut cache = PolicyCache::default();
+
+        let initial = cache.begin_refresh();
+        let (engine, applied) = cache.refresh_modified(
+            initial,
+            key,
+            cache_test_bundle(),
+            disabled.clone(),
+            Some("\"same-policy\"".to_string()),
+            1.0,
+        );
+        assert!(applied);
+        assert!(!engine.is_enabled());
+
+        // Cloudflare can apply a binding-only deployment without replacing the
+        // isolate. The next request therefore carries new EngineOptions while
+        // the platform policy ETag is unchanged and answers 304.
+        let rebound = cache
+            .cached(key, &enabled, 100_000.0)
+            .expect("the raw bundle remains cached");
+        assert!(rebound.recompiled);
+        assert_eq!(rebound.fetched_ms, 1.0);
+        assert_eq!(rebound.last_error_ms, None);
+        assert!(rebound.engine.is_enabled());
+        assert_eq!(rebound.engine.active_policy_count(), 1);
+        assert_eq!(rebound.etag.as_deref(), Some("\"same-policy\""));
+
+        let revalidation = cache.begin_refresh();
+        let (engine, applied) = cache.refresh_not_modified(revalidation, key, &rebound, 100_001.0);
+        assert!(applied);
+        assert!(engine.is_enabled());
+        assert_eq!(engine.active_policy_count(), 1);
+    }
+
+    #[test]
+    fn delayed_older_policy_refresh_cannot_replace_a_faster_newer_result() {
+        let key = "platform/project";
+        let options = cache_test_options(true);
+        let mut cache = PolicyCache::default();
+
+        // Deterministic completion order: the old request starts first but its
+        // response is delayed; the later request installs the new policy first.
+        let delayed_old = cache.begin_refresh();
+        let fast_new = cache.begin_refresh();
+        let (new_engine, new_applied) = cache.refresh_modified(
+            fast_new,
+            key,
+            cache_test_bundle(),
+            options.clone(),
+            Some("\"new\"".to_string()),
+            2.0,
+        );
+        assert!(new_applied);
+        assert_eq!(new_engine.active_policy_count(), 1);
+
+        let (old_engine, old_applied) = cache.refresh_modified(
+            delayed_old,
+            key,
+            crate::policy::config::PolicyBundle::default(),
+            options.clone(),
+            Some("\"old\"".to_string()),
+            3.0,
+        );
+        assert!(!old_applied, "the delayed response must lose the CAS");
+        assert_eq!(old_engine.active_policy_count(), 0);
+        cache.refresh_failed(delayed_old, key, 3.5);
+
+        let current = cache
+            .cached(key, &options, 4.0)
+            .expect("the newer result remains installed");
+        assert_eq!(current.engine.active_policy_count(), 1);
+        assert_eq!(current.etag.as_deref(), Some("\"new\""));
+        assert_eq!(current.last_error_ms, None);
+    }
 
     // -- configuration matrix -------------------------------------------------
 
