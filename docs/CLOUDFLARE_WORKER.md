@@ -79,9 +79,9 @@ previously proven by compilation alone.
 It needs no Cloudflare account, no Noveum backend and no provider key.
 `scripts/novaguard_mock_platform.py` plays the control plane plus the OpenAI and
 Anthropic upstreams. The Worker is pointed at it with `NOVEUM_API_URL`,
-`OPENAI_BASE_URL`, and `ANTHROPIC_BASE_URL`. Ten phases use fresh isolates where
-policy changes require them (a restart is how the 60-second in-isolate policy
-cache is dropped):
+`OPENAI_BASE_URL`, and `ANTHROPIC_BASE_URL`. The 13 phases start fresh isolates
+whenever policy changes require them (a restart is how the 60-second in-isolate
+policy cache is dropped):
 
 | Phase | Proves |
 |---|---|
@@ -94,7 +94,10 @@ cache is dropped):
 | 7. Guarded Anthropic + pricing parity | Translated terminal usage settles the platform reservation at authoritative counts; strict admission also prices Sonnet 5's 1-hour cache-write premium, omitted-geo 1.1x reservation, and the active Opus 5 row rather than a token-only approximation |
 | 8. Concurrent agents | 16 mixed OpenAI/Anthropic, buffered/streaming callers overlap by default (`CONCURRENT_CLIENTS` may be 12, 16, or 20); each gets one admission and exactly one completion, with no leaked active hold |
 | 9. Strict-policy selection and bounded input | A real workerd matrix proves only enforcing, blocking, in-scope strict caps require an output bound; advisory, shadow, and out-of-scope cases remain allowed. Admission measures the exact transformed upstream JSON, adds the separate 4,096-token reserve only for client tools, and rejects 15 opaque or premium strict-input shapes before `/admit` or the provider |
-| 10. Reservation lease safety | A deliberately slow SSE call is terminated and abandoned before a shortened test lease can expire; a follow-up request receives a new reservation, while the live first reservation is never reaped or double-spent |
+| 10. Rate-only strict input | Opaque request bodies are rejected before admission/provider dispatch, and admission outages independently honor the rate policy's `failClosed` setting |
+| 11. Reservation lease safety | A deliberately slow SSE call is terminated and abandoned before a shortened test lease can expire; a follow-up request receives a new reservation, while the live first reservation is never reaped or double-spent |
+| 12. Worker output-token binding | `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS=128000` drives both `/admit.maximumOutputTokens` and an unbounded Anthropic request's upstream `max_tokens` |
+| 13. Policy refresh ordering | A delayed older refresh cannot replace the blocking policy installed by a faster newer refresh in the same isolate |
 
 Phase 1 is the one worth reading the output of. A `gpt-4o` request with
 `max_tokens: 4096` reserves `$0.040965` up front and settles at `$0.0000675` —
@@ -280,9 +283,12 @@ name every admission block, fail-closed decision, and abandoned settlement.
 | Spend looks ~100x too high on streaming | `stream_options.include_usage` was stripped by something between the Worker and the provider, so streams settle at their estimate | Check `wrangler tail` for `abandon` settlements on streaming requests. |
 | `reservation … gave up after 3 attempts` in the logs | Settlement could not reach the platform | The hold expires server-side at `expiresAt` — conservatively, i.e. still counted until then. No action beyond fixing connectivity. |
 
-Deleting the bridge is symmetrical: delete **both** values with
-`npx --yes wrangler@4.120.0 secret delete ...`. Removing only one leaves a
-half-applied configuration, which is a deliberate 503.
+Removing the bridge means removing **both** values. Delete the API key with
+`npx --yes wrangler@4.120.0 secret delete NOVEUM_API_KEY`. If
+`NOVEUM_GUARD_PROJECT_ID` is also a secret, delete it with
+`npx --yes wrangler@4.120.0 secret delete NOVEUM_GUARD_PROJECT_ID`; if it is the
+usual `[vars]` entry, remove that entry from `wrangler.toml` and redeploy. During
+any half-applied interval the Worker deliberately returns 503.
 
 ## Implemented edge behavior and verification scope
 
@@ -351,7 +357,7 @@ Note the redact replacement key is **`redactWith`** (see `wrangler.toml`).
 
 The PR's reproducible evidence is local/CI evidence: wasm compilation,
 `worker-build --release`, `wrangler deploy --dry-run`, native unit/integration
-tests, and the nine-phase hermetic `workerd` suite. That suite exercises actual
+tests, and the 13-phase hermetic `workerd` suite. That suite exercises actual
 `worker::Fetch`, Anthropic translation, `ctx.wait_until`, concurrent agents,
 stream settlement, and strict-policy selection against mocks. It does **not**
 claim that this exact working tree has been published to or smoke-tested on a

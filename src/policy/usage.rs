@@ -506,9 +506,9 @@ where
             return;
         }
         let n = batch.len();
-        queue.in_flight.store(n, Ordering::Relaxed);
+        queue.in_flight.fetch_add(n, Ordering::Relaxed);
         let delivered = send(batch).await;
-        queue.in_flight.store(0, Ordering::Relaxed);
+        queue.in_flight.fetch_sub(n, Ordering::Relaxed);
         let counter = if delivered {
             &queue.delivered
         } else {
@@ -912,6 +912,66 @@ mod tests {
         assert_eq!(outcome.delivered, 0);
         assert_eq!(outcome.failed, 3);
         assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn concurrent_drains_add_all_in_flight_batches() {
+        let total = MAX_BATCH + 1;
+        let q = Arc::new(UsageQueue::new(total));
+        for i in 0..total {
+            q.push(ev(&format!("e{i}")));
+        }
+
+        let entered = Arc::new(tokio::sync::Barrier::new(3));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut drains = Vec::new();
+        for _ in 0..2 {
+            let q = q.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            drains.push(tokio::spawn(async move {
+                drain_pending(&q, move |_batch| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        entered.wait().await;
+                        let permit = release
+                            .acquire_owned()
+                            .await
+                            .expect("test release semaphore stays open");
+                        permit.forget();
+                        true
+                    }
+                })
+                .await;
+            }));
+        }
+
+        // Both drainers have removed disjoint batches from `pending` and are
+        // blocked in their sinks. `in_flight` must be their sum, not whichever
+        // drainer wrote last.
+        entered.wait().await;
+        assert_eq!(q.unconfirmed(), total);
+
+        // Let one drainer finish while the other remains blocked. Completing
+        // one batch must subtract only its own count, never clear the other.
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while q.delivered.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one drain should complete");
+        let delivered = q.delivered.load(Ordering::Relaxed) as usize;
+        assert_eq!(q.unconfirmed(), total - delivered);
+
+        release.add_permits(1);
+        for drain in drains {
+            drain.await.unwrap();
+        }
+        assert_eq!(q.unconfirmed(), 0);
+        assert_eq!(q.delivered.load(Ordering::Relaxed) as usize, total);
     }
 
     /// Shutdown must not be able to hang the process: an unresponsive sink is

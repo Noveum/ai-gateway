@@ -65,6 +65,8 @@ Config via env:
   MOCK_NO_POLICIES       return an empty effective policy set (default 0)
   MOCK_POLICY_MODE       explicit policy mode: ENFORCE | SHADOW | OFF
                          (default absent/null, which the platform treats as enforce)
+  MOCK_ENFORCEMENT_MODE  cost_cap enforcement: STRICT | ADVISORY
+                         (default absent/null, using the in-process ledger)
   MOCK_SCOPE_TO_MODELS   comma-separated cost-cap model scope (default absent)
   MOCK_EXPAND_REDACT_WITH_LEN
                          when positive, add an input REGEX_MATCH policy that

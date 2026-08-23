@@ -16,7 +16,7 @@
       "runtimeExecutable": "bash",
       "runtimeArgs": [
         "-lc",
-        "export PATH=\"$HOME/.nvm/versions/node/v24.14.1/bin:$PATH\"; exec npx wrangler@4.120.0 dev --port \"$PORT\""
+        "exec npx --yes wrangler@4.120.0 dev --port \"$PORT\""
       ],
       "port": 8787,
       "autoPort": true

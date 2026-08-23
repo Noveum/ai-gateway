@@ -482,7 +482,9 @@ implemented here:
 - exact audit persistence for gateway `pricingVersion` and `costBreakdown`;
 - metering ownership for requests spanning advisory/strict policy hot swaps;
 - graceful-shutdown draining of detached exporters and shared tenant reporters;
-- Worker policy-refresh timeout, singleflight, and monotonic stale-write guard;
+- Worker policy-refresh timeout and singleflight (the implemented monotonic
+  generation guard prevents a delayed older refresh from replacing newer state
+  but does not coalesce concurrent fetches);
 - cross-replica atomic admission for native rate-only policies (current native
   rate enforcement remains advisory and may overshoot during refresh windows).
 

@@ -220,7 +220,7 @@ the table below describes **this gateway's implementation**.
 | Input | Gateway behavior |
 |---|---|
 | `model`, `stream` | Forwarded to Anthropic |
-| `max_tokens`, `max_completion_tokens`, `max_output_tokens` | First non-null value wins and becomes Anthropic `max_tokens`; it must be a positive integer. If all are absent and no applicable strict Nova Guard cap requires a real bound, the gateway supplies `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` (default `1024`) |
+| `max_tokens`, `max_completion_tokens`, `max_output_tokens` | Strict Nova Guard admission requires all supplied non-null aliases to agree and rejects conflicts; otherwise the first non-null value wins and becomes Anthropic `max_tokens`. The selected value must be a positive integer. If all are absent and no applicable strict Nova Guard cap requires a real bound, the gateway supplies `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` (default `1024`) |
 | `temperature` | For constrained families, omit it or use exactly `1`. For other models it must be non-negative; values above `1` are capped at `1` |
 | `top_p`, `top_k` | Forwarded for models that accept them. Constrained families require omitted or `0.99`–`1` `top_p` and reject any `top_k` |
 | `stop` | String or string array converted to `stop_sequences`, unless `stop_sequences` is already present |

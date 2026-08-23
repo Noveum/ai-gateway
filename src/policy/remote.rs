@@ -8,6 +8,7 @@
 //! [`crate::policy::platform`]; this module is the native HTTP + cache layer.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -822,6 +823,11 @@ struct ResolverSlot {
     entry: Mutex<Option<(CachedIdentity, Instant)>>,
 }
 
+struct ResolverCacheEntry {
+    slot: Arc<ResolverSlot>,
+    access_order: u64,
+}
+
 /// Resolves a caller credential to the tenant it may act as, with a TTL cache.
 ///
 /// One async slot per credential means the resolution is single-flighted per
@@ -833,7 +839,8 @@ pub struct TenantResolver {
     deny_ttl: Duration,
     budget: Duration,
     max_entries: usize,
-    slots: std::sync::Mutex<HashMap<CredentialCacheKey, Arc<ResolverSlot>>>,
+    access_order: AtomicU64,
+    slots: std::sync::Mutex<HashMap<CredentialCacheKey, ResolverCacheEntry>>,
 }
 
 impl TenantResolver {
@@ -844,6 +851,7 @@ impl TenantResolver {
             deny_ttl: TENANT_DENY_TTL,
             budget: RESOLVE_BUDGET,
             max_entries,
+            access_order: AtomicU64::new(0),
             slots: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -926,23 +934,43 @@ impl TenantResolver {
 
     fn slot(&self, cache_key: &CredentialCacheKey) -> Arc<ResolverSlot> {
         let mut slots = self.slots.lock().expect("tenant resolver lock poisoned");
-        if let Some(slot) = slots.get(cache_key) {
-            return slot.clone();
+        let access_order = self.access_order.fetch_add(1, Ordering::Relaxed);
+        if let Some(entry) = slots.get_mut(cache_key) {
+            entry.access_order = access_order;
+            return entry.slot.clone();
         }
-        // Cheap bound: a flood of distinct invalid keys must not grow this map
-        // without limit. Slots are tiny and re-created on demand, so clearing
-        // is safe (at worst it costs one extra platform call per live tenant).
+        // A flood of distinct invalid keys must not grow this map without
+        // limit, but pressure from one key must not flush every live tenant and
+        // turn their next requests into a resolution stampede. Evict exactly
+        // the least recently used slot; ties are deterministic and never log a
+        // credential-derived cache key.
         if slots.len() >= self.max_entries {
-            warn!(
-                entries = slots.len(),
-                "Nova Guard: credential resolution cache full; clearing it"
-            );
-            slots.clear();
+            let lru = slots
+                .iter()
+                .min_by(|(a_key, a), (b_key, b)| {
+                    a.access_order
+                        .cmp(&b.access_order)
+                        .then_with(|| a_key.cmp(b_key))
+                })
+                .map(|(key, _)| *key);
+            if let Some(lru) = lru {
+                slots.remove(&lru);
+                warn!(
+                    entries = slots.len(),
+                    "Nova Guard: credential resolution cache full; evicting its least recently used slot"
+                );
+            }
         }
         let slot = Arc::new(ResolverSlot {
             entry: Mutex::new(None),
         });
-        slots.insert(*cache_key, slot.clone());
+        slots.insert(
+            *cache_key,
+            ResolverCacheEntry {
+                slot: slot.clone(),
+                access_order,
+            },
+        );
         slot
     }
 
@@ -1362,9 +1390,20 @@ struct PendingEntry {
 /// completed-entry pruning walks only the expired prefix, active entries are
 /// bounded by in-flight concurrency). This is per-process: a true
 /// cross-instance guarantee needs an atomic reservation on the platform side.
-#[derive(Default)]
 pub struct PendingSpend {
     inner: std::sync::Mutex<PendingInner>,
+    completed_ttl: Duration,
+    active_reservation_max_age: Duration,
+}
+
+impl Default for PendingSpend {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(PendingInner::default()),
+            completed_ttl: PENDING_SPEND_TTL,
+            active_reservation_max_age: ACTIVE_RESERVATION_MAX_AGE,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1386,9 +1425,9 @@ impl PendingInner {
         totals.tokens = totals.tokens.saturating_sub(e.tokens);
     }
 
-    fn prune(&mut self) {
+    fn prune(&mut self, completed_ttl: Duration, active_reservation_max_age: Duration) {
         while let Some(front) = self.completed.front() {
-            if front.at.elapsed() >= PENDING_SPEND_TTL {
+            if front.at.elapsed() >= completed_ttl {
                 let e = self.completed.pop_front().expect("front just checked");
                 Self::subtract(&mut self.totals, &e);
             } else {
@@ -1399,7 +1438,7 @@ impl PendingInner {
         // bounded by in-flight concurrency, so the scan is cheap.
         let mut totals = self.totals;
         self.active.retain(|e| {
-            let leaked = e.at.elapsed() >= ACTIVE_RESERVATION_MAX_AGE;
+            let leaked = e.at.elapsed() >= active_reservation_max_age;
             if leaked {
                 warn!(
                     reservation = e.id,
@@ -1421,13 +1460,25 @@ impl PendingSpend {
         Self::default()
     }
 
+    /// Production uses the constants above; tests inject zero/short durations
+    /// so both expiry paths are covered without sleeping for 45 seconds or 15
+    /// minutes (or depending on scheduler timing).
+    #[cfg(test)]
+    fn with_ttls(completed_ttl: Duration, active_reservation_max_age: Duration) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(PendingInner::default()),
+            completed_ttl,
+            active_reservation_max_age,
+        }
+    }
+
     /// Atomically reserve this request's estimated usage (cost, one request,
     /// estimated tokens) and return `(reservation_id, other_pending_totals)` —
     /// the totals of every *other* un-expired reservation, to be folded into
     /// the counters the policy engine evaluates.
     pub fn reserve(&self, cost_usd: f64, tokens: u64) -> (u64, PendingTotals) {
         let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
-        inner.prune();
+        inner.prune(self.completed_ttl, self.active_reservation_max_age);
         let others = inner.totals;
         let id = inner.next_id;
         inner.next_id += 1;
@@ -1483,7 +1534,7 @@ impl PendingSpend {
     /// Current un-expired pending totals (prunes expired entries).
     pub fn sum(&self) -> PendingTotals {
         let mut inner = self.inner.lock().expect("pending-spend lock poisoned");
-        inner.prune();
+        inner.prune(self.completed_ttl, self.active_reservation_max_age);
         inner.totals
     }
 }
@@ -1730,8 +1781,9 @@ mod tests {
         let p = PendingSpend::new();
         let (r, _) = p.reserve(0.01, 10);
         // Active entries never age out via the completed-prefix pruning; the
-        // reservation is still counted regardless of admission age (the
-        // 15-minute leak backstop is not reachable in a unit test).
+        // reservation is still counted here; production's 15-minute leak
+        // backstop has not elapsed (its expiry path is covered below with an
+        // injected test duration).
         assert_eq!(p.sum().requests, 1);
         // Completing moves it to the TTL'd set — still counted immediately
         // after completion (the usage hasn't landed in /state yet).
@@ -1741,6 +1793,33 @@ mod tests {
         p.complete(r);
         p.release(r);
         assert_eq!(p.sum().requests, 1);
+    }
+
+    #[test]
+    fn completed_reservations_expire_at_the_configured_ttl() {
+        let p = PendingSpend::with_ttls(Duration::ZERO, ACTIVE_RESERVATION_MAX_AGE);
+        let (reservation, _) = p.reserve(0.01, 10);
+        p.complete(reservation);
+
+        assert_eq!(
+            p.sum(),
+            PendingTotals::default(),
+            "a completed reservation must stop counting after its TTL"
+        );
+        assert_eq!(p.active_count(), 0);
+    }
+
+    #[test]
+    fn leaked_active_reservations_are_reaped_and_totals_are_reset() {
+        let p = PendingSpend::with_ttls(PENDING_SPEND_TTL, Duration::ZERO);
+        p.reserve(0.01, 10);
+
+        assert_eq!(
+            p.sum(),
+            PendingTotals::default(),
+            "the active-reservation backstop must remove every reserved dimension"
+        );
+        assert_eq!(p.active_count(), 0, "the leaked active entry must be gone");
     }
 
     // ---------------------------------------------------------------
@@ -2161,6 +2240,70 @@ mod tests {
         assert_eq!(first.organization_id, "org_first");
         assert_eq!(second.organization_id, "org_second");
         assert_eq!(second.projects, vec!["project_second"]);
+    }
+
+    #[tokio::test]
+    async fn resolver_cache_pressure_evicts_only_the_least_recently_used_credential() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const HOT: &str = "nv_hot";
+        const COLD: &str = "nv_cold";
+        const NEW: &str = "nv_new";
+
+        let server = MockServer::start().await;
+        for (key, project) in [(HOT, "hot"), (COLD, "cold"), (NEW, "new")] {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/projects/guardrails/resolve"))
+                .and(header("authorization", format!("Bearer {key}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "id": project,
+                        "organizationId": "org",
+                    }])),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let resolver = TenantResolver::with_timings(
+            server.uri(),
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+            2,
+        );
+        resolver.resolve(HOT).await.unwrap();
+        resolver.resolve(COLD).await.unwrap();
+        resolver.resolve(HOT).await.unwrap(); // make HOT the most recently used
+        resolver.resolve(NEW).await.unwrap(); // overfill by one
+        resolver.resolve(HOT).await.unwrap(); // must still be cached
+        assert_eq!(
+            resolver
+                .slots
+                .lock()
+                .expect("tenant resolver lock poisoned")
+                .len(),
+            2,
+            "selective eviction must still enforce the configured bound"
+        );
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let hot_authorization = format!("Bearer {HOT}");
+        let hot_requests = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(hot_authorization.as_str())
+            })
+            .count();
+        assert_eq!(
+            hot_requests, 1,
+            "overfilling the cache must not flush a recently used credential"
+        );
     }
 
     #[test]

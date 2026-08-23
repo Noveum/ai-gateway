@@ -44,7 +44,7 @@ production Cloudflare account. The reproducible PR evidence is:
 1. native formatting, lint, build, and hermetic tests;
 2. wasm compilation and `worker-build --release`;
 3. `wrangler deploy --dry-run`; and
-4. `scripts/novaguard_worker_e2e.sh`, a nine-phase suite running the generated
+4. `scripts/novaguard_worker_e2e.sh`, a 13-phase suite running the generated
    bundle in real local `workerd` against mock Noveum, OpenAI, and Anthropic
    upstreams.
 

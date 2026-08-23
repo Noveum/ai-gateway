@@ -478,14 +478,57 @@ mod tests {
     /// A guard that is simply dropped must abandon (estimate retained), never
     /// silently vanish and never cancel (which would release a hold for a call
     /// that may have reached the provider).
-    #[test]
-    fn drop_defaults_to_abandon() {
-        let settlement = Settlement::Abandon("x".into());
-        assert_eq!(settlement.endpoint(), "abandon");
-        // The default is constructed in `Drop`; assert the same choice here so
-        // a future edit that flips it to `cancel` fails a test.
-        let default_on_drop =
-            Settlement::Abandon("request ended without authoritative usage".to_string());
-        assert_eq!(default_on_drop.endpoint(), "abandon");
+    #[tokio::test]
+    async fn drop_defaults_to_abandon() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let expected_path = "/api/v1/projects/proj_1/policies/reservations/res-drop/abandon";
+        Mock::given(method("POST"))
+            .and(path(expected_path))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = Arc::new(AdmissionClient::new(
+            RemoteConfig {
+                base_url: server.uri(),
+                ..test_cfg()
+            },
+            None,
+        ));
+        drop(AdmissionGuard::new(client, "res-drop".into()));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let requests = server.received_requests().await.unwrap_or_default();
+                if requests
+                    .iter()
+                    .any(|request| request.url.path() == expected_path)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping an undecided guard must settle through /abandon");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == expected_path)
+                .count(),
+            1,
+            "Drop must abandon the held reservation exactly once"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/cancel")),
+            "Drop must never release a hold for a call that may have reached the provider"
+        );
     }
 }

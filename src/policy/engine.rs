@@ -998,59 +998,68 @@ impl PolicyEngine {
                         state.tokens_by_window.get(period).copied()
                     }
                 };
+                let mut unavailable_action = None;
                 for w in &rl.config.windows {
                     if let Some(max) = w.max_requests {
-                        let Some(count) = requests_for(&w.period) else {
-                            return self.unavailable_state_decision(
-                                &rl.meta,
-                                "rate_limit",
-                                w.action,
-                                false,
-                            );
-                        };
-                        if count >= max {
-                            let mut d = PolicyDecision::allow(
-                                &rl.meta.id,
-                                &rl.meta.name,
-                                "rate_limit",
-                                rl.meta.mode,
-                            );
-                            d.flagged = true;
-                            d.score = 1.0;
-                            d.severity = Severity::High;
-                            d.action = w.action;
-                            d.reason =
-                                format!("requests {count} reached limit {max} per {}", w.period);
-                            return d;
+                        match requests_for(&w.period) {
+                            Some(count) if count >= max => {
+                                let mut d = PolicyDecision::allow(
+                                    &rl.meta.id,
+                                    &rl.meta.name,
+                                    "rate_limit",
+                                    rl.meta.mode,
+                                );
+                                d.flagged = true;
+                                d.score = 1.0;
+                                d.severity = Severity::High;
+                                d.action = w.action;
+                                d.reason = format!(
+                                    "requests {count} reached limit {max} per {}",
+                                    w.period
+                                );
+                                return d;
+                            }
+                            Some(_) => {}
+                            None => {
+                                unavailable_action.get_or_insert(w.action);
+                            }
                         }
                     }
                     if let Some(max) = w.max_tokens {
-                        let Some(count) = tokens_for(&w.period) else {
-                            return self.unavailable_state_decision(
-                                &rl.meta,
-                                "rate_limit",
-                                w.action,
-                                false,
-                            );
-                        };
-                        if count >= max {
-                            let mut d = PolicyDecision::allow(
-                                &rl.meta.id,
-                                &rl.meta.name,
-                                "rate_limit",
-                                rl.meta.mode,
-                            );
-                            d.flagged = true;
-                            d.score = 1.0;
-                            d.severity = Severity::High;
-                            d.action = w.action;
-                            d.reason =
-                                format!("tokens {count} reached limit {max} per {}", w.period);
-                            return d;
+                        match tokens_for(&w.period) {
+                            Some(count) if count >= max => {
+                                let mut d = PolicyDecision::allow(
+                                    &rl.meta.id,
+                                    &rl.meta.name,
+                                    "rate_limit",
+                                    rl.meta.mode,
+                                );
+                                d.flagged = true;
+                                d.score = 1.0;
+                                d.severity = Severity::High;
+                                d.action = w.action;
+                                d.reason =
+                                    format!("tokens {count} reached limit {max} per {}", w.period);
+                                return d;
+                            }
+                            Some(_) => {}
+                            None => {
+                                unavailable_action.get_or_insert(w.action);
+                            }
                         }
                     }
                 }
-                PolicyDecision::allow(&rl.meta.id, &rl.meta.name, "rate_limit", rl.meta.mode)
+                match unavailable_action {
+                    Some(action) => {
+                        self.unavailable_state_decision(&rl.meta, "rate_limit", action, false)
+                    }
+                    None => PolicyDecision::allow(
+                        &rl.meta.id,
+                        &rl.meta.name,
+                        "rate_limit",
+                        rl.meta.mode,
+                    ),
+                }
             }
             None => {
                 self.unavailable_state_decision(&rl.meta, "rate_limit", PolicyAction::Block, false)
@@ -1554,14 +1563,7 @@ mod tests {
     /// it. `failClosed` is only honored in this shape — without a state backend
     /// `compile` deliberately neutralizes it (nothing could ever satisfy it).
     fn live_state_engine(json: &str) -> PolicyEngine {
-        let bundle = PolicyBundle::from_json_str(json).unwrap();
-        PolicyEngine::from_bundle(
-            &bundle,
-            EngineOptions {
-                live_state_backed: true,
-                ..Default::default()
-            },
-        )
+        backed_engine(json)
     }
 
     /// An org-scoped `cost_cap` at $100 over `30d_rolling`, on a live-state
@@ -1714,6 +1716,29 @@ mod tests {
         ls.requests_by_window.insert("1m".into(), 100);
         let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
         assert!(r.is_blocked());
+    }
+
+    #[test]
+    fn rate_limit_checks_later_windows_after_a_missing_counter() {
+        let e = engine(
+            r#"{"policies":[{"name":"rl","type":"rate_limit","mode":"enforce",
+            "config":{"windows":[
+              {"period":"1m","maxRequests":60,"action":"block"},
+              {"period":"1h","maxRequests":50,"action":"block"}
+            ]}}]}"#,
+        );
+        let mut ls = LiveState::default();
+        // The first window is unmeasurable, but the later one is definitively
+        // over its cap. A known block must outrank an unavailable-state allow.
+        ls.requests_by_window.insert("1h".into(), 50);
+
+        let r = e.evaluate(Phase::Input, "gpt-4o", "hi", None, None, Some(&ls));
+
+        assert!(r.is_blocked(), "the measurable 1h cap must still block");
+        assert!(
+            r.block.unwrap().reason.contains("per 1h"),
+            "the block must come from the later measurable window"
+        );
     }
 
     #[test]

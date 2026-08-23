@@ -25,6 +25,8 @@ MOCK_PORT="${MOCK_PORT:-8899}"
 CONCURRENT_CLIENTS="${CONCURRENT_CLIENTS:-16}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
+# shellcheck source=novaguard_worker_process.sh
+source "$ROOT/scripts/novaguard_worker_process.sh"
 [ -n "${NODE_BIN_DIR:-}" ] && PATH="$NODE_BIN_DIR:$PATH"
 # Keep the caller's tool ordering. CI and release validation intentionally put
 # their pinned `worker-build` ahead of any older global Cargo install; silently
@@ -107,13 +109,14 @@ expect_stat_at_least() {
 start_mock() {
   local log="$1"; shift
   if [ -n "$MOCK_PID" ]; then
-    kill "$MOCK_PID" 2>/dev/null
-    wait "$MOCK_PID" 2>/dev/null
+    worker_e2e_stop_process_and_port "$MOCK_PID" "$MOCK_PORT" || exit 1
     MOCK_PID=""
   fi
   env MOCK_PORT="$MOCK_PORT" "$@" python3 "$ROOT/scripts/novaguard_mock_platform.py" >"$log" 2>&1 &
   MOCK_PID=$!
-  disown "$MOCK_PID" 2>/dev/null   # keep phase restarts from printing job-control noise
+  # Detach only to suppress Bash job-termination notices. The next restart does
+  # not depend on job-table `wait`: it polls this PID and the listener port.
+  disown "$MOCK_PID" 2>/dev/null || true
   for _ in $(seq 1 40); do
     curl -sf -o /dev/null "http://127.0.0.1:$MOCK_PORT/__mock/stats" && return 0
     sleep 0.25

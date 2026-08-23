@@ -71,20 +71,33 @@ impl ProviderMetrics {
     /// output tokens in `message_delta`), so a later chunk must never wipe
     /// fields an earlier chunk already supplied.
     pub fn merge_streaming(&mut self, newer: ProviderMetrics) {
-        // A later chunk that REPLACES a populated model/token value without
-        // carrying a new cost invalidates any earlier cost — otherwise the
-        // final record pairs updated tokens with an obsolete price and the
-        // middleware never recomputes it (cost is still `Some`).
-        fn replaces<T: PartialEq + Copy>(old: Option<T>, new: Option<T>) -> bool {
-            matches!((old, new), (Some(a), Some(b)) if a != b)
+        // A later chunk that changes a priced value without carrying a usable
+        // cost invalidates any earlier cost. `None -> Some` counts as a change:
+        // Anthropic commonly supplies the input and output halves in separate
+        // events, so the first event's input-only cost is stale once output
+        // tokens arrive.
+        fn changes<T: PartialEq + Copy>(old: Option<T>, new: Option<T>) -> bool {
+            matches!(new, Some(value) if old != Some(value))
         }
         let model_replaced = !Self::is_placeholder_model(&newer.model)
             && !Self::is_placeholder_model(&self.model)
             && newer.model != self.model;
-        let cost_is_stale = newer.cost.is_none()
-            && (model_replaced
-                || replaces(self.input_tokens, newer.input_tokens)
-                || replaces(self.output_tokens, newer.output_tokens));
+        // Extractors use a placeholder when a chunk does not carry a model.
+        // If the accumulator already has a real model, a cost calculated under
+        // that placeholder is not authoritative for the model we retain.
+        let placeholder_cost_mismatch = Self::is_placeholder_model(&newer.model)
+            && !Self::is_placeholder_model(&self.model)
+            && newer.cost.is_some();
+        let priced_values_changed = model_replaced
+            || changes(self.input_tokens, newer.input_tokens)
+            || changes(self.output_tokens, newer.output_tokens);
+        let cost_is_stale =
+            priced_values_changed && (newer.cost.is_none() || placeholder_cost_mismatch);
+        let newer_cost = if placeholder_cost_mismatch {
+            None
+        } else {
+            newer.cost
+        };
 
         if (!Self::is_placeholder_model(&newer.model) || Self::is_placeholder_model(&self.model))
             && !newer.model.is_empty()
@@ -97,7 +110,7 @@ impl ProviderMetrics {
         self.cost = if cost_is_stale {
             None // downstream recomputes from the merged model + tokens
         } else {
-            newer.cost.or(self.cost)
+            newer_cost.or(self.cost)
         };
         self.request_id = newer.request_id.or(self.request_id.take());
         self.project_id = newer.project_id.or(self.project_id.take());
@@ -349,6 +362,58 @@ mod tests {
     }
 
     #[test]
+    fn merge_streaming_rejects_a_placeholder_models_cost_for_a_real_model() {
+        let mut acc = ProviderMetrics {
+            model: "claude-sonnet-5".to_string(),
+            input_tokens: Some(13),
+            cost: Some(0.000_039),
+            ..Default::default()
+        };
+
+        acc.merge_streaming(ProviderMetrics {
+            model: "claude".to_string(),
+            cost: Some(9.99),
+            ..Default::default()
+        });
+
+        assert_eq!(acc.model, "claude-sonnet-5");
+        assert_eq!(
+            acc.cost,
+            Some(0.000_039),
+            "a cost computed for a placeholder model must not replace the real model's cost"
+        );
+    }
+
+    #[test]
+    fn merge_streaming_clears_cost_when_a_placeholder_chunk_adds_priced_tokens() {
+        // Anthropic's message_start can price the input side under the real
+        // model, while message_delta adds output tokens under the extractor's
+        // `claude` placeholder. The placeholder chunk's own cost cannot be
+        // paired with the retained real model; the merged view must be repriced.
+        let mut acc = ProviderMetrics {
+            model: "claude-sonnet-5".to_string(),
+            input_tokens: Some(13),
+            cost: Some(0.000_039),
+            ..Default::default()
+        };
+
+        acc.merge_streaming(ProviderMetrics {
+            model: "claude".to_string(),
+            output_tokens: Some(4),
+            cost: Some(9.99),
+            ..Default::default()
+        });
+
+        assert_eq!(acc.model, "claude-sonnet-5");
+        assert_eq!(acc.input_tokens, Some(13));
+        assert_eq!(acc.output_tokens, Some(4));
+        assert_eq!(
+            acc.cost, None,
+            "changed billable tokens must force downstream repricing"
+        );
+    }
+
+    #[test]
     fn merge_streaming_invalidates_cost_when_tokens_are_replaced() {
         // A later chunk replaces a populated token count without carrying a new
         // cost: the earlier cost is now stale and must be cleared so the
@@ -388,6 +453,7 @@ mod tests {
         assert_eq!(acc.cost, Some(0.01), "unchanged tokens keep the cost");
         // A newer chunk carrying its own cost always wins.
         acc.merge_streaming(ProviderMetrics {
+            model: "gpt-4o".to_string(),
             output_tokens: Some(9),
             cost: Some(0.02),
             ..Default::default()

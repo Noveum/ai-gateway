@@ -63,10 +63,32 @@ impl PolicyBundle {
         serde_json::from_str(s)
     }
 
-    /// The major version of the schema this bundle declares (default `1`).
-    fn declared_major(&self) -> Option<u32> {
-        let v = self.schema_version.as_deref()?;
-        v.split('.').next()?.parse().ok()
+    /// The major version of the schema this bundle declares.
+    ///
+    /// Absence is distinct from a present malformed value: only absence gets
+    /// the documented `1.0.0` default.
+    fn declared_major(&self) -> Result<Option<u32>, String> {
+        let Some(version) = self.schema_version.as_deref() else {
+            return Ok(None);
+        };
+        let components: Vec<_> = version.split('.').collect();
+        if components.len() != 3
+            || components.iter().any(|component| {
+                component.is_empty() || !component.chars().all(|c| c.is_ascii_digit())
+            })
+        {
+            return Err(format!(
+                "bundle declares malformed schemaVersion '{version}'; expected three numeric \
+                 components in MAJOR.MINOR.PATCH form"
+            ));
+        }
+        let major = components[0].parse::<u32>().map_err(|_| {
+            format!(
+                "bundle declares malformed schemaVersion '{version}'; its major component is \
+                 too large to compare with this build"
+            )
+        })?;
+        Ok(Some(major))
     }
 
     /// Validate every policy in the bundle against the checked-in schema.
@@ -95,7 +117,7 @@ impl PolicyBundle {
             .next()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
-        match self.declared_major() {
+        match self.declared_major()? {
             None => Ok(()),
             Some(major) if major == expected => Ok(()),
             Some(major) => Err(format!(
@@ -466,8 +488,9 @@ pub enum CostEnforcementMode {
 ///
 /// Lives here rather than in [`crate::policy::admission`] (which re-exports it)
 /// because both sides of the admission decision must agree, and one of those
-/// sides agree. Admission-outage handling additionally mirrors the platform's
-/// wire contract in
+/// sides is the wasm32 Worker, where the native admission module does not
+/// exist. Admission-outage handling additionally mirrors the platform's wire
+/// contract in
 /// [`PolicyEngine::admission_unavailable_decision`](crate::policy::engine::PolicyEngine::admission_unavailable_decision).
 pub fn resolve_strict(override_mode: Option<CostEnforcementMode>, policy_strict: bool) -> bool {
     match override_mode {
@@ -763,6 +786,31 @@ mod tests {
             PolicyBundle::from_json_str(r#"{"schemaVersion":"2.0.0","policies":[]}"#).unwrap();
         let err = future.schema_version_supported().unwrap_err();
         assert!(err.contains("2.0.0"), "{err}");
+    }
+
+    #[test]
+    fn malformed_present_schema_version_is_refused() {
+        for version in ["v2.0.0", "+1.0.0", "", "1.x.0", "1.0", "1.0.0.0"] {
+            let bundle = PolicyBundle::from_json_str(&format!(
+                r#"{{"schemaVersion":"{version}","policies":[]}}"#
+            ))
+            .unwrap();
+            let err = bundle
+                .schema_version_supported()
+                .expect_err("a present malformed schemaVersion must not be treated as absent");
+            assert!(err.contains(version), "{version:?}: {err}");
+            assert!(err.contains("malformed"), "{version:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn numeric_minor_and_patch_components_follow_the_json_schema_without_u32_limits() {
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"schemaVersion":"1.4294967296.999999999999999999999","policies":[]}"#,
+        )
+        .unwrap();
+
+        assert!(bundle.schema_version_supported().is_ok());
     }
 
     #[test]

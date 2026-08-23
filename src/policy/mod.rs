@@ -29,8 +29,8 @@ pub mod engine;
 /// parsing. Pure + sync, so it compiles for BOTH the native server and the
 /// wasm32 Worker and is testable without a runtime.
 pub mod metering;
-// Translation layer for Noveum platform NovaGuard policies + live state. Pure +
-// shared; the native HTTP fetch is in `crate::policy::remote`.
+/// Translation layer for Noveum platform NovaGuard policies + live state. Pure +
+/// shared; the native HTTP fetch is in `crate::policy::remote`.
 pub mod platform;
 pub mod pricing;
 /// Hand-maintained rate rows, matching `pricing/catalog.json`.
@@ -54,9 +54,9 @@ pub mod remote;
 /// can drift.
 pub mod admission_wire;
 
-// Cross-replica atomic admission (POST .../policies/admit + reservation
-// settlement). Strict-mode `cost_cap` enforcement calls this instead of the
-// per-process `remote::PendingSpend` ledger. Native-only (reqwest).
+/// Cross-replica atomic admission (POST .../policies/admit + reservation
+/// settlement). Strict-mode `cost_cap` enforcement calls this instead of the
+/// per-process `remote::PendingSpend` ledger. Native-only (reqwest).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admission;
 

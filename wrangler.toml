@@ -37,7 +37,7 @@ head_sampling_rate = 1
 # same schema as the native `nova-guard.json`) — uncomment the example below or,
 # for production, use a `wrangler secret` / Workers KV (see
 # docs/CLOUDFLARE_DEPLOYMENT.md). Optional: `NOVEUM_GUARD_BLOCK_RESPONSE_MODE`
-# (`guard_error` | `provider_error`).
+# (`synthetic_success` | `provider_error`).
 #
 # Example policy set exercising all three enforcement paths (do NOT enable
 # blindly on a shared deployment — it will block SSNs and redact phones/emails):
@@ -71,7 +71,7 @@ head_sampling_rate = 1
 #                                   IGNORED when the platform bridge below is
 #                                   configured (the platform is then the source
 #                                   of truth); the Worker logs a warning.
-#   NOVEUM_GUARD_BLOCK_RESPONSE_MODE  `guard_error` | `provider_error`.
+#   NOVEUM_GUARD_BLOCK_RESPONSE_MODE  `synthetic_success` | `provider_error`.
 #
 # Platform-managed Nova Guard (the "bridge"). BOTH are required, or neither —
 # exactly one, or either set to an empty string, is a configuration error and

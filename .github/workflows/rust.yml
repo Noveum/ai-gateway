@@ -51,10 +51,16 @@ jobs:
         run: cargo build --verbose
 
       # Run the hermetic suites by name rather than `cargo test`, which would
-      # also pull in `run_integration_tests` (that one needs live provider keys
-      # and belongs in the scheduled smoke workflow).
+      # also run the live-provider cases in `run_integration_tests`; those need
+      # real keys and belong in the scheduled smoke workflow. The filtered step
+      # below runs only that target's three network-free helper regressions.
       - name: Unit tests
         run: cargo test --lib
+
+      - name: Provider harness helper tests (no live calls)
+        run: |
+          cargo test --test run_integration_tests streaming_smoke_
+          cargo test --test run_integration_tests request_body_can_select_
 
       - name: Nova Guard platform integration tests
         run: cargo test --test novaguard_platform
@@ -145,6 +151,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
+
+      - name: Workerd mock restart lifecycle regression
+        run: bash scripts/novaguard_worker_process_test.sh
 
       - name: Install worker-build
         run: cargo install worker-build --version "${WORKER_BUILD_VERSION}" --locked

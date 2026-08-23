@@ -2101,7 +2101,7 @@ mod tests {
     // -- catalog integrity ------------------------------------------------
 
     #[test]
-    fn rate_rows_match_the_committed_catalog() {
+    fn rust_pricing_tables_match_the_committed_catalog() {
         const RATE_EPSILON: f64 = 1e-9;
 
         fn field<'a>(entry: &'a Value, id: &str, key: &str) -> &'a Value {
@@ -2419,6 +2419,48 @@ mod tests {
             "pricing/catalog.json has {} aliases but MODEL_ALIASES has {} entries",
             alias_entries.len(),
             catalog::MODEL_ALIASES.len()
+        );
+
+        let tool_fee_entries = parsed["toolFees"]
+            .as_array()
+            .expect("catalog `toolFees` is not an array");
+        for entry in tool_fee_entries {
+            let id = entry["id"]
+                .as_str()
+                .expect("catalog tool fee entry has no string `id`");
+            let (_, rust_fee) = catalog::TOOL_FEES_USD_PER_1K_CALLS
+                .iter()
+                .find(|(rust_id, _)| *rust_id == id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{id}: pricing/catalog.json declares a tool fee but \
+                         TOOL_FEES_USD_PER_1K_CALLS has no entry"
+                    )
+                });
+            assert_rate_eq(
+                id,
+                "toolFees.usdPer1kCalls",
+                required_rate(entry, id, "usdPer1kCalls"),
+                *rust_fee,
+            );
+        }
+        for (id, _) in catalog::TOOL_FEES_USD_PER_1K_CALLS {
+            let matches = tool_fee_entries
+                .iter()
+                .filter(|entry| entry["id"].as_str() == Some(id))
+                .count();
+            assert_eq!(
+                matches, 1,
+                "TOOL_FEES_USD_PER_1K_CALLS carries {id}, but pricing/catalog.json has \
+                 {matches} tool fee entries for it"
+            );
+        }
+        assert_eq!(
+            tool_fee_entries.len(),
+            catalog::TOOL_FEES_USD_PER_1K_CALLS.len(),
+            "pricing/catalog.json has {} tool fees but TOOL_FEES_USD_PER_1K_CALLS has {} entries",
+            tool_fee_entries.len(),
+            catalog::TOOL_FEES_USD_PER_1K_CALLS.len()
         );
     }
 
