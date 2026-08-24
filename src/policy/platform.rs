@@ -25,6 +25,11 @@ use crate::policy::rules::LiveState;
 /// refusal path validate the same pair, and their messages must agree.
 pub const API_KEY_VAR: &str = "NOVEUM_API_KEY";
 pub const PROJECT_ID_VAR: &str = "NOVEUM_GUARD_PROJECT_ID";
+/// Stable identity for every native and Worker control-plane request.
+///
+/// The production CDN/WAF rejects requests without a User-Agent before they
+/// reach the API, so both transports must send this exact value.
+pub const PLATFORM_USER_AGENT: &str = concat!("noveum-ai-gateway/", env!("CARGO_PKG_VERSION"));
 /// Selects the deployment mode (`dedicated` / `shared`). Declared here for the
 /// same reason as the pair above: the native bootstrap *implements* both modes
 /// and the Worker *refuses* the shared one, and neither may drift from the

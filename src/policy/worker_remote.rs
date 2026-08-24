@@ -71,6 +71,18 @@ pub const ASSUMED_OUTPUT_TOKENS_VAR: &str = "NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS"
 /// Default platform base URL when [`API_URL_VAR`] is unset.
 pub const DEFAULT_API_URL: &str = "https://api.noveum.ai";
 
+#[cfg(any(target_arch = "wasm32", test))]
+fn control_plane_headers(api_key: &str) -> [(&'static str, String); 3] {
+    [
+        ("authorization", format!("Bearer {api_key}")),
+        ("accept", "application/json".to_string()),
+        (
+            "user-agent",
+            crate::policy::platform::PLATFORM_USER_AGENT.to_string(),
+        ),
+    ]
+}
+
 /// Largest `max_tokens` we will forward into the admission arithmetic. Mirrors
 /// `middleware::MAX_OUTPUT_TOKEN_LIMIT`; anything above it is untrusted client
 /// JSON, not a real completion budget.
@@ -738,8 +750,9 @@ mod wasm_io {
         if_none_match: Option<&str>,
     ) -> Result<HttpOutcome> {
         let headers = Headers::new();
-        headers.set("authorization", &format!("Bearer {}", cfg.api_key))?;
-        headers.set("accept", "application/json")?;
+        for (name, value) in control_plane_headers(&cfg.api_key) {
+            headers.set(name, &value)?;
+        }
         if let Some(tag) = if_none_match {
             headers.set("if-none-match", tag)?;
         }
@@ -1117,6 +1130,22 @@ mod tests {
                 "binding {invalid:?} must retain the established native default"
             );
         }
+    }
+
+    #[test]
+    fn control_plane_headers_include_the_versioned_user_agent_required_by_the_cdn() {
+        let headers = control_plane_headers("test-key");
+        assert_eq!(
+            headers,
+            [
+                ("authorization", "Bearer test-key".to_string()),
+                ("accept", "application/json".to_string()),
+                (
+                    "user-agent",
+                    format!("noveum-ai-gateway/{}", env!("CARGO_PKG_VERSION")),
+                ),
+            ]
+        );
     }
 
     #[test]

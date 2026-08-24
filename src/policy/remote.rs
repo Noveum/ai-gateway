@@ -32,7 +32,7 @@ pub(crate) static PLATFORM_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         // (CDN/WAF) rejects requests with no UA with a 403 before they reach the
         // application, which silently killed the whole platform bridge (policies,
         // state, and usage all go through this client).
-        .user_agent(concat!("noveum-ai-gateway/", env!("CARGO_PKG_VERSION")))
+        .user_agent(platform::PLATFORM_USER_AGENT)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()
