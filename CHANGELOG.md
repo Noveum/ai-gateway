@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-08-24
+
+### Breaking changes
+
+- The minimum supported Rust version (MSRV) is now **1.94.1** (previously
+  1.91).
+- `AppState::new` now accepts the live-state provider, usage reporter,
+  admission client, and shared-tenancy resolver used by platform-managed Nova
+  Guard. Downstream callers using the former three-argument constructor must
+  pass the additional components (or `None`).
+- `Policy::policy_type` is now `PolicyTypeTag` rather than `PolicyType`, so the
+  gateway can preserve and report an invalid wire-level policy name. Use
+  `Policy::kind()` to read its parsed `PolicyType` and `Policy::type_name()` to
+  read the original string.
+- `PolicyEngine::from_env` is now synchronous and returns `Result<Self,
+  String>` so malformed or unsupported configuration fails explicitly instead
+  of producing an apparently valid engine.
+
+### Added
+
+- Platform-managed Nova Guard for the native gateway: effective-policy polling,
+  live cost/rate state, atomic admission reservations, and complete/cancel/
+  abandon settlement against the Noveum control plane.
+- Organization-scoped guardrails backed by organization counters, including
+  shared-key enforcement across multiple projects. Project policies continue to
+  use project counters.
+- Dedicated and shared native tenancy modes. Shared gateways authenticate each
+  request and derive project/organization identity server-side rather than
+  trusting caller-supplied tenant headers.
+- The same platform bridge on Cloudflare Workers, with policy/config caching,
+  strict admission, settlement, usage reporting, and a 13-phase Workerd
+  end-to-end regression suite. Workers intentionally support dedicated tenancy;
+  shared tenancy remains a native-gateway deployment mode.
+- A versioned Nova Guard JSON Schema and checked-in policy-type registry.
+  Unknown, malformed, and reserved-but-unenforceable policies now produce named
+  rejections instead of disappearing silently.
+- Provider-aware pricing from one checked-in catalog, including long-context
+  tiers, cached-token rates, server-tool fees, provider/model aliases, a
+  conservative unknown-model fallback, and a pricing/catalog version attached
+  to reservations and usage.
+- Authoritative buffered and streaming usage extraction, including Anthropic
+  Messages-to-OpenAI SSE translation, so settlement uses provider-reported
+  tokens and costs when available.
+- Batched Nova Guard usage delivery with bounded queues, retry/backoff, event
+  deduplication, and bounded shutdown flushing.
+- Hermetic native, policy-platform, Worker/Workerd, supply-chain, and Docker CI
+  gates, plus a separate real-provider smoke workflow.
+
+### Changed
+
+- Strict cost caps use platform-atomic admission across replicas; advisory caps
+  continue to use cached live state. Rate-limit and cost-cap evaluation now
+  distinguish unavailable state from a measured zero.
+- Request estimates require explicit, bounded output-token limits when a strict
+  cap needs them. Actual provider usage replaces the estimate at settlement;
+  cancellations release holds and ambiguous disconnects abandon them safely.
+- Model-scoped cost caps decide which requests a policy applies to while their
+  spend ceiling is evaluated against the policy scope's aggregate spend.
+- The pricing catalog includes current GPT-5.6 Sol promotional and long-context
+  rates and preserves provider-specific pricing when model names overlap.
+- Cloudflare Worker configuration changes no longer reuse a stale guard runtime,
+  and panic-recovery metadata is retained in release WASM builds.
+
+### Fixed
+
+- Closed fail-open paths for unknown pricing, malformed policy bundles,
+  unavailable admission/live state under fail-closed policies, and missing
+  organization counters.
+- Prevented duplicate metering and incorrect in-flight accounting across
+  buffered, streaming, rejected, cancelled, and disconnected requests.
+- Corrected reservation lifecycle handling so completed calls reconcile to
+  actual usage, calls proven not to reach a provider cancel their hold, and
+  uncertain outcomes do not release budget prematurely.
+- Preserved upstream provider/model identity when accepting cost telemetry, so
+  placeholder models cannot attach a mismatched price to a real model.
+- Hardened tenant runtime caching against credential leakage and cache-pressure
+  stampedes while keeping raw credentials out of cache keys and logs.
+
 ## [1.2.0] - 2026-06-26
 ### Added
 - **One package, three deployment shapes.** The same `noveum-ai-gateway` crate
@@ -199,7 +277,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error handling
 - Basic documentation
 
-[Unreleased]: https://github.com/Noveum/ai-gateway/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/Noveum/ai-gateway/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/Noveum/ai-gateway/compare/v1.2.0...v2.0.0
+[1.2.0]: https://github.com/Noveum/ai-gateway/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Noveum/ai-gateway/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/noveum/ai-gateway/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/noveum/ai-gateway/compare/v0.2.0...v1.0.0

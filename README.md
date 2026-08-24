@@ -745,59 +745,82 @@ docker-compose up -d
 
 ## Release Process for noveum-ai-gateway
 
-### 1. Pre-release Checklist
-- [ ] Update version number in `Cargo.toml`
-- [ ] Update CHANGELOG.md (if you have one)
-- [ ] Ensure all tests pass: `cargo test`
-- [ ] Verify the crate builds locally: `cargo build --release`
-- [ ] Run `cargo clippy` to check for any linting issues
-- [ ] Run `cargo fmt` to ensure consistent formatting
+Publishing a crate is permanent: a version cannot be overwritten or deleted
+from crates.io. Perform releases only from a reviewed, deployed, and clean
+`main` commit. If a published version is unsafe, it can be yanked to prevent new
+dependency resolution, but existing lockfiles and direct downloads continue to
+work.
 
-### 2. Git Commands
+### 1. Prepare and review the release
+
+- [ ] Merge the implementation PR and complete its production deployment gates.
+- [ ] Choose the version according to SemVer; public Rust API breaks require a
+      major version.
+- [ ] Update the version in both `Cargo.toml` and `Cargo.lock`.
+- [ ] Move the release notes out of `[Unreleased]` in `CHANGELOG.md` and update
+      its comparison links.
+- [ ] Ensure the release commit contains no credentials and the package list
+      contains only intentional files.
+
 ```bash
-# Create and switch to a release branch
-git checkout -b release/v0.1.6
+git switch main
+git pull --ff-only
+git status --short
 
-# Stage and commit changes
-git add Cargo.toml CHANGELOG.md
-git commit -m "chore: release v0.1.6"
-
-# Create a git tag
-git tag -a v0.1.7 -m "Release v0.1.7"
-
-# Push changes and tag
-git push origin release/v0.1.7
-git push origin v0.1.7
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --lib
+cargo test --locked --test novaguard_platform
+cargo test --locked --test policy_integration
+cargo check --locked --target wasm32-unknown-unknown --no-default-features --lib
+cargo build --locked --release
+cargo package --locked --list
+cargo publish --locked --dry-run
 ```
 
-### 3. Publishing to crates.io
-```bash
-# Verify the package contents
-cargo package
+Run the Cloudflare Worker/Workerd, Docker, supply-chain, and real-provider smoke
+gates documented above as well. The Cargo dry-run verifies the crate archive;
+it does not validate a production Cloudflare deployment or the Noveum control
+plane.
 
-# Publish to crates.io (requires authentication)
-cargo publish
+### 2. Publish the exact reviewed commit
+
+Confirm `HEAD` is the reviewed release commit on `origin/main`, the tree is
+clean, and the version does not already exist on crates.io. Then publish once:
+
+```bash
+git fetch origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+test -z "$(git status --porcelain)"
+
+cargo publish --locked
 ```
 
-### 4. Post-release
-1. Create a GitHub release (if using GitHub)
-   - Go to Releases → Draft a new release
-   - Choose the tag v0.1.7
-   - Add release notes
-   - Publish release
+Cargo uses a scoped crates.io token from the local credential provider or
+`CARGO_REGISTRY_TOKEN`. Never place the token in this repository, a shell
+history entry, or release output.
 
-2. Merge the release branch back to main
+### 3. Tag and verify
+
+After crates.io confirms the publish, tag that same commit and create the GitHub
+release from the matching changelog section:
+
 ```bash
-git checkout main
-git merge release/v0.1.7
-git push origin main
+NOVEUM_RELEASE_VERSION=2.0.0
+git tag -a "v${NOVEUM_RELEASE_VERSION}" -m "v${NOVEUM_RELEASE_VERSION}"
+git push origin "v${NOVEUM_RELEASE_VERSION}"
+gh release create "v${NOVEUM_RELEASE_VERSION}" --verify-tag \
+  --title "v${NOVEUM_RELEASE_VERSION}" --generate-notes
 ```
 
-### 5. Version Verification
-After publishing, verify:
-- The new version appears on [crates.io](https://crates.io/crates/noveum-ai-gateway)
-- Documentation is updated on [docs.rs](https://docs.rs/noveum-ai-gateway)
-- The GitHub release is visible (if using GitHub)
+Verify the crate version and checksum on
+[crates.io](https://crates.io/crates/noveum-ai-gateway), wait for the matching
+[docs.rs](https://docs.rs/noveum-ai-gateway) build, and verify the GitHub tag and
+release resolve to the exact published source commit. For an emergency yank:
+
+```bash
+cargo yank --vers 2.0.0 noveum-ai-gateway
+```
 
 ## Testing Deployment
 
