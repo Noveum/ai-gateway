@@ -11,10 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - GHCR release metadata now gives the immutable Cargo-version tag higher
   priority than `latest`, so `org.opencontainers.image.version` identifies the
-  release instead of the moving alias. After both registry pushes, automation
-  uses an empty temporary Docker configuration to prove that the exact GHCR and
-  Docker Hub tags are anonymously pullable, then reruns OCI, identity,
-  hardening, and health validation on the pulled images.
+  release instead of the moving alias. Unprivileged build validation now runs
+  with `contents: read`; only a serialized, tag-only dependent release job has
+  `packages: write` and Docker Hub secrets. Before either login or push, that
+  job requires both exact version tags to return an authenticated anonymous
+  `MANIFEST_UNKNOWN`; existing tags and every unauthorized, ambiguous, or
+  network-failed response abort. After both pushes, automation uses an empty
+  temporary Docker configuration to prove that the exact GHCR and Docker Hub
+  tags are anonymously pullable, then reruns OCI, identity, hardening, and
+  health validation on the pulled images.
 
 ### Documentation
 

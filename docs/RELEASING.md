@@ -48,9 +48,12 @@ that a Cloudflare, Docker, Kubernetes, or control-plane deployment works. The
 Docker checks prove that PR, `main`, and manual events are build-only, that a
 mismatched release tag or a tag outside trusted `main` is rejected, and that the
 deny-by-default context admits only the release inputs copied by the Dockerfile.
-The workflow-wiring check also proves that credential-bearing provider smoke
-is job-gated to `refs/heads/main` before checkout or secret exposure, then
-checks out the exact scheduled/manual event SHA.
+The workflow-wiring check also proves that Docker build validation has only
+`contents: read`, registry permissions and secrets exist only in the serialized
+tag release job, exact tags are checked before login/push, existing tags fail
+closed, and credential-bearing provider smoke is job-gated to
+`refs/heads/main` before checkout or secret exposure, then checks out the exact
+scheduled/manual event SHA.
 
 ## 2. Publish once
 
@@ -84,7 +87,10 @@ gh release create "v${NOVEUM_RELEASE_VERSION}" --verify-tag \
 The tag push is the **only** publishing trigger for release containers. The
 Docker workflow verifies that the ref is exactly
 `v${Cargo package version}` and that its commit is contained in trusted `main`
-before logging into either registry, then publishes `${NOVEUM_RELEASE_VERSION}`
+in an unprivileged build job. A dependent tag-only job serializes releases,
+repeats the exact-tag and trusted-main checks, and accepts only authenticated
+anonymous `MANIFEST_UNKNOWN` responses for both exact version tags before it
+receives registry credentials. It then publishes `${NOVEUM_RELEASE_VERSION}`
 and `latest` to both
 `ghcr.io/noveum/ai-gateway` and `noveum/noveum-ai-gateway`. Pull requests,
 `main` pushes, and manual workflow runs never publish. Wait for that exact tag's
@@ -97,6 +103,11 @@ pushes, the workflow uses an empty temporary Docker configuration to
 anonymously pull each exact version tag and reruns the hardened runtime/OCI
 validator. This is the release gate for public visibility and registry
 contents; an authenticated push alone is not sufficient.
+
+Do not rerun a failed release blindly. If either exact version tag was created,
+the no-clobber preflight will intentionally reject the rerun. Record which
+registry and digest succeeded, preserve the partial artifacts, and prepare a
+new reviewed patch version instead of overwriting them.
 
 Verify all of the following resolve to the same version and source commit:
 

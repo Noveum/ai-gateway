@@ -12,6 +12,7 @@ docker_context_validation_tmp=""
 docker_runtime_validation_container=""
 release_provenance_validation_tmp=""
 release_image_validation_tmp=""
+release_tag_preflight_tmp=""
 
 package_version() {
   local version
@@ -144,11 +145,68 @@ self_test_release_provenance() {
 }
 
 validate_workflow_wiring() {
+  local build_job release_job preflight_line first_login_line first_push_line
+  local release_mode_line release_provenance_line workflow_sensitive_count release_sensitive_count
   local docker_workflow provider_workflow classifier_line fetch_line provenance_line runtime_line first_publish_line
   local last_publish_line release_images_line metadata_version_priority metadata_latest_priority
   local build_action_count revision_arg_count smoke_if_line steps_line checkout_line first_secret_line
   docker_workflow="${repository_root}/.github/workflows/docker-build.yml"
   provider_workflow="${repository_root}/.github/workflows/provider-smoke.yml"
+
+  build_job="$(awk '
+    /^  docker:/ { in_job = 1 }
+    in_job && /^  [A-Za-z0-9_-]+:/ && !/^  docker:/ { exit }
+    in_job { print }
+  ' "${docker_workflow}")"
+  release_job="$(awk '
+    /^  release:/ { in_job = 1 }
+    in_job && /^  [A-Za-z0-9_-]+:/ && !/^  release:/ { exit }
+    in_job { print }
+  ' "${docker_workflow}")"
+  if [[ "${build_job}" != *"contents: read"* || "${build_job}" == *"packages: write"* ||
+    "${build_job}" == *'${{ secrets.'* || "${build_job}" == *"push: true"* ]]
+  then
+    echo "The build-validation job must have contents:read only and no publication credentials or pushes" >&2
+    return 1
+  fi
+  if [[ -z "${release_job}" || "${release_job}" != *"needs: docker"* ||
+    "${release_job}" != *"packages: write"* || "${release_job}" != *"contents: read"* ||
+    "${release_job}" != *"refs/tags/v"* || "${release_job}" != *"concurrency:"* ||
+    "${release_job}" != *"group:"* || "${release_job}" != *"cancel-in-progress: false"* ||
+    "${release_job}" == *"environment:"* ]]
+  then
+    echo "A serialized tag-only release job must depend on the unprivileged Docker validation job" >&2
+    return 1
+  fi
+  if printf '%s\n' "${build_job}" | grep -Eq '^    if:'; then
+    echo "The unprivileged Docker validation job must run for every workflow event" >&2
+    return 1
+  fi
+
+  workflow_sensitive_count="$(grep -Ec 'push:[[:space:]]*true|\$\{\{[[:space:]]*secrets\.' "${docker_workflow}" || true)"
+  release_sensitive_count="$(printf '%s\n' "${release_job}" | grep -Ec 'push:[[:space:]]*true|\$\{\{[[:space:]]*secrets\.' || true)"
+  if [[ "${workflow_sensitive_count}" -eq 0 || "${workflow_sensitive_count}" -ne "${release_sensitive_count}" ]]; then
+    echo "All registry pushes and secrets must be isolated inside the tag-only release job" >&2
+    return 1
+  fi
+
+  preflight_line="$(grep -n -m1 'validate_docker_release.sh release-tags-absent' "${docker_workflow}" | cut -d: -f1 || true)"
+  first_login_line="$(grep -n -m1 'uses: docker/login-action@' "${docker_workflow}" | cut -d: -f1 || true)"
+  first_push_line="$(grep -n -m1 'push:[[:space:]]*true' "${docker_workflow}" | cut -d: -f1 || true)"
+  if [[ -z "${preflight_line}" || -z "${first_login_line}" || -z "${first_push_line}" ]] ||
+    (( preflight_line >= first_login_line || preflight_line >= first_push_line ))
+  then
+    echo "Both immutable registry tags must be proven absent before any registry login or push" >&2
+    return 1
+  fi
+  release_mode_line="$(grep -n 'validate_docker_release.sh mode' "${docker_workflow}" | tail -n 1 | cut -d: -f1 || true)"
+  release_provenance_line="$(grep -n 'validate_docker_release.sh provenance HEAD refs/remotes/origin/main' "${docker_workflow}" | tail -n 1 | cut -d: -f1 || true)"
+  if [[ -z "${release_mode_line}" || -z "${release_provenance_line}" ]] ||
+    (( release_mode_line >= release_provenance_line || release_provenance_line >= preflight_line ))
+  then
+    echo "The release job must repeat exact-tag and trusted-main provenance checks before registry preflight" >&2
+    return 1
+  fi
 
   classifier_line="$(grep -n -m1 'validate_docker_release.sh mode' "${docker_workflow}" | cut -d: -f1 || true)"
   if [[ -z "${classifier_line}" ]]; then
@@ -212,36 +270,6 @@ validate_workflow_wiring() {
     return 1
   fi
 
-  # Registry credentials and every push-capable Docker step must be guarded by
-  # the validated release output, rather than by a mutable branch name.
-  if ! awk '
-    function finish_step() {
-      if (sensitive && !guarded) {
-        print "Sensitive Docker workflow step is not release-guarded: " step > "/dev/stderr"
-        bad = 1
-      }
-      sensitive = 0
-      guarded = 0
-      step = "<unnamed>"
-    }
-    /^      - / {
-      finish_step()
-      step = $0
-    }
-    /push:[[:space:]]*true/ || /\$\{\{[[:space:]]*secrets\./ ||
-      /validate_docker_release\.sh release-images/ { sensitive = 1 }
-    /if:[[:space:]]*steps\.release\.outputs\.publish[[:space:]]*==[[:space:]]*'"'"'true'"'"'/ {
-      guarded = 1
-    }
-    END {
-      finish_step()
-      exit bad
-    }
-  ' "${docker_workflow}"
-  then
-    return 1
-  fi
-
   smoke_if_line="$(grep -n -m1 "if: github.ref == 'refs/heads/main'" "${provider_workflow}" | cut -d: -f1 || true)"
   steps_line="$(grep -n -m1 '^[[:space:]]*steps:' "${provider_workflow}" | cut -d: -f1 || true)"
   checkout_line="$(grep -n -m1 'uses: actions/checkout@' "${provider_workflow}" | cut -d: -f1 || true)"
@@ -266,6 +294,7 @@ validate_workflow_wiring() {
 
   self_test_release_mode
   self_test_release_provenance
+  python3 "${repository_root}/scripts/test_registry_tag_preflight.py"
   echo "Workflow release and secret-ref guards are wired correctly"
 }
 
@@ -446,6 +475,152 @@ validate_runtime_image() {
   echo "Runtime image is healthy as UID:GID ${runtime_uid}:${runtime_gid} with revision ${revision_label} and a read-only root filesystem"
 }
 
+cleanup_release_tag_preflight() {
+  case "${release_tag_preflight_tmp}" in
+    "${TMPDIR:-/tmp}"/noveum-registry-preflight.*)
+      rm -rf -- "${release_tag_preflight_tmp}"
+      release_tag_preflight_tmp=""
+      ;;
+    "") ;;
+    *)
+      echo "Refusing to remove unexpected registry preflight path: ${release_tag_preflight_tmp}" >&2
+      ;;
+  esac
+}
+
+assert_manifest_absent() {
+  local registry_base="$1"
+  local token_url="$2"
+  local service="$3"
+  local repository="$4"
+  local tag="$5"
+  local display_image="$6"
+  local validation_tmp token_body manifest_body token_status manifest_status token
+
+  if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    echo "curl and python3 are required for registry tag preflight" >&2
+    return 1
+  fi
+
+  validation_tmp="$(mktemp -d "${TMPDIR:-/tmp}/noveum-registry-preflight.XXXXXX")"
+  release_tag_preflight_tmp="${validation_tmp}"
+  token_body="${validation_tmp}/token.json"
+  manifest_body="${validation_tmp}/manifest.json"
+  trap cleanup_release_tag_preflight EXIT HUP INT TERM
+
+  if ! token_status="$(curl --silent --show-error --location \
+    --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+    --output "${token_body}" --write-out '%{http_code}' \
+    --get \
+    --data-urlencode "service=${service}" \
+    --data-urlencode "scope=repository:${repository}:pull" \
+    "${token_url}")"
+  then
+    echo "Anonymous registry token request failed for ${display_image}" >&2
+    return 1
+  fi
+  if [[ "${token_status}" != "200" ]]; then
+    echo "Anonymous registry token request failed for ${display_image} with HTTP ${token_status}" >&2
+    return 1
+  fi
+  if ! token="$(python3 -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+token = payload.get("token") or payload.get("access_token")
+if not isinstance(token, str) or not token or any(ord(char) < 32 or ord(char) == 127 for char in token):
+    raise SystemExit(1)
+print(token, end="")
+' "${token_body}" 2>/dev/null)"
+  then
+    echo "Anonymous registry token response was invalid for ${display_image}" >&2
+    return 1
+  fi
+
+  if ! manifest_status="$(curl --silent --show-error --location \
+    --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+    --output "${manifest_body}" --write-out '%{http_code}' \
+    --header "Authorization: Bearer ${token}" \
+    --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "${registry_base%/}/v2/${repository}/manifests/${tag}")"
+  then
+    echo "Registry manifest request failed for ${display_image}" >&2
+    return 1
+  fi
+  if [[ "${manifest_status}" == "200" ]]; then
+    echo "Release tag already exists: ${display_image}" >&2
+    return 1
+  fi
+  if [[ "${manifest_status}" != "404" ]]; then
+    echo "Registry manifest status was ambiguous for ${display_image}: HTTP ${manifest_status}" >&2
+    return 1
+  fi
+  if ! python3 -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+errors = payload.get("errors")
+if not isinstance(errors, list) or not any(
+    isinstance(error, dict) and error.get("code") == "MANIFEST_UNKNOWN"
+    for error in errors
+):
+    raise SystemExit(1)
+' "${manifest_body}" 2>/dev/null
+  then
+    echo "Registry 404 did not return MANIFEST_UNKNOWN for ${display_image}" >&2
+    return 1
+  fi
+
+  cleanup_release_tag_preflight
+  trap - EXIT HUP INT TERM
+  echo "Release tag is absent: ${display_image}"
+}
+
+validate_release_tags_absent() {
+  local ghcr_image="$1"
+  local dockerhub_image="$2"
+  local expected_version ghcr_reference ghcr_repository ghcr_tag
+  local dockerhub_repository dockerhub_tag
+
+  expected_version="$(package_version)"
+  if [[ "${ghcr_image}" != ghcr.io/*":${expected_version}" || "${ghcr_image}" == *@* ]]; then
+    echo "GHCR preflight requires the exact immutable Cargo tag: ${ghcr_image}" >&2
+    return 1
+  fi
+  if [[ "${dockerhub_image}" != *":${expected_version}" || "${dockerhub_image}" == *@* ||
+    "${dockerhub_image}" == */*/* ]]
+  then
+    echo "Docker Hub preflight requires an owner/image Cargo tag: ${dockerhub_image}" >&2
+    return 1
+  fi
+
+  ghcr_reference="${ghcr_image#ghcr.io/}"
+  ghcr_tag="${ghcr_reference##*:}"
+  ghcr_repository="${ghcr_reference%:*}"
+  dockerhub_tag="${dockerhub_image##*:}"
+  dockerhub_repository="${dockerhub_image%:*}"
+  if [[ -z "${ghcr_repository}" || -z "${dockerhub_repository}" ||
+    "${ghcr_tag}" != "${expected_version}" || "${dockerhub_tag}" != "${expected_version}" ]]
+  then
+    echo "Could not parse exact release image references" >&2
+    return 1
+  fi
+
+  assert_manifest_absent \
+    "${NOVEUM_RELEASE_GHCR_REGISTRY_BASE:-https://ghcr.io}" \
+    "${NOVEUM_RELEASE_GHCR_TOKEN_URL:-https://ghcr.io/token}" \
+    "ghcr.io" "${ghcr_repository}" "${ghcr_tag}" "${ghcr_image}" || return 1
+  assert_manifest_absent \
+    "${NOVEUM_RELEASE_DOCKERHUB_REGISTRY_BASE:-https://registry-1.docker.io}" \
+    "${NOVEUM_RELEASE_DOCKERHUB_TOKEN_URL:-https://auth.docker.io/token}" \
+    "registry.docker.io" "${dockerhub_repository}" "${dockerhub_tag}" "${dockerhub_image}" || return 1
+  echo "Both immutable release tags are absent"
+}
+
 validate_release_images() {
   local ghcr_image="$1"
   local dockerhub_image="$2"
@@ -506,6 +681,7 @@ Usage: scripts/validate_docker_release.sh package-version
        scripts/validate_docker_release.sh workflows
        scripts/validate_docker_release.sh context
        scripts/validate_docker_release.sh runtime-image IMAGE [EXPECTED_REVISION]
+       scripts/validate_docker_release.sh release-tags-absent GHCR_IMAGE DOCKERHUB_IMAGE
        scripts/validate_docker_release.sh release-images GHCR_IMAGE DOCKERHUB_IMAGE EXPECTED_REVISION
 EOF
   return 2
@@ -544,6 +720,10 @@ case "${command_name}" in
   runtime-image)
     [[ "$#" -ge 2 && "$#" -le 3 ]] || usage
     validate_runtime_image "$2" "${3:-}"
+    ;;
+  release-tags-absent)
+    [[ "$#" -eq 3 ]] || usage
+    validate_release_tags_absent "$2" "$3"
     ;;
   release-images)
     [[ "$#" -eq 4 ]] || usage

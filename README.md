@@ -328,12 +328,17 @@ Container automation publishes `2.0.1` and `latest` to both GHCR and Docker Hub
 only when the pushed Git tag is exactly `v2.0.1`, matching the Cargo package
 version, and that tag's commit is already contained in trusted `main`. Pull
 requests, `main` pushes, and manual workflow runs build and exercise the image
-but publish nothing, so they cannot overwrite a release image. The Docker build
-context is deny-by-default and contains only the Cargo manifest/lockfile, Rust
-source, policy schema, and pricing catalog. The release image records the exact
-version and source revision and runs as the fixed unprivileged identity
-`65532:65532`. Treat the version tag as immutable and pin the verified registry
-digest for deployment; do not use `latest` as a release identity.
+with `contents: read` and receive no registry permissions or secrets. A
+serialized tag-only release job depends on that validation and alone receives
+`packages: write` plus Docker Hub credentials. Before either registry login or
+push, it accepts only an anonymous `MANIFEST_UNKNOWN` result for both exact
+version tags; an existing tag, authorization/visibility error, rate limit,
+malformed response, or network failure aborts. The Docker build context is
+deny-by-default and contains only the Cargo manifest/lockfile, Rust source,
+policy schema, and pricing catalog. The release image records the exact version
+and source revision and runs as the fixed unprivileged identity `65532:65532`.
+Treat the version tag as immutable and pin the verified registry digest for
+deployment; do not use `latest` as a release identity.
 
 **v2.0.1 GHCR caveat:** the image published to GHCR on 2026-08-24 has
 `org.opencontainers.image.version=latest`, and its package did not allow an
