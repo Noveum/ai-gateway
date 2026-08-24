@@ -13,6 +13,13 @@ lockfiles and downloads remain valid.
 - `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and comparison links agree.
 - The packaged README links repository documentation to the exact release tag,
   not `HEAD` or a moving branch.
+- The GHCR package is explicitly **Public** in package settings. Repository
+  visibility does not make a container package public; GitHub documents the
+  separate setting in
+  [Configuring a package's access control and visibility](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
+  GitHub also documents that changing a package to Public cannot be undone, so
+  obtain the package owner's explicit approval and record the change. This
+  workflow validates visibility but never changes it.
 - crates.io credentials are stored in Cargo's credential provider or a scoped
   `CARGO_REGISTRY_TOKEN`, never in the repository or command history.
 
@@ -41,9 +48,12 @@ that a Cloudflare, Docker, Kubernetes, or control-plane deployment works. The
 Docker checks prove that PR, `main`, and manual events are build-only, that a
 mismatched release tag or a tag outside trusted `main` is rejected, and that the
 deny-by-default context admits only the release inputs copied by the Dockerfile.
-The workflow-wiring check also proves that credential-bearing provider smoke
-is job-gated to `refs/heads/main` before checkout or secret exposure, then
-checks out the exact scheduled/manual event SHA.
+The workflow-wiring check also proves that Docker build validation has only
+`contents: read`, registry permissions and secrets exist only in the serialized
+tag release job, exact tags are checked before login/push, existing tags fail
+closed, and credential-bearing provider smoke is job-gated to
+`refs/heads/main` before checkout or secret exposure, then checks out the exact
+scheduled/manual event SHA.
 
 ## 2. Publish once
 
@@ -77,12 +87,27 @@ gh release create "v${NOVEUM_RELEASE_VERSION}" --verify-tag \
 The tag push is the **only** publishing trigger for release containers. The
 Docker workflow verifies that the ref is exactly
 `v${Cargo package version}` and that its commit is contained in trusted `main`
-before logging into either registry, then publishes `${NOVEUM_RELEASE_VERSION}`
+in an unprivileged build job. A dependent tag-only job serializes releases,
+repeats the exact-tag and trusted-main checks, and accepts only authenticated
+anonymous `MANIFEST_UNKNOWN` responses for both exact version tags before it
+receives registry credentials. It then publishes `${NOVEUM_RELEASE_VERSION}`
 and `latest` to both
 `ghcr.io/noveum/ai-gateway` and `noveum/noveum-ai-gateway`. Pull requests,
 `main` pushes, and manual workflow runs never publish. Wait for that exact tag's
 workflow to finish, then verify both versioned images and record their digests;
 do not infer success from the moving `latest` tag.
+
+The immutable Cargo-version tag has higher metadata priority than `latest`, so
+the generated OCI version label must equal the Cargo version. After both
+pushes, the workflow uses an empty temporary Docker configuration to
+anonymously pull each exact version tag and reruns the hardened runtime/OCI
+validator. This is the release gate for public visibility and registry
+contents; an authenticated push alone is not sufficient.
+
+Do not rerun a failed release blindly. If either exact version tag was created,
+the no-clobber preflight will intentionally reject the rerun. Record which
+registry and digest succeeded, preserve the partial artifacts, and prepare a
+new reviewed patch version instead of overwriting them.
 
 Verify all of the following resolve to the same version and source commit:
 
@@ -99,6 +124,17 @@ the generic
 [crates.io package](https://crates.io/crates/noveum-ai-gateway),
 [docs.rs package](https://docs.rs/noveum-ai-gateway), and
 [GitHub releases page](https://github.com/Noveum/ai-gateway/releases).
+
+### v2.0.1 container exception
+
+The 2026-08-24 GHCR v2.0.1 publication used equal-priority raw tags with
+`latest` first. Its immutable image therefore reports
+`org.opencontainers.image.version=latest`, and anonymous access failed during
+the release audit. Docker Hub v2.0.1 is public and correctly labeled. Do not
+rerun the tag by moving/recreating it, and do not overwrite either versioned
+image. Changing the existing GHCR package visibility to Public is a separate
+administrative action that preserves its digest, but it does not repair the
+label; corrected GHCR metadata belongs in a later patch release.
 
 ## Emergency response
 

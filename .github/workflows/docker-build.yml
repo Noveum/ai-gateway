@@ -10,14 +10,14 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  GHCR_IMAGE: ghcr.io/noveum/ai-gateway
+  DOCKERHUB_IMAGE: noveum/noveum-ai-gateway
 
 jobs:
   docker:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
 
     steps:
       - name: Checkout repository
@@ -95,26 +95,77 @@ jobs:
           git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
           bash scripts/validate_docker_release.sh provenance HEAD refs/remotes/origin/main
 
+  release:
+    name: Publish immutable release images
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: docker
+    concurrency:
+      group: noveum-ai-gateway-container-release
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Revalidate release workflow and exact tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          bash scripts/validate_docker_release.sh workflows
+          VERSION="$(bash scripts/validate_docker_release.sh package-version)"
+          test "$(bash scripts/validate_docker_release.sh mode "${EVENT_NAME}" "${GIT_REF}")" = release
+          echo "CARGO_VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Reverify release commit provenance against main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          bash scripts/validate_docker_release.sh provenance HEAD refs/remotes/origin/main
+
+      # This runs before either login. Only an authenticated anonymous token
+      # followed by a MANIFEST_UNKNOWN response counts as an absent tag.
+      - name: Prove immutable version tags do not exist
+        run: |
+          set -euo pipefail
+          bash scripts/validate_docker_release.sh release-tags-absent \
+            "${GHCR_IMAGE}:${CARGO_VERSION}" \
+            "${DOCKERHUB_IMAGE}:${CARGO_VERSION}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
       - name: Log in to GitHub Container Registry
-        if: steps.release.outputs.publish == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Extract metadata for GHCR
-        if: steps.release.outputs.publish == 'true'
         id: meta-ghcr
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.GHCR_IMAGE }}
           tags: |
-            type=raw,value=latest
-            type=raw,value=${{ env.CARGO_VERSION }}
+            type=raw,value=${{ env.CARGO_VERSION }},priority=900
+            type=raw,value=latest,priority=200
 
       - name: Build and push to GitHub Container Registry
-        if: steps.release.outputs.publish == 'true'
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
@@ -129,25 +180,25 @@ jobs:
           # Match local build platform for GHCR build too
           platforms: linux/amd64
 
-      - name: Login to Docker Hub
-        if: steps.release.outputs.publish == 'true'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Build and push to Docker Hub
-        if: steps.release.outputs.publish == 'true'
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: true
           tags: |
-            noveum/noveum-ai-gateway:latest
-            noveum/noveum-ai-gateway:${{ env.CARGO_VERSION }}
+            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ env.DOCKERHUB_IMAGE }}:${{ env.CARGO_VERSION }}
           build-args: |
             VERSION=${{ env.CARGO_VERSION }}
             REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+
+      - name: Verify public release images from both registries
+        run: |
+          set -euo pipefail
+          bash scripts/validate_docker_release.sh release-images \
+            "${GHCR_IMAGE}:${CARGO_VERSION}" \
+            "${DOCKERHUB_IMAGE}:${CARGO_VERSION}" \
+            "${GITHUB_SHA}"

@@ -52,6 +52,39 @@ intended registry before rollout, then pin that digest for production. `latest`
 moves only on a matching release tag, but remains mutable and is not a release
 identifier.
 
+Build validation runs on every event with only `contents: read`. The dependent
+release job runs only for `v*` tag pushes, is serialized without canceling a
+running release, and alone receives `packages: write` and Docker Hub secrets.
+Before either registry login or push, it obtains anonymous pull tokens and
+requires both exact version manifests to return HTTP 404 with the Distribution
+error code `MANIFEST_UNKNOWN`. An existing tag or any unauthorized, ambiguous,
+rate-limited, malformed, or network-failed response stops the release. This
+prevents a rerun from overwriting an immutable version tag; serialization keeps
+two release runs from passing the absence check concurrently.
+
+GHCR package visibility is separate from repository visibility. A supported
+public image must be anonymously pullable, not merely pullable by the release
+workflow's `GITHUB_TOKEN`. The release workflow therefore uses an empty
+temporary Docker configuration after publication to pull each exact GHCR and
+Docker Hub version tag, then repeats the OCI-label, runtime-identity,
+read-only-root, and health checks on those registry artifacts.
+
+Because publication cannot be atomic across two registries, a failure after
+one exact tag is pushed is not safely retryable: preflight will reject that
+existing tag. Preserve the partial evidence, do not overwrite it, and publish a
+corrected new patch version after review.
+
+### v2.0.1 registry caveat
+
+The immutable GHCR v2.0.1 image published on 2026-08-24 has
+`org.opencontainers.image.version=latest`; anonymous access also failed during
+the release verification. Docker Hub's v2.0.1 image is publicly pullable and
+has the correct `2.0.1` version label and source revision. Do not repush,
+retag, or recreate v2.0.1. A package administrator may separately make the
+existing GHCR package public without changing its digest, but only a later
+patch release can provide corrected GHCR OCI metadata. Until then, use the
+verified Docker Hub digest when exact container metadata is required.
+
 The repository's `.dockerignore` denies the entire working tree, then admits
 only `Cargo.toml`, `Cargo.lock`, `src/`, `schema/`, and `pricing/`. Docker still
 receives the selected Dockerfile separately. This keeps `.env` files, Wrangler

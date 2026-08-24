@@ -92,8 +92,10 @@ checkout or secret exposure and checks out the exact event SHA. The context
 check proves that the deny-by-default
 `.dockerignore` admits only `Cargo.toml`, `Cargo.lock`, `src/`, `schema/`, and
 `pricing/`, while representative `.env`, Wrangler-state, and unlisted files
-cannot be copied. Release tags publish the version and `latest` to GHCR and
-Docker Hub; production still pins the verified version digest.
+cannot be copied. It also runs the hermetic registry preflight regression:
+`MANIFEST_UNKNOWN` passes, while an existing tag, an unrelated 404, or denied
+anonymous token fails. Release tags publish the version and `latest` to GHCR
+and Docker Hub; production still pins the verified version digest.
 
 Confirm the immutable image identifies the release you built:
 
@@ -101,6 +103,38 @@ Confirm the immutable image identifies the release you built:
 docker image inspect noveum-ai-gateway:candidate \
   --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }} {{ .Config.User }}'
 ```
+
+For a tag publication, CI additionally validates the actual registry artifacts
+after both pushes:
+
+```bash
+bash scripts/validate_docker_release.sh release-images \
+  "ghcr.io/noveum/ai-gateway:${NOVEUM_RELEASE_VERSION}" \
+  "noveum/noveum-ai-gateway:${NOVEUM_RELEASE_VERSION}" \
+  "${NOVEUM_RELEASE_REVISION}"
+```
+
+This command uses an empty temporary Docker configuration, so both pulls must
+work anonymously. It then checks the exact Cargo version/revision labels,
+fixed `65532:65532` identity, read-only root filesystem, and versioned health
+response. The immutable GHCR v2.0.1 artifact is a known exception: it reports
+the OCI version as `latest`, and anonymous access failed on 2026-08-24. Do not
+repush it; use Docker Hub v2.0.1 or a corrected later patch release.
+
+Before either registry login or push, the serialized release job runs:
+
+```bash
+bash scripts/validate_docker_release.sh release-tags-absent \
+  "ghcr.io/noveum/ai-gateway:${NOVEUM_RELEASE_VERSION}" \
+  "noveum/noveum-ai-gateway:${NOVEUM_RELEASE_VERSION}"
+```
+
+Success means both anonymous token requests returned HTTP 200 and both exact
+manifest requests returned HTTP 404 with `MANIFEST_UNKNOWN`. Every other result
+is a failure, including HTTP 200 (tag already exists), authentication or
+visibility errors, `NAME_UNKNOWN`, rate limits, malformed JSON, and network or
+TLS failure. Job-level concurrency prevents two release runs from checking the
+same absent tags at once.
 
 ## 5. Live provider matrix
 
