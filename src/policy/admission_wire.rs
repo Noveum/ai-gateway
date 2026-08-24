@@ -8,8 +8,9 @@
 //! transport differs. Everything that *decides* something is here:
 //!
 //! * the request and settlement bodies, and their exact camelCase field names;
-//! * [`classify_admit`], including the contract's sharpest edge — a **block is
-//!   HTTP 200**, and a **503 is never an allow**;
+//! * [`classify_admit`](crate::policy::admission_wire::classify_admit), including
+//!   the contract's sharpest edge — a **block is HTTP 200**, and a **503 is
+//!   never an allow**;
 //! * how a `200 {allowed:false}` decision becomes a gateway [`PolicyDecision`],
 //!   so a platform block renders byte-identically at the edge and natively;
 //! * URL-segment encoding and error-body truncation.
@@ -21,10 +22,11 @@
 //! native one. There is now one copy.
 //!
 //! The module is deliberately free of `reqwest`, `tokio` and `chrono` so it
-//! compiles for `wasm32`. That is also why [`Settlement::to_json`] takes its
-//! timestamp as an argument instead of reading a clock: the native side passes
-//! `chrono`, the Worker passes `Date.now()`, and the function stays pure and
-//! testable on either.
+//! compiles for `wasm32`. That is also why
+//! [`Settlement::to_json`](crate::policy::admission_wire::Settlement::to_json)
+//! takes its timestamp as an argument instead of reading a clock: the native
+//! side passes `chrono`, the Worker passes `Date.now()`, and the function stays
+//! pure and testable on either.
 
 use serde_json::{json, Value};
 

@@ -13,8 +13,8 @@
 //!
 //! Reporting is **best-effort and never blocks the request path**: callers hand
 //! an event to [`UsageReporter::report`], which appends it to a bounded in-memory
-//! queue (evicting the *oldest* event on overflow, see [`QUEUE_CAPACITY`]); a
-//! background task batches (≤ [`MAX_BATCH`]) and flushes on an interval, with
+//! queue (evicting the *oldest* event on overflow, see `QUEUE_CAPACITY`); a
+//! background task batches (≤ `MAX_BATCH`) and flushes on an interval, with
 //! `eventId`-idempotent retries for `5xx`/`429`. See the golden rule: one fresh
 //! `eventId` per call, reused on every retry, so the server dedups and never
 //! double-counts.
@@ -85,8 +85,9 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_REASON_LEN: usize = 500;
 
 /// One usage event. Serializes to the platform's wire shape; the two outcomes
-/// carry different field sets (see [`UsageEvent::allowed`] / [`blocked`]), so all
-/// outcome-specific fields are optional and skipped when unset.
+/// carry different field sets (see [`UsageEvent::allowed`] /
+/// [`UsageEvent::blocked`]), so all outcome-specific fields are optional and
+/// skipped when unset.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageEvent {

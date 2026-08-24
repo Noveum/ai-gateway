@@ -577,7 +577,7 @@ impl PolicyEngine {
     ///
     /// Per considered cap the fail-closed/fail-open computation is the one an
     /// unavailable `/state` uses
-    /// ([`PolicyEngine::unavailable_state_decision`]): a `failClosed` policy
+    /// (`PolicyEngine::unavailable_state_decision`): a `failClosed` policy
     /// blocks, everything else allows with the explicit reason recorded.
     ///
     /// Returns the blocking decision if any considered policy fails closed,

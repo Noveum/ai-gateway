@@ -537,7 +537,7 @@ pub(crate) fn credential_cache_key(secret: &str) -> CredentialCacheKey {
 /// A short, non-reversible credential label for logs only.
 ///
 /// Forty-eight bits are sufficient for human correlation but not for an
-/// authorization cache key; [`credential_cache_key`] is always used internally
+/// authorization cache key; `credential_cache_key` is always used internally
 /// wherever a collision could otherwise reuse another caller's identity.
 pub fn credential_fingerprint(secret: &str) -> String {
     let key = credential_cache_key(secret);
@@ -1144,7 +1144,7 @@ pub async fn bootstrap_engine(
 }
 
 /// Spawn a background task that re-fetches `/policies/effective` every
-/// [`POLICY_POLL_INTERVAL`] and hot-swaps the engine's policy set when it
+/// `POLICY_POLL_INTERVAL` and hot-swaps the engine's policy set when it
 /// changes. Uses `If-None-Match`/304 so an unchanged set is nearly free.
 ///
 /// A fetch *error* is logged and the current policies are kept (a transient
@@ -1266,7 +1266,7 @@ impl RemoteLiveState {
     /// The lock is held across the refresh, which single-flights it: concurrent
     /// callers hitting an expired TTL wait for the one in-flight fetch and then
     /// read its (fresh) result, rather than serving stale data or stampeding
-    /// `/state`. After a failed refresh, callers within [`ERROR_BACKOFF`] get
+    /// `/state`. After a failed refresh, callers within `ERROR_BACKOFF` get
     /// `None` immediately (no per-request connect timeouts during an outage).
     pub async fn get(&self) -> Option<LiveState> {
         let mut guard = self.cache.lock().await;
@@ -1382,7 +1382,7 @@ struct PendingEntry {
 /// long-lived or streaming request keeps its cap protection for its whole
 /// duration) until [`PendingSpend::complete`] fires — via the RAII
 /// [`ReservationGuard`] attached to the response body, which also covers
-/// client-cancellation — and then ages out [`PENDING_SPEND_TTL`] after
+/// client-cancellation — and then ages out `PENDING_SPEND_TTL` after
 /// completion, by which time the real usage event has been reported and folded
 /// into `/state`. Briefly double-counting a completed entry that already
 /// landed only errs toward blocking *near the limit*, the correct direction
@@ -1510,7 +1510,7 @@ impl PendingSpend {
     }
 
     /// Mark a forwarded request as completed: its reservation keeps counting
-    /// for [`PENDING_SPEND_TTL`] from NOW (covering the usage-report + state
+    /// for `PENDING_SPEND_TTL` from NOW (covering the usage-report + state
     /// ingestion lag), then expires.
     pub fn complete(&self, reservation: u64) {
         let mut inner = self.inner.lock().expect("pending-spend lock poisoned");

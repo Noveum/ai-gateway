@@ -8,12 +8,13 @@
 //! per request — and this module is the gateway-side client for it.
 //!
 //! Flow, per guarded request, when a `cost_cap` is in **strict** enforcement
-//! mode (see [`CostEnforcementMode`]):
+//! mode (see [`CostEnforcementMode`](crate::policy::config::CostEnforcementMode)):
 //!
 //! 1. `POST .../policies/admit` with this request's *estimated* usage. The
 //!    platform reserves atomically and answers allowed / blocked, or 503
 //!    (unavailable — never treated as allowed).
-//! 2. The reservation is held by an RAII [`AdmissionGuard`] for the whole
+//! 2. The reservation is held by an RAII
+//!    [`AdmissionGuard`](crate::policy::admission::AdmissionGuard) for the whole
 //!    request, exactly like [`ReservationGuard`](crate::policy::remote::ReservationGuard).
 //! 3. On the way out the guard **settles**:
 //!    * `complete` with the real token counts when authoritative usage was
@@ -24,10 +25,13 @@
 //!    * `cancel` only when the request provably never reached the provider (a
 //!      later gateway-side policy blocked it), which releases the hold.
 //!
-//! Settlement never blocks the client: [`AdmissionGuard`]'s `Drop` spawns it.
+//! Settlement never blocks the client:
+//! [`AdmissionGuard`](crate::policy::admission::AdmissionGuard)'s `Drop` spawns
+//! it.
 //!
-//! Native-only (reqwest). The Worker has no admission client yet; it already
-//! refuses to start with `cost_cap`/`rate_limit` policies at all.
+//! This module is the native `reqwest` transport. The Worker performs the same
+//! atomic admission and settlement through [`crate::policy::worker_remote`],
+//! using the shared wire contract in [`crate::policy::admission_wire`].
 
 use std::sync::Arc;
 use std::time::Duration;

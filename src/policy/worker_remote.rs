@@ -41,10 +41,11 @@
 //! wrote a test for, and never catches one copy being updated without the other.
 //!
 //! What remains here is genuinely Worker-specific: the credential matrix
-//! ([`WorkerRemoteConfig::from_values`], which deliberately mirrors the native
-//! `RemoteConfig::from_values` because the two must agree on what a half-applied
-//! secret set *means*, not because they share code), the tenancy refusal, the
-//! request-path heuristics, and the `worker::Fetch` I/O.
+//! ([`WorkerRemoteConfig::from_values`](crate::policy::worker_remote::WorkerRemoteConfig::from_values),
+//! which deliberately mirrors the native `RemoteConfig::from_values` because
+//! the two must agree on what a half-applied secret set *means*, not because
+//! they share code), the tenancy refusal, the request-path heuristics, and the
+//! `worker::Fetch` I/O.
 
 #[cfg(any(target_arch = "wasm32", test))]
 use std::rc::Rc;

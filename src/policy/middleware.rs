@@ -17,7 +17,7 @@
 //! through [`crate::policy::metering::StreamUsageScanner`] as it flows to the
 //! client, so the platform reservation settles on the provider's real token
 //! counts instead of retaining the `input + max_tokens` estimate. See
-//! [`attach_stream_settlement`].
+//! `attach_stream_settlement`.
 
 use std::sync::Arc;
 

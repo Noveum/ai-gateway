@@ -8,7 +8,8 @@
 //!
 //! Two things live here, both previously duplicated:
 //!
-//! 1. [`SseFrameBuffer`] — incremental SSE frame reassembly. HTTP/TCP chunk
+//! 1. [`SseFrameBuffer`](crate::policy::metering::SseFrameBuffer) — incremental
+//!    SSE frame reassembly. HTTP/TCP chunk
 //!    boundaries have nothing to do with SSE frame boundaries: a provider (or
 //!    any hop) may flush `data: {...}` split in the middle of the JSON, or even
 //!    in the middle of a multi-byte UTF-8 sequence. Parsing each transport chunk
@@ -16,8 +17,10 @@
 //!    (`telemetry::middleware`, private, and `providers::anthropic_stream`,
 //!    copied *because* the first was private); this is now the only one.
 //!
-//! 2. [`extract_actual_usage`] / [`StreamUsageScanner`] — reading the provider's
-//!    own token counts out of a buffered JSON body or out of a live SSE stream.
+//! 2. [`extract_actual_usage`](crate::policy::metering::extract_actual_usage) /
+//!    [`StreamUsageScanner`](crate::policy::metering::StreamUsageScanner) —
+//!    reading the provider's own token counts out of a buffered JSON body or out
+//!    of a live SSE stream.
 //!
 //! ## Why the stream scanner matters
 //!
@@ -27,9 +30,10 @@
 //! of tokens, so every streaming request could be billed ~100x its true cost and
 //! consume the customer's cost cap accordingly. "Errs high" is only acceptable
 //! when usage is genuinely unrecoverable — and for SSE it is *recoverable*: the
-//! final chunk carries authoritative usage. [`StreamUsageScanner`] recovers it
-//! without buffering the response, so the reservation can be reconciled down to
-//! actual via `complete`.
+//! final chunk carries authoritative usage.
+//! [`StreamUsageScanner`](crate::policy::metering::StreamUsageScanner) recovers
+//! it without buffering the response, so the reservation can be reconciled down
+//! to actual via `complete`.
 
 use serde_json::Value;
 
