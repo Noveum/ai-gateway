@@ -1,0 +1,657 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.noveum.ai/novaguard/policy.v1.json",
+  "title": "NovaGuard policy bundle",
+  "description": "The NovaGuard policy contract. The gateway embeds this file to validate every policy config. The gateway (Rust), the Noveum platform (TypeScript/Zod/Prisma) and the Python SDK each maintain their own policy type list; a new type has to be added here and in each of them.",
+  "x-schema-version": "1.0.0",
+  "type": "object",
+  "required": ["policies"],
+  "properties": {
+    "schemaVersion": {
+      "description": "Version of THIS schema the bundle was authored against. Absent means 1.0.0 (the first published version). A consumer that does not understand the major version must refuse the bundle rather than silently ignore fields.",
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+$",
+      "default": "1.0.0"
+    },
+    "bundleVersion": {
+      "description": "Author-controlled revision string for the bundle itself (not the schema).",
+      "type": "string"
+    },
+    "exportedAt": {
+      "description": "RFC 3339 timestamp of when the bundle was exported by the control plane.",
+      "type": "string"
+    },
+    "scope": { "$ref": "#/$defs/bundleScope" },
+    "policies": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/policy" }
+    }
+  },
+
+  "x-platform-wire": {
+    "description": "The Noveum platform (control plane + Prisma) serializes `type`, `mode`, `action` and `enforcementMode` in SCREAMING_SNAKE_CASE. The canonical wire form in THIS schema is the snake_case/lowercase form the gateway and the Python SDK use; src/policy/platform.rs performs the translation on ingest. `platformEnum` under x-policy-types is the SCREAMING_SNAKE spelling of each type, and is also the exact member list the Prisma `PolicyType` enum must carry.",
+    "screamingSnakeFields": [
+      "type",
+      "mode",
+      "config.action",
+      "config.windows[].action",
+      "config.enforcementMode"
+    ]
+  },
+
+  "x-policy-types": {
+    "cost_cap": {
+      "title": "Cost cap",
+      "description": "Block or flag when spend over a rolling/calendar window crosses a cap.",
+      "rustVariant": "CostCap",
+      "platformEnum": "COST_CAP",
+      "enforcement": "enforced",
+      "engine": "live_state",
+      "phases": ["input"],
+      "configRef": "costCapConfig",
+      "rustConfigStruct": "CostCapConfig"
+    },
+    "rate_limit": {
+      "title": "Rate limit",
+      "description": "Block when request or token counts over a window exceed a limit.",
+      "rustVariant": "RateLimit",
+      "platformEnum": "RATE_LIMIT",
+      "enforcement": "enforced",
+      "engine": "live_state",
+      "phases": ["input"],
+      "configRef": "rateLimitConfig",
+      "rustConfigStruct": "RateLimitConfig"
+    },
+    "model_allowlist": {
+      "title": "Model allow/deny list",
+      "description": "Allow only listed models (or deny specific ones). Supports 'gpt-4*' wildcards.",
+      "rustVariant": "ModelAllowlist",
+      "platformEnum": "MODEL_ALLOWLIST",
+      "enforcement": "enforced",
+      "engine": "text_rule",
+      "phases": ["input"],
+      "configRef": "modelAllowlistConfig",
+      "rustConfigStruct": "ModelAllowlistConfig"
+    },
+    "regex_match": {
+      "title": "Regex match",
+      "description": "Block, redact, mask or flag on linear-time regex matches.",
+      "rustVariant": "RegexMatch",
+      "platformEnum": "REGEX_MATCH",
+      "enforcement": "enforced",
+      "engine": "text_rule",
+      "phases": ["input", "output", "both"],
+      "configRef": "regexMatchConfig",
+      "rustConfigStruct": "RegexMatchConfig"
+    },
+    "banned_substrings": {
+      "title": "Banned substrings",
+      "description": "Block or redact a fixed list of literal terms (Aho-Corasick).",
+      "rustVariant": "BannedSubstrings",
+      "platformEnum": "BANNED_SUBSTRINGS",
+      "enforcement": "enforced",
+      "engine": "text_rule",
+      "phases": ["input", "output", "both"],
+      "configRef": "bannedSubstringsConfig",
+      "rustConfigStruct": "BannedSubstringsConfig"
+    },
+    "pii_detection": {
+      "title": "PII detection",
+      "description": "Detect and mask, redact or block personally identifiable information.",
+      "rustVariant": "PiiDetection",
+      "platformEnum": "PII_DETECTION",
+      "enforcement": "enforced",
+      "engine": "text_rule",
+      "phases": ["input", "output", "both"],
+      "configRef": "piiDetectionConfig",
+      "rustConfigStruct": "PiiDetectionConfig"
+    },
+    "secrets_detection": {
+      "title": "Secrets detection",
+      "description": "Detect leaked credentials (cloud keys, tokens, JWTs, PEM blocks).",
+      "rustVariant": "SecretsDetection",
+      "platformEnum": "SECRETS_DETECTION",
+      "enforcement": "enforced",
+      "engine": "text_rule",
+      "phases": ["input", "output", "both"],
+      "configRef": "secretsDetectionConfig",
+      "rustConfigStruct": "SecretsDetectionConfig"
+    },
+    "json_schema": {
+      "title": "JSON schema conformance",
+      "description": "Validate that the model output is JSON conforming to a schema.",
+      "rustVariant": "JsonSchema",
+      "platformEnum": "JSON_SCHEMA",
+      "enforcement": "enforced",
+      "engine": "text_rule",
+      "phases": ["output"],
+      "configRef": "jsonSchemaConfig",
+      "rustConfigStruct": "JsonSchemaConfig"
+    },
+    "token_length_cap": {
+      "title": "Token length cap",
+      "description": "Block when the request token count exceeds a cap.",
+      "rustVariant": "TokenLengthCap",
+      "platformEnum": "TOKEN_LENGTH_CAP",
+      "enforcement": "enforced",
+      "engine": "text_rule",
+      "phases": ["input"],
+      "configRef": "tokenLengthCapConfig",
+      "rustConfigStruct": "TokenLengthCapConfig"
+    },
+    "scorer_gate": {
+      "title": "Scorer gate",
+      "description": "Gate on an external NovaEval scorer's score. RESERVED: the gateway parses and validates this config but cannot enforce it without an external scoring service.",
+      "rustVariant": "ScorerGate",
+      "platformEnum": "SCORER_GATE",
+      "enforcement": "reserved",
+      "engine": "external_scorer",
+      "phases": ["input", "output", "both"],
+      "configRef": "scorerGateConfig",
+      "rustConfigStruct": null
+    },
+    "prompt_injection": {
+      "title": "Prompt injection detection",
+      "description": "Detect prompt-injection / jailbreak attempts. RESERVED: requires an external classifier.",
+      "rustVariant": "PromptInjection",
+      "platformEnum": "PROMPT_INJECTION",
+      "enforcement": "reserved",
+      "engine": "external_scorer",
+      "phases": ["input", "both"],
+      "configRef": "promptInjectionConfig",
+      "rustConfigStruct": null
+    },
+    "topic_restriction": {
+      "title": "Topic restriction",
+      "description": "Allow or block conversations by topic. RESERVED: requires an external classifier.",
+      "rustVariant": "TopicRestriction",
+      "platformEnum": "TOPIC_RESTRICTION",
+      "enforcement": "reserved",
+      "engine": "external_scorer",
+      "phases": ["input", "output", "both"],
+      "configRef": "topicRestrictionConfig",
+      "rustConfigStruct": null
+    },
+    "content_moderation": {
+      "title": "Content moderation",
+      "description": "Score payloads against moderation categories. RESERVED: requires an external classifier.",
+      "rustVariant": "ContentModeration",
+      "platformEnum": "CONTENT_MODERATION",
+      "enforcement": "reserved",
+      "engine": "external_scorer",
+      "phases": ["input", "output", "both"],
+      "configRef": "contentModerationConfig",
+      "rustConfigStruct": null
+    },
+    "grounding_check": {
+      "title": "Grounding check",
+      "description": "Check the completion is grounded in supplied context. RESERVED: requires an external scorer.",
+      "rustVariant": "GroundingCheck",
+      "platformEnum": "GROUNDING_CHECK",
+      "enforcement": "reserved",
+      "engine": "external_scorer",
+      "phases": ["output"],
+      "configRef": "groundingCheckConfig",
+      "rustConfigStruct": null
+    }
+  },
+
+  "$defs": {
+    "bundleScope": {
+      "type": "object",
+      "properties": {
+        "organizationId": { "type": "string" },
+        "projectId": { "type": "string" }
+      }
+    },
+
+    "phase": {
+      "description": "Which side of the LLM call a policy inspects.",
+      "type": "string",
+      "enum": ["input", "output", "both"]
+    },
+    "policyMode": {
+      "description": "off = not evaluated; shadow = evaluated and recorded but never applied; enforce = applied.",
+      "type": "string",
+      "enum": ["off", "shadow", "enforce"],
+      "default": "shadow"
+    },
+    "policyAction": {
+      "description": "What the policy does with the payload when it flags.",
+      "type": "string",
+      "enum": ["allow", "block", "redact", "mask", "hash", "replace", "flag_only"]
+    },
+    "costWindow": {
+      "type": "string",
+      "enum": [
+        "1d_rolling",
+        "7d_rolling",
+        "30d_rolling",
+        "1d_calendar",
+        "1mo_calendar"
+      ]
+    },
+    "costEnforcementMode": {
+      "description": "strict routes through the control plane's atomic reservation API; advisory uses the cached live-state counter.",
+      "type": "string",
+      "enum": ["advisory", "strict"],
+      "default": "advisory"
+    },
+    "policySource": {
+      "description": "Which scope of the platform's merged /effective set the policy came from. Org-sourced cost_cap/rate_limit policies evaluate against org-scope counters.",
+      "type": "string",
+      "enum": ["project", "org", "organization"]
+    },
+
+    "policyType": {
+      "description": "Must list the same types as x-policy-types.",
+      "type": "string",
+      "enum": [
+        "cost_cap",
+        "rate_limit",
+        "model_allowlist",
+        "regex_match",
+        "banned_substrings",
+        "pii_detection",
+        "secrets_detection",
+        "json_schema",
+        "token_length_cap",
+        "scorer_gate",
+        "prompt_injection",
+        "topic_restriction",
+        "content_moderation",
+        "grounding_check"
+      ]
+    },
+
+    "policyBase": {
+      "type": "object",
+      "required": ["name", "type"],
+      "properties": {
+        "policyId": { "type": "string" },
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "type": { "$ref": "#/$defs/policyType" },
+        "mode": { "$ref": "#/$defs/policyMode" },
+        "failClosed": {
+          "description": "When live state is unavailable, block instead of allowing. NOTE the two defaults are deliberately different and both are correct: an absent field on the wire means `false` (a hand-written bundle must opt into blocking), while the platform's create/update API fills `true` when the client omits it, so a stored row is always explicit. `x-platform-create-default` is the value the platform's Zod schema must default to; the drift check asserts it.",
+          "type": "boolean",
+          "default": false,
+          "x-platform-create-default": true
+        },
+        "strictness": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "default": 2
+        },
+        "priority": { "type": "integer", "default": 100 },
+        "enabled": { "type": "boolean", "default": true },
+        "source": { "$ref": "#/$defs/policySource" },
+        "config": { "type": "object" }
+      }
+    },
+
+    "policy": {
+      "allOf": [
+        { "$ref": "#/$defs/policyBase" },
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "type": { "const": "cost_cap" },
+                "config": { "$ref": "#/$defs/costCapConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "rate_limit" },
+                "config": { "$ref": "#/$defs/rateLimitConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "model_allowlist" },
+                "config": { "$ref": "#/$defs/modelAllowlistConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "regex_match" },
+                "config": { "$ref": "#/$defs/regexMatchConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "banned_substrings" },
+                "config": { "$ref": "#/$defs/bannedSubstringsConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "pii_detection" },
+                "config": { "$ref": "#/$defs/piiDetectionConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "secrets_detection" },
+                "config": { "$ref": "#/$defs/secretsDetectionConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "json_schema" },
+                "config": { "$ref": "#/$defs/jsonSchemaConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "token_length_cap" },
+                "config": { "$ref": "#/$defs/tokenLengthCapConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "scorer_gate" },
+                "config": { "$ref": "#/$defs/scorerGateConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "prompt_injection" },
+                "config": { "$ref": "#/$defs/promptInjectionConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "topic_restriction" },
+                "config": { "$ref": "#/$defs/topicRestrictionConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "content_moderation" },
+                "config": { "$ref": "#/$defs/contentModerationConfig" }
+              },
+              "required": ["config"]
+            },
+            {
+              "properties": {
+                "type": { "const": "grounding_check" },
+                "config": { "$ref": "#/$defs/groundingCheckConfig" }
+              },
+              "required": ["config"]
+            }
+          ]
+        }
+      ]
+    },
+
+    "costCapConfig": {
+      "type": "object",
+      "required": ["window", "maxUsd"],
+      "properties": {
+        "window": { "$ref": "#/$defs/costWindow" },
+        "maxUsd": { "type": "number", "exclusiveMinimum": 0 },
+        "softUsd": { "type": "number", "exclusiveMinimum": 0 },
+        "action": {
+          "description": "Stateful policies can only block; there is no payload to transform at admission time.",
+          "type": "string",
+          "enum": ["block"],
+          "default": "block"
+        },
+        "scopeToModels": { "type": "array", "items": { "type": "string" } },
+        "enforcementMode": { "$ref": "#/$defs/costEnforcementMode" }
+      }
+    },
+
+    "rateWindow": {
+      "type": "object",
+      "required": ["period"],
+      "properties": {
+        "period": {
+          "description": "Window label. Restricted to the periods the control plane actually maintains counters for: a period with no counter can never be evaluated, so accepting one would create a permanently unmeasurable limit.",
+          "type": "string",
+          "enum": ["1m", "1h", "1d"]
+        },
+        "maxRequests": { "type": "integer", "minimum": 1 },
+        "maxTokens": { "type": "integer", "minimum": 1 },
+        "action": {
+          "description": "Stateful policies can only block; there is no payload to transform at admission time.",
+          "type": "string",
+          "enum": ["block"],
+          "default": "block"
+        }
+      },
+      "anyOf": [
+        { "required": ["maxRequests"] },
+        { "required": ["maxTokens"] }
+      ]
+    },
+
+    "rateLimitConfig": {
+      "type": "object",
+      "required": ["windows"],
+      "properties": {
+        "windows": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rateWindow" }
+        }
+      }
+    },
+
+    "modelAllowlistConfig": {
+      "type": "object",
+      "properties": {
+        "allowed": { "type": "array", "items": { "type": "string" } },
+        "denied": { "type": "array", "items": { "type": "string" } },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" }
+      },
+      "anyOf": [{ "required": ["allowed"] }, { "required": ["denied"] }]
+    },
+
+    "regexPattern": {
+      "type": "object",
+      "required": ["name", "regex"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "regex": { "type": "string", "minLength": 1 },
+        "flags": { "type": "string", "default": "" }
+      }
+    },
+
+    "regexMatchConfig": {
+      "type": "object",
+      "required": ["patterns"],
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "output" },
+        "patterns": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/regexPattern" }
+        },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" },
+        "redactWith": { "type": "string", "default": "[REDACTED]" },
+        "regexTimeoutMs": { "type": "integer", "minimum": 1, "default": 50 }
+      }
+    },
+
+    "bannedSubstringsConfig": {
+      "type": "object",
+      "required": ["words"],
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "both" },
+        "words": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "caseInsensitive": { "type": "boolean", "default": true },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" },
+        "redactWith": { "type": "string", "default": "[REDACTED]" }
+      }
+    },
+
+    "piiDetectionConfig": {
+      "type": "object",
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "both" },
+        "entities": {
+          "description": "Entity types to detect, e.g. EMAIL_ADDRESS, US_SSN. Empty means all known.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "action": { "$ref": "#/$defs/policyAction", "default": "mask" },
+        "maskChar": { "type": "string", "minLength": 1, "default": "*" }
+      }
+    },
+
+    "secretsDetectionConfig": {
+      "type": "object",
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "both" },
+        "detectors": {
+          "description": "Detector ids, e.g. aws_access_key, openai_key. Empty means all known. An unsupported id is rejected, not ignored.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" }
+      }
+    },
+
+    "jsonSchemaConfig": {
+      "type": "object",
+      "required": ["schema"],
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "output" },
+        "schema": {
+          "description": "The JSON Schema document the model output must conform to.",
+          "type": "object"
+        },
+        "allowMarkdownCodeFences": { "type": "boolean", "default": true },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" }
+      }
+    },
+
+    "tokenLengthCapConfig": {
+      "type": "object",
+      "required": ["maxTokens"],
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "input" },
+        "maxTokens": { "type": "integer", "minimum": 1 },
+        "scopeToModels": { "type": "array", "items": { "type": "string" } },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" }
+      }
+    },
+
+    "scorerGateConfig": {
+      "type": "object",
+      "required": ["scorer", "threshold"],
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "output" },
+        "scorer": {
+          "description": "NovaEval scorer id to invoke.",
+          "type": "string",
+          "minLength": 1
+        },
+        "threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "comparison": {
+          "type": "string",
+          "enum": ["lt", "lte", "gt", "gte"],
+          "default": "lt"
+        },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" },
+        "timeoutMs": { "type": "integer", "minimum": 1, "default": 2000 }
+      }
+    },
+
+    "promptInjectionConfig": {
+      "type": "object",
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "input" },
+        "threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.8
+        },
+        "detectors": { "type": "array", "items": { "type": "string" } },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" }
+      }
+    },
+
+    "topicRestrictionConfig": {
+      "type": "object",
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "both" },
+        "allowedTopics": { "type": "array", "items": { "type": "string" } },
+        "blockedTopics": { "type": "array", "items": { "type": "string" } },
+        "threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.7
+        },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" }
+      },
+      "anyOf": [
+        { "required": ["allowedTopics"] },
+        { "required": ["blockedTopics"] }
+      ]
+    },
+
+    "contentModerationConfig": {
+      "type": "object",
+      "required": ["categories"],
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "both" },
+        "categories": {
+          "description": "Moderation categories to score, e.g. hate, self_harm, sexual, violence.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.7
+        },
+        "action": { "$ref": "#/$defs/policyAction", "default": "block" }
+      }
+    },
+
+    "groundingCheckConfig": {
+      "type": "object",
+      "properties": {
+        "phase": { "$ref": "#/$defs/phase", "default": "output" },
+        "minGroundingScore": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.7
+        },
+        "sourceField": {
+          "description": "Request field holding the grounding context.",
+          "type": "string",
+          "default": "context"
+        },
+        "action": { "$ref": "#/$defs/policyAction", "default": "flag_only" }
+      }
+    }
+  }
+}

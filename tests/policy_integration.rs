@@ -52,11 +52,19 @@ async fn canned_secret_handler() -> Response {
 }
 
 fn router(engine: PolicyEngine) -> Router {
-    let engine = Arc::new(engine);
+    // No platform live-state in tests (`live: None`) → cost_cap/rate_limit fail open.
+    // No usage reporter either (`usage: None`).
+    let guard_state = noveum_ai_gateway::policy::middleware::GuardState {
+        engine: Arc::new(engine),
+        live: None,
+        usage: None,
+        pending: Arc::new(noveum_ai_gateway::policy::remote::PendingSpend::new()),
+        admission: None,
+    };
     Router::new()
         .route("/v1/chat/completions", post(echo_handler))
         .route("/v1/canned", post(canned_secret_handler))
-        .layer(from_fn_with_state(engine, guard_middleware))
+        .layer(from_fn_with_state(guard_state, guard_middleware))
 }
 
 fn engine_from(json_bundle: &str) -> PolicyEngine {
@@ -274,4 +282,58 @@ async fn disabled_engine_is_pure_passthrough() {
     let resp = app.oneshot(req).await.unwrap();
     let (status, _) = response_json(resp).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// NOV-107: a policy the engine cannot compile must not be a silent no-op on the
+/// live request path. A `failClosed` one blocks; a fail-open one lets traffic
+/// through but is still visible to the operator via `rejected_policies()`.
+#[tokio::test]
+async fn fail_closed_unenforceable_policy_blocks_the_request_path() {
+    // `content_moderation` is in the contract but needs an external classifier
+    // this build does not call, so it can never take effect. Marked
+    // `failClosed`, the honest outcome is to block rather than to quietly admit
+    // everything the operator believed was being moderated.
+    let engine = engine_from(
+        r#"{"policies":[{"name":"moderation","type":"content_moderation","mode":"enforce",
+        "failClosed":true,"config":{"categories":["hate","violence"]}}]}"#,
+    );
+    assert_eq!(engine.rejected_policy_count(), 1);
+    assert!(engine.rejected_policies()[0].contains("content_moderation"));
+
+    let app = router(engine);
+    let req = post_json(
+        "/v1/chat/completions",
+        json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.headers().get("x-noveum-guard-blocked").unwrap(),
+        "true"
+    );
+    let (status, body) = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK); // synthetic_success default
+    assert_eq!(body["x_noveum_guard"]["blocked"], true);
+}
+
+#[tokio::test]
+async fn unknown_policy_type_is_reported_but_fails_open() {
+    // A typo'd type must be loudly visible without taking production down.
+    let engine = engine_from(
+        r#"{"policies":[{"name":"typo","type":"promt_injection","mode":"enforce","config":{}}]}"#,
+    );
+    assert_eq!(engine.active_policy_count(), 0);
+    let rejected = engine.rejected_policies();
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0].contains("promt_injection"), "{rejected:?}");
+
+    let app = router(engine);
+    let req = post_json(
+        "/v1/chat/completions",
+        json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert!(resp.headers().get("x-noveum-guard-blocked").is_none());
+    let (status, body) = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["messages"][0]["content"], "hello");
 }

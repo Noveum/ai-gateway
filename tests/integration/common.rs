@@ -8,6 +8,12 @@ use reqwest::{
 use serde_json::{json, Value};
 use std::env;
 
+#[derive(Clone, Copy)]
+enum OutputLimitField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
 /// Configuration for a provider test
 pub struct ProviderTestConfig {
     pub provider_name: String,
@@ -15,6 +21,7 @@ pub struct ProviderTestConfig {
     pub model: String,
     pub prompt: String,
     pub max_tokens: u32,
+    output_limit_field: OutputLimitField,
 }
 
 impl ProviderTestConfig {
@@ -25,6 +32,7 @@ impl ProviderTestConfig {
             model: model.to_string(),
             prompt: "Write a very short poem about Rust programming language".to_string(),
             max_tokens: 100,
+            output_limit_field: OutputLimitField::MaxTokens,
         }
     }
 
@@ -35,6 +43,13 @@ impl ProviderTestConfig {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self.output_limit_field = OutputLimitField::MaxTokens;
+        self
+    }
+
+    pub fn with_max_completion_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self.output_limit_field = OutputLimitField::MaxCompletionTokens;
         self
     }
 }
@@ -115,7 +130,7 @@ pub fn setup_test_headers(provider: &str, api_key: &str) -> HeaderMap {
 
 /// Create a request body for a provider test
 pub fn create_test_request_body(config: &ProviderTestConfig, stream: bool) -> Value {
-    json!({
+    let mut body = json!({
         "model": config.model,
         "messages": [
             {
@@ -123,9 +138,14 @@ pub fn create_test_request_body(config: &ProviderTestConfig, stream: bool) -> Va
                 "content": config.prompt
             }
         ],
-        "stream": stream,
-        "max_tokens": config.max_tokens
-    })
+        "stream": stream
+    });
+    let field = match config.output_limit_field {
+        OutputLimitField::MaxTokens => "max_tokens",
+        OutputLimitField::MaxCompletionTokens => "max_completion_tokens",
+    };
+    body[field] = json!(config.max_tokens);
+    body
 }
 
 /// Get API key for the provider
@@ -245,10 +265,45 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
     );
 }
 
+#[derive(Default)]
+struct StreamingSmokeState {
+    data_chunks: Vec<Value>,
+    saw_done: bool,
+}
+
+impl StreamingSmokeState {
+    fn process_line(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if line == "data: [DONE]" {
+            self.saw_done = true;
+            return;
+        }
+        if let Some(json_str) = line.strip_prefix("data: ") {
+            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                self.data_chunks.push(json);
+            }
+        }
+    }
+
+    fn validate_complete(&self) -> Result<(), &'static str> {
+        if self.data_chunks.is_empty() {
+            return Err("No streaming data chunks received");
+        }
+        if !self.saw_done {
+            return Err("Streaming response ended without the required data: [DONE] marker");
+        }
+        Ok(())
+    }
+}
+
 /// Run a streaming test for a provider.
 ///
-/// Validates that the gateway streams an OpenAI-compatible SSE response and that
-/// non-empty content is reconstructable from the chunks.
+/// Validates that the gateway streams OpenAI-compatible JSON chunks and finishes
+/// with the protocol's `data: [DONE]` marker. A valid tool-call response may have
+/// no text content, so completion is defined by the SSE protocol, not text deltas.
 pub async fn run_streaming_test(config: &ProviderTestConfig) {
     let api_key = get_api_key(&config.api_key_env_var);
     let gateway_url = gateway_url();
@@ -287,33 +342,11 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
     );
 
     let mut stream = response.bytes_stream();
-    let mut stream_data: Vec<Value> = Vec::new();
-    let mut content = String::new();
+    let mut state = StreamingSmokeState::default();
 
     // Network chunks do not align to SSE event boundaries, so buffer raw bytes
     // and only parse complete lines (a `data:` line split across two chunks would
     // otherwise be dropped, making the test flaky).
-    let mut process_line = |line: &str| {
-        let line = line.trim();
-        if line.is_empty() || line == "data: [DONE]" {
-            return;
-        }
-        if let Some(json_str) = line.strip_prefix("data: ") {
-            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                if let Some(delta) = json
-                    .get("choices")
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    content.push_str(delta);
-                }
-                stream_data.push(json);
-            }
-        }
-    };
-
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.expect("Failed to read chunk");
@@ -321,22 +354,60 @@ pub async fn run_streaming_test(config: &ProviderTestConfig) {
         // Drain complete lines (everything up to and including each '\n').
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            process_line(&String::from_utf8_lossy(&line_bytes));
+            state.process_line(&String::from_utf8_lossy(&line_bytes));
         }
     }
     // Handle any final line not terminated by a newline.
     if !buf.is_empty() {
-        process_line(&String::from_utf8_lossy(&buf));
+        state.process_line(&String::from_utf8_lossy(&buf));
     }
 
-    assert!(!stream_data.is_empty(), "No streaming data chunks received");
-    assert!(
-        !content.is_empty(),
-        "Reconstructed streaming content should not be empty"
-    );
+    state
+        .validate_complete()
+        .unwrap_or_else(|message| panic!("{message}"));
 
     println!(
         "Streaming test completed successfully for provider: {}",
         config.provider_name
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_smoke_rejects_a_stream_without_the_done_marker() {
+        let mut state = StreamingSmokeState::default();
+        state.process_line(r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#);
+
+        let message = state
+            .validate_complete()
+            .expect_err("a stream without data: [DONE] must fail the smoke test");
+        assert!(
+            message.contains("data: [DONE]"),
+            "failure should name the missing terminator, got: {message}"
+        );
+    }
+
+    #[test]
+    fn streaming_smoke_accepts_tool_calls_without_text_content() {
+        let mut state = StreamingSmokeState::default();
+        state.process_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
+        );
+        state.process_line("data: [DONE]");
+
+        assert_eq!(state.validate_complete(), Ok(()));
+    }
+
+    #[test]
+    fn request_body_can_select_max_completion_tokens_without_leaking_max_tokens() {
+        let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-5.6-luna")
+            .with_max_completion_tokens(16);
+        let body = create_test_request_body(&config, false);
+
+        assert_eq!(body["max_completion_tokens"], 16);
+        assert!(body.get("max_tokens").is_none());
+    }
 }

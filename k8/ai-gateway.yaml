@@ -1,3 +1,40 @@
+# Shared public gateway (gateway.noveum.ai).
+#
+# ⚠ DO NOT add NOVEUM_API_KEY / NOVEUM_GUARD_PROJECT_ID to this Deployment.
+#
+# Those two variables select DEDICATED mode, in which NOVEUM_GUARD_PROJECT_ID is
+# process-wide: every request a replica serves would be metered and capped
+# against that one project no matter which tenant sent it. This deployment is
+# multi-tenant, so dedicated mode would mis-bill every tenant but one.
+#
+# The mode this deployment needs is SHARED:
+#
+#   NOVEUM_GUARD_TENANCY=shared      # and NEITHER of the two variables above
+#   NOVEUM_API_URL=https://api.noveum.ai
+#
+# In shared mode every /v1/* caller authenticates with its own Noveum API key in
+# the `x-noveum-api-key` header, and the project + organization to enforce
+# against are derived server-side from that credential. There is deliberately no
+# process-wide key: each caller's own key is used for its own platform calls, so
+# one tenant's secret is never applied to another's traffic. That key needs
+# `projects:read` (to derive the project), `guardrails:read` (policies + live
+# state) and `guardrails:ingest` (usage + reservation settlement).
+#
+# `/health` stays reachable without a credential, so the liveness probe below
+# needs no change.
+#
+# Before turning it on here, two things must hold:
+#
+#   1. The platform's composite /state (the nested `org` block) is deployed.
+#      The order is mandatory: platform first, then the gateway. Reversed,
+#      org-scoped counters read as unavailable and fail-closed org policies
+#      block during the rollout.
+#   2. You accept that with an HPA up to 50 replicas, a cost cap in ADVISORY
+#      enforcement is a per-process estimate, not a cross-replica hard cap.
+#      Set NOVEUM_GUARD_COST_ENFORCEMENT=strict for platform-atomic admission,
+#      which does hold across replicas.
+#
+# See "Platform-managed Nova Guard: the two deployment modes" in the README.
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

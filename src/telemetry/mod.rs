@@ -3,6 +3,8 @@ pub mod middleware;
 pub mod plugins;
 pub mod provider_metrics;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use self::plugins::NovaGuardUsagePlugin;
 pub use self::{metrics::MetricsRegistry, middleware::metrics_middleware, plugins::ConsolePlugin};
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +66,13 @@ pub(crate) struct LogMetadata {
     pub ttfb: u128, // Time to First Byte in milliseconds
     pub tokens: TokenInfo,
     pub cost: Option<f64>,
+    /// Itemized components behind `cost`, so an exported log can be reconciled
+    /// against a provider invoice line by line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_breakdown: Option<Value>,
+    /// The pricing catalog version `cost` was computed from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing_version: Option<String>,
     pub status: String,
     pub path: String,
     pub method: String,
@@ -119,6 +128,17 @@ pub struct RequestMetrics {
     // Cost metrics
     pub cost: Option<f64>,
 
+    /// The itemized cost behind `cost`: what was spent on uncached input, on
+    /// cache reads, on cache writes, on output and on per-request tool fees,
+    /// plus the catalog version those rates came from and whether any dimension
+    /// could not be priced.
+    ///
+    /// `cost` alone cannot answer "why"; a bill that says $0.07 with no
+    /// components is unauditable, and one that silently omits a dimension it
+    /// could not price is worse than unauditable. `None` only when there was no
+    /// usage to price at all.
+    pub cost_breakdown: Option<crate::policy::pricing::CostBreakdown>,
+
     // OpenTelemetry additional fields
     pub id: Option<String>,
     pub thread_id: Option<String>,
@@ -136,6 +156,11 @@ pub struct RequestMetrics {
     // Streaming response data
     pub streamed_data: Option<Vec<Value>>,
     pub is_streaming: bool,
+
+    /// True when this response is a Nova Guard synthetic block, not a real
+    /// provider call. Usage reporting skips these (the BLOCKED usage event is
+    /// emitted by the guard middleware instead) so a block isn't double-counted.
+    pub guard_blocked: bool,
 }
 
 impl RequestMetrics {
@@ -160,6 +185,14 @@ impl RequestMetrics {
             ttfb: self.ttfb.as_millis(),
             tokens: token_info,
             cost: self.cost,
+            cost_breakdown: self
+                .cost_breakdown
+                .as_ref()
+                .and_then(|b| serde_json::to_value(b).ok()),
+            pricing_version: self
+                .cost_breakdown
+                .as_ref()
+                .map(|b| b.pricing_version.to_string()),
             status: status.to_string(),
             path: self.path.clone(),
             method: self.method.clone(),

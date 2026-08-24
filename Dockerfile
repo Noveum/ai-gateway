@@ -1,5 +1,5 @@
 # Build stage
-# Rust 1.96 (>= the crate's MSRV of 1.91); 1.82 is too old — some transitive
+# Rust 1.96 (>= the crate's MSRV of 1.94.1); 1.82 is too old — some transitive
 # dependencies now ship `edition = "2024"` manifests that need Cargo >= 1.85.
 FROM --platform=linux/amd64 rust:1.96-slim-bookworm AS builder
 
@@ -24,8 +24,14 @@ RUN mkdir src && \
     cargo build --release --target x86_64-unknown-linux-gnu && \
     rm -rf src
 
-# Now copy the real source code
+# Now copy the real source code, plus the data directories the crate embeds at
+# compile time via include_str! — without them cargo cannot compile the lib:
+#   schema/  -> src/policy/policy_types.rs (policy JSON Schema)
+#   pricing/ -> src/policy/pricing.rs (catalog integrity check; test-only today,
+#               copied anyway so a future non-test embed can't break only Docker)
 COPY src ./src
+COPY schema ./schema
+COPY pricing ./pricing
 
 # Build the application
 RUN RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --target x86_64-unknown-linux-gnu && \
@@ -48,4 +54,4 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /usr/src/app/target/x86_64-unknown-linux-gnu/release/noveum-ai-gateway /usr/local/bin/
 
 # Set the startup command
-CMD ["noveum-ai-gateway"] 
+CMD ["noveum-ai-gateway"]

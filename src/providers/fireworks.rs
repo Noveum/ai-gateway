@@ -5,7 +5,7 @@
 //! stripped since the base URL already carries it). Token usage comes from the
 //! standard `usage` object and cost is priced via the shared table.
 
-use super::utils::log_tracking_headers;
+use super::utils::{log_tracking_headers, normalized_bearer_header};
 use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
@@ -69,28 +69,10 @@ impl Provider for FireworksProvider {
             .get(http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
         {
-            // Validate token is not empty
-            if auth.trim().is_empty() {
-                error!("Empty authorization token provided for Fireworks");
-                return Err(AppError::InvalidHeader);
-            }
-
-            // Validate token format
-            if !auth.starts_with("Bearer ") {
-                error!("Invalid authorization format for Fireworks - must start with 'Bearer'");
-                return Err(AppError::InvalidHeader);
-            }
-
-            // Validate token is not just "Bearer "
-            if auth.len() <= 7 {
-                error!("Empty Bearer token in Fireworks authorization header");
-                return Err(AppError::InvalidHeader);
-            }
-
             debug!("Using provided authorization header for Fireworks");
             headers.insert(
                 http::header::AUTHORIZATION,
-                http::header::HeaderValue::from_str(auth).map_err(|_| {
+                normalized_bearer_header(auth).map_err(|_| {
                     error!("Invalid characters in Fireworks authorization header");
                     AppError::InvalidHeader
                 })?,
@@ -189,6 +171,15 @@ impl MetricsExtractor for FireworksMetricsExtractor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn process_headers_normalizes_case_insensitive_bearer() {
+        let p = FireworksProvider::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "bearer fireworks-test".parse().unwrap());
+        let out = p.process_headers(&headers).unwrap();
+        assert_eq!(out.get("authorization").unwrap(), "Bearer fireworks-test");
+    }
 
     #[test]
     fn base_url_includes_v1_and_path_is_stripped() {

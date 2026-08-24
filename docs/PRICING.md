@@ -1,180 +1,308 @@
-# Model Pricing
+# Model pricing and Nova Guard cost accounting
 
-The gateway computes a per-request USD cost from a built-in model pricing table
-([`src/policy/pricing.rs`](../src/policy/pricing.rs)). The same table is used by
-the Nova Guard `cost_cap` reservation estimate and by every provider's metrics
-extractor, so cost is single-sourced.
+The gateway's checked-in pricing catalog is version **`2026.08.23`**. All token
+rates are USD per 1,000,000 tokens. Nova Guard uses these rates to reserve and
+settle cost-cap usage; they are policy estimates, not a provider invoice.
 
-> **Accuracy / scope.** Prices are USD **per 1,000,000 tokens**, standard
-> synchronous tier, current as of **June 2026**, verified against official
-> provider pricing pages. The table intentionally does **not** model
-> cached-input, batch, or tiered pricing — see [caveats](#caveats). It exists to
-> support budget caps and cost annotation, not to be the system of record for
-> billing.
+The complete, reviewable manifest is [`pricing/catalog.json`](../pricing/catalog.json).
+It contains 161 current and legacy base rows, cache rates, long-context tiers,
+scheduled changes, tool fees, source links, aliases, and provenance. This guide
+describes the accounting contract and highlights current rows instead of
+duplicating that entire manifest.
 
-## How lookup works
+## Sources of truth
 
-* **Exact match** on the lowercased model id wins.
-* Otherwise a **dated-snapshot family match** applies: the longest table id that
-  the requested id extends *at a version boundary* (`-`, `:`, `.`, `@`, `/`)
-  wins — so `gpt-4o-2024-11-20` → `gpt-4o`, but `gpt-4` (shorter, no boundary)
-  and garbage prefixes like `g` resolve to **nothing** (cost `0`, never a wrong
-  family).
-* Unknown models cost `0.0`; the caller decides whether unknown-model cost
-  should fail open or closed.
+| Concern | Location |
+|---|---|
+| Versioned base/cache rates, long-context and scheduled rows, aliases, tool fees, and primary-source URLs | [`pricing/catalog.json`](../pricing/catalog.json) |
+| Gateway runtime mirror used by the compiled binary | [`src/policy/pricing_catalog.rs`](../src/policy/pricing_catalog.rs) |
+| Lookup, conservative fallbacks, request reservation, usage parsing, and settlement arithmetic | [`src/policy/pricing.rs`](../src/policy/pricing.rs) |
+| Platform billing mirror | `packages/telemetry/src/pricing/generated/index.ts` in the Noveum platform repository |
 
-## Provider coverage
+`pricing/catalog.json` is the rate-review manifest. The Rust and platform
+tables are currently hand-maintained mirrors, not generated artifacts. A rate
+change is incomplete until all applicable copies, tests, and the catalog
+version agree.
 
-The gateway proxies these providers (via `x-provider`). All are priced from the
-table below **except OpenRouter**, which is a meta-router — it is priced only when
-the upstream model id it returns also appears in the table, and otherwise reports
-cost `0` (see [caveats](#caveats)).
+## What one cost contains
 
-| Provider | `x-provider` | Endpoint / mode |
-|---|---|---|
-| OpenAI | `openai` | native |
-| Anthropic | `anthropic` | native |
-| AWS Bedrock | `bedrock` | SigV4 |
-| Groq | `groq` | OpenAI-compatible |
-| Together AI | `together` | OpenAI-compatible |
-| Fireworks AI | `fireworks` | OpenAI-compatible |
-| Mistral | `mistral` | OpenAI-compatible |
-| Cohere | `cohere` | OpenAI-compatibility endpoint |
-| Google Gemini | `google` / `gemini` | OpenAI-compatibility endpoint (`/v1beta/openai`) |
-| DeepSeek | `deepseek` | OpenAI-compatible |
-| xAI (Grok) | `xai` / `grok` | OpenAI-compatible |
-| OpenRouter | `openrouter` | OpenAI-compatible (routed; priced only if upstream model is in the table) |
-| Perplexity | `perplexity` | OpenAI-compatible |
+For catalog-priced usage, the total is:
 
-## Pricing table (USD per 1M tokens)
+```text
+uncached input
++ cache reads
++ cache writes (default TTL and Anthropic 1-hour TTL separately)
++ output
++ known per-call tool/search fees
+```
 
-### OpenAI
-| model | input | output |
-|---|---|---|
-| gpt-5 | 1.25 | 10.00 |
-| gpt-5-mini | 0.25 | 2.00 |
-| gpt-5-nano | 0.05 | 0.40 |
-| gpt-4.1 | 2.00 | 8.00 |
-| gpt-4.1-mini | 0.40 | 1.60 |
-| gpt-4.1-nano | 0.10 | 0.40 |
-| gpt-4o | 2.50 | 10.00 |
-| gpt-4o-mini | 0.15 | 0.60 |
-| o3 | 2.00 | 8.00 |
-| o4-mini | 1.10 | 4.40 |
-| o1 | 15.00 | 60.00 |
-| text-embedding-3-small | 0.02 | — |
-| text-embedding-3-large | 0.13 | — |
+Long-context tiers are selected using the total input context, including cache
+reads and writes. A request/response multiplier, such as Anthropic US-only
+inference or fast mode, applies to every token and cache dimension but not to a
+separately priced tool call.
 
-### Anthropic
-| model | input | output |
-|---|---|---|
-| claude-opus-4-8 | 5.00 | 25.00 |
-| claude-opus-4-7 | 5.00 | 25.00 |
-| claude-opus-4-6 | 5.00 | 25.00 |
-| claude-sonnet-4-6 | 3.00 | 15.00 |
-| claude-sonnet-4-5 | 3.00 | 15.00 |
-| claude-haiku-4-5 | 1.00 | 5.00 |
-| claude-fable-5 | 10.00 | 50.00 |
+Every breakdown records the catalog version, whether all used dimensions were
+priced, which dimensions were missing, whether an unknown-model assumption was
+used, and whether the total came from catalog arithmetic or an authoritative
+provider-reported charge. For `xai` / `grok`, a supplied
+`usage.cost_in_usd_ticks` is authoritative: xAI defines 10 billion ticks as one
+USD and documents the total as including cache discounts and server-side tools.
+When that field is absent, the gateway falls back to catalog arithmetic. No
+other provider is configured as an authoritative cost source in catalog version
+`2026.08.23`.
 
-### Google Gemini
-| model | input | output |
-|---|---|---|
-| gemini-2.5-pro | 1.25 | 10.00 |
-| gemini-2.5-flash | 0.30 | 2.50 |
-| gemini-2.5-flash-lite | 0.10 | 0.40 |
+## Lookup and defensive pricing
 
-### Groq
-| model | input | output |
-|---|---|---|
-| llama-3.3-70b-versatile | 0.59 | 0.79 |
-| llama-3.1-8b-instant | 0.05 | 0.08 |
-| meta-llama/llama-4-scout-17b-16e-instruct | 0.11 | 0.34 |
-| openai/gpt-oss-120b | 0.15 | 0.60 |
-| openai/gpt-oss-20b | 0.075 | 0.30 |
+Lookup lowercases the model ID and applies these rules:
 
-### Mistral
-| model | input | output |
-|---|---|---|
-| mistral-large-latest | 0.50 | 1.50 |
-| mistral-medium-latest | 1.50 | 7.50 |
-| mistral-small-latest | 0.15 | 0.60 |
-| codestral-latest | 0.30 | 0.90 |
-| magistral-medium-latest | 2.00 | 5.00 |
+1. An exact model ID wins.
+2. A declared exact alias is resolved to its concrete target.
+3. Otherwise the longest catalog family extended at a version boundary (`-`,
+   `:`, `.`, `@`, or `/`) wins. For example, a dated `gpt-4o-*` snapshot can
+   match `gpt-4o`, while `gpt-4oxyz` cannot.
 
-### Cohere
-| model | input | output |
-|---|---|---|
-| command-a-03-2025 | 2.50 | 10.00 |
-| command-r-plus-08-2024 | 2.50 | 10.00 |
-| command-r-08-2024 | 0.15 | 0.60 |
-| command-r7b-12-2024 | 0.0375 | 0.15 |
+The current exact aliases are `gpt-5.6` and `daybreak-blue-latest` to
+`gpt-5.6-sol`, plus `daybreak-red-latest` to `gpt-5.6-cyber`.
 
-### Together AI
-| model | input | output |
-|---|---|---|
-| meta-llama/llama-3.3-70b-instruct-turbo | 1.04 | 1.04 |
-| meta-llama/llama-4-maverick-17b-128e-instruct-fp8 | 0.27 | 0.85 |
-| meta-llama/llama-4-scout-17b-16e-instruct | 0.18 | 0.59 |
-| deepseek-ai/deepseek-v3 | 1.25 | 1.25 |
+An unknown model is **not free and is not globally rejected**. Nova Guard
+prices it at the maximum input and output rates derived from the compiled Rust
+runtime's base, long-context, and scheduled rows (currently $15/$75 per
+million), marks the breakdown as assumed, and emits a deduplicated warning.
+This lets the proxy pass new provider model IDs while preventing an
+unrecognized ID from reserving $0. A `cost_cap` with `failClosed: true` blocks
+an unknown model lookup. For a known model, an unpriced cache/tool dimension is
+conservatively charged and marked incomplete, but incompleteness alone does not
+currently trigger the policy's fail-closed branch.
 
-### Fireworks AI
-| model | input | output |
-|---|---|---|
-| accounts/fireworks/models/deepseek-v4-pro | 1.74 | 3.48 |
-| accounts/fireworks/models/deepseek-v4-flash | 0.14 | 0.28 |
-| accounts/fireworks/models/kimi-k2p6 | 0.95 | 4.00 |
-| accounts/fireworks/models/llama-v3p3-70b-instruct | 0.90 | 0.90 |
+When a provider reports a billable dimension whose rate is missing, the
+gateway also refuses to silently drop it:
 
-### AWS Bedrock (US on-demand)
-| model | input | output |
-|---|---|---|
-| anthropic.claude-opus-4-5-20251101-v1:0 | 5.00 | 25.00 |
-| anthropic.claude-sonnet-4-5-20250929-v1:0 | 3.00 | 15.00 |
-| anthropic.claude-haiku-4-5-20251001-v1:0 | 1.00 | 5.00 |
-| amazon.nova-pro-v1:0 | 0.80 | 3.20 |
-| amazon.nova-lite-v1:0 | 0.06 | 0.24 |
-| amazon.nova-micro-v1:0 | 0.035 | 0.14 |
-| amazon.nova-premier-v1:0 | 2.50 | 12.50 |
+- an unpriced cache read uses that model's uncached-input rate;
+- an unpriced cache write uses that input rate times the largest catalogued
+  cache-write premium (currently 2x);
+- an unknown tool uses the largest catalogued per-call tool fee.
 
-### DeepSeek (cache-miss input)
-| model | input | output |
-|---|---|---|
-| deepseek-v4-flash | 0.14 | 0.28 |
-| deepseek-v4-pro | 0.435 | 0.87 |
-| deepseek-chat | 0.27 | 1.10 |
-| deepseek-reasoner | 0.55 | 2.19 |
+The breakdown is marked incomplete in each case. A low-level catalog-only
+helper may use `0` to mean "no row" internally, but the reservation, policy,
+telemetry, and settlement boundaries replace that sentinel with this defensive
+breakdown. It is never recorded as a real zero-dollar unknown call.
 
-### xAI (Grok)
-| model | input | output |
-|---|---|---|
-| grok-4.3 | 1.25 | 2.50 |
-| grok-build-0.1 | 1.00 | 2.00 |
+## Reservation and settlement
 
-### Perplexity (token cost only; per-request search fees billed separately)
-| model | input | output |
-|---|---|---|
-| sonar | 1.00 | 1.00 |
-| sonar-pro | 3.00 | 15.00 |
-| sonar-reasoning-pro | 2.00 | 8.00 |
+Nova Guard builds a preflight hold from its current request-token estimate,
+explicit output ceiling, and declared billable dimensions, then settles against
+provider-reported usage:
 
-## Caveats
+- An applicable enforcing, blocking, strict `cost_cap` requires a positive
+  explicit `max_tokens`, `max_completion_tokens`, or `max_output_tokens`.
+  Multiple non-null aliases must agree; strict admission rejects a conflict and
+  normalizes compatible-provider requests to one upstream ceiling.
+  Unbounded strict requests receive HTTP 400 `missing_output_limit` before a
+  reservation or provider call. Advisory caps and rate-only policies may use
+  `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` (default `1024`).
+- The strict contract is intentionally narrower than transparent proxying: it
+  accepts bounded JSON `/v1/chat/completions` requests with a model and messages.
+  It rejects Responses/conversation state, images, files, audio, remote search
+  (including xAI `search_parameters`), server/MCP tools, multi-choice
+  `n`/`best_of`, Perplexity, and OpenRouter before admission. Client function
+  tools remain supported on adapters that translate or transparently pass them;
+  Bedrock tool use is not translated yet. Strict Bedrock admission is limited
+  to catalogued commercial Claude IDs/profiles whose global or geographic
+  multiplier is derivable from the model ID; region-priced Nova/Titan families
+  are rejected before reservation until source Region is part of the pricing
+  contract. Direct OpenAI strict calls are pinned
+  to `service_tier: "default"`; premium service tiers are rejected.
+  Advisory policies retain the broader proxy surface. Because a multipart or
+  otherwise non-JSON body has no trustworthy model with which to evaluate
+  `scopeToModels`, the presence of any enforcing/blocking strict cap rejects
+  that opaque shape instead of guessing that it is out of scope.
+- Declaring Anthropic prompt caching reserves the **entire estimated prompt**
+  as a first-write miss at the longest declared TTL. A `1h` breakpoint
+  therefore reserves the 2x input write rate; omitted TTL means `5m` (1.25x).
+  This is intentionally conservative even when only part of the prompt has a
+  breakpoint.
+- For eligible Anthropic models, `inference_geo: "global"` reserves standard
+  rates and `"us"` reserves 1.1x. If it is omitted, admission reserves 1.1x
+  because the workspace can select US-only inference; provider-reported geo
+  settles the hold to the exact multiplier.
+- Anthropic `speed: "fast"` is accepted only for `claude-opus-5` and
+  `claude-opus-4-8` and reserves 2x token/cache rates. It stacks
+  multiplicatively with US-only inference, so the combined reservation and
+  settlement multiplier is 2.2x. `speed: "standard"` and omission use the
+  normal rate. Invalid values and fast mode on other models are rejected before
+  admission. The caller must also opt into Anthropic's research preview with
+  `anthropic-beta: fast-mode-2026-02-01`; the gateway forwards rather than
+  synthesizes that header.
+- A supported request-declared tool fee, such as OpenAI web search, is included
+  in the reservation. Provider-reported tool counts are included in settlement
+  when the request shape itself is supported.
+- An Anthropic pre-output refusal (`stop_reason: "refusal"` with zero output
+  tokens) retains token counts for observability but settles monetary cost to
+  **$0**. A refusal after any output is billed normally.
+- A response with explicit zero output is authoritative and completes the
+  reservation. Buffered and streaming settlement both require authoritative
+  input **and** output token fields; missing usage or either missing half
+  abandons and retains the conservative estimate.
 
-1. **Gemini 2.5 Pro is tiered** — input/output double above a 200K-token prompt.
-   The table uses the ≤200K rate; large-context calls are under-priced. Handle
-   the threshold separately if exact billing matters.
-2. **Cache-hit / cache-miss** — DeepSeek and Fireworks have large cache-hit
-   discounts; the table uses cache-miss input. Track cached tokens separately to
-   avoid over-billing cached traffic.
-3. **Perplexity** adds per-request search fees ($5–$14 / 1,000 requests) on top
-   of tokens — not representable as a token rate.
-4. **OpenRouter** is a meta-router with per-upstream-model pricing; it is routed
-   but not priced in the table (cost annotates as `0` unless the underlying
-   model id also appears here).
-5. **xAI** retired several slugs (`grok-3`, `grok-4`) that now redirect to
-   `grok-4.3`; map old ids explicitly if you depend on them.
+## Current catalog highlights
+
+These rows are a small operational subset of the full manifest. Cache columns
+mean cache hit, default cache write, and Anthropic 1-hour cache write
+respectively; `—` means the dimension is not present for that row.
+
+### OpenAI GPT-5.6 family
+
+| Model | Input | Output | Cache hit | Cache write |
+|---|---:|---:|---:|---:|
+| `gpt-5.6-luna` | $0.20 | $1.20 | $0.02 | $0.25 |
+| `gpt-5.6-terra` | $2.00 | $12.00 | $0.20 | $2.50 |
+| `gpt-5.6-sol` | $4.00 | $20.00 | $0.40 | $5.00 |
+| `gpt-5.6-cyber` | $12.50 | $75.00 | $1.25 | $15.625 |
+
+The current `gpt-5.6` and `daybreak-blue-latest` aliases resolve to
+`gpt-5.6-sol`; `daybreak-red-latest` resolves to `gpt-5.6-cyber`.
+
+OpenAI describes the GPT-5.6 Sol Standard rates above as promotional and
+available **at least through November 21, 2026**. It has not published an exact
+end date or replacement rates, so the catalog carries the promotion as the
+current rate and intentionally has no scheduled rollback.
+
+### Current Anthropic rows
+
+| Model | Availability note | Input | Output | Cache hit | 5m write | 1h write |
+|---|---|---:|---:|---:|---:|---:|
+| `claude-sonnet-5` | Active; $2/$10 launch pricing is permanent | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
+| `claude-opus-5` | Active | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| `claude-opus-4-8` | Active | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| `claude-opus-4-5-20251101` | Active dated model ID | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| `claude-fable-5` | Active | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+| `claude-mythos-5` | Active, limited/invitation-only availability | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+
+Anthropic publishes cache hits at 0.1x input, 5-minute writes at 1.25x,
+1-hour writes at 2x, US-only inference at 1.1x for eligible models, and fast
+mode at 2x for supported models. Sonnet 5's previously announced increase to
+$3/$15 was cancelled; the catalog intentionally has no scheduled increase.
+
+### Long-context tiers
+
+When total input exceeds the threshold, the whole request uses the tier row:
+
+| Model | Threshold | Input | Output | Cache hit | Cache write |
+|---|---:|---:|---:|---:|---:|
+| `gpt-5.6-luna` | >272,000 | $0.40 | $1.80 | $0.04 | $0.50 |
+| `gpt-5.6-terra` | >272,000 | $4.00 | $18.00 | $0.40 | $5.00 |
+| `gpt-5.6-sol` | >272,000 | $8.00 | $30.00 | $0.80 | $10.00 |
+| `gemini-2.5-pro` | >200,000 | $2.50 | $15.00 | $0.25 | $0.00 |
+| `grok-4.3` | >200,000 | $2.50 | $5.00 | $0.40 | $0.00 |
+
+Long-context rows are encoded under `longContext` in `pricing/catalog.json` and
+mirrored into both the Rust runtime table and the platform TypeScript pricing
+table. Both select the long-context row only when total input is greater than
+the documented threshold; the exact threshold remains on the short rate.
+
+## Anthropic request limitations that protect cost accuracy
+
+The Anthropic adapter rejects unsupported cost-affecting shapes before Nova
+Guard admission:
+
+- `fallbacks` is rejected because one response can bill multiple models while
+  the current reservation and settlement record has one model.
+- `speed: "fast"` is limited to `claude-opus-5` and `claude-opus-4-8`, whose
+  2x pricing is modeled. Standard speed remains supported.
+- On constrained Claude families, non-default `temperature`, non-default
+  `top_p`, and any `top_k` are rejected instead of relying on an upstream 400.
+- Sonnet 5 rejects manual `thinking.type: "enabled"` (use `adaptive` or
+  `disabled`) and a final assistant prefill.
+- Every supplied `cache_control` must be an object with `type: "ephemeral"`
+  and an omitted, `5m`, or `1h` TTL.
+- Native Anthropic server tools and MCP tool definitions remain unsupported by
+  this OpenAI Chat Completions adapter. The settlement parser can account for
+  server-tool usage fields if present, but that does not make those request
+  shapes supported.
+
+See [the Anthropic compatibility guide](providers/anthropic.md) for the exact
+request and response contract.
+
+## Accuracy boundaries
+
+- Published batch discounts are not modeled by the synchronous gateway path.
+- OpenAI Fast/Priority pricing and the regional-processing 10% uplift are not
+  modeled in settlement. Strict direct-OpenAI admission pins
+  `service_tier: "default"` and rejects a requested premium tier; advisory
+  traffic can still forward premium tiers, and a regional base URL can still
+  differ from the catalog estimate.
+- Catalogued Bedrock Claude rows use global rates. Direct and geography-scoped
+  Claude 4.5 IDs (including identifiable system inference-profile ARNs) are
+  reserved and settled at 1.1x across input, output, and cache dimensions;
+  explicit `global.` profiles use the global rate. Opaque application inference
+  profiles remain unpriceable rather than being guessed.
+- AWS publishes source-Region-specific rates for Amazon Nova (for example, the
+  public 2026-08-20 price list prices Nova Pro in Milan above the catalog's
+  global rate). Nova/Titan requests therefore remain supported for advisory
+  proxying, but strict Bedrock admission rejects them until reservation and
+  settlement receive the validated source Region.
+- Gemini cached-content storage is billed over time, but a single response does
+  not report the storage duration; the per-request catalog therefore records a
+  zero write-token charge and does not claim to model storage.
+- Negotiated discounts, taxes, currency conversion, provider rounding, and
+  later price changes can differ from the catalog.
+- OpenRouter and other routing providers are exact only when the resolved model
+  maps to a catalog row or an authoritative billed total becomes available.
+- xAI/Grok settlement prefers `usage.cost_in_usd_ticks` when the provider
+  supplies it; a response without that field falls back to the catalog and its
+  normal completeness caveats. Strict requests reject `search_parameters`
+  because its server-search fee cannot be bounded by a token-only hold.
+- Legacy rows are preserved for compatibility and explicitly marked
+  `legacy: true`; do not assume their rates were reverified for this catalog
+  version.
+
+## Examples
+
+An uncached Sonnet 5 call with 1,000 input and 500 output tokens costs:
+
+```text
+(1,000 / 1,000,000 × $2) + (500 / 1,000,000 × $10) = $0.007
+```
+
+If the same token counts are reported with US-only inference, the settled cost
+is `$0.007 × 1.1 = $0.0077`. Sonnet 5 does not support fast mode in the gateway.
+For an Opus 5 call, fast mode doubles all token/cache dimensions; fast plus US
+inference multiplies them by `2 × 1.1 = 2.2`.
+
+For a Sonnet 5 request whose estimated 1,000-token prompt declares a 1-hour
+cache breakpoint and whose maximum output is 500 tokens, strict admission
+reserves:
+
+```text
+(1,000 / 1,000,000 × $4) + (500 / 1,000,000 × $10) = $0.009
+```
+
+If the request omits `inference_geo`, the conservative reservation is
+`$0.009 × 1.1 = $0.0099`; settlement reconciles it after Anthropic reports the
+actual geo and cache usage.
 
 ## Updating prices
 
-Edit the `MODEL_PRICING` array in [`src/policy/pricing.rs`](../src/policy/pricing.rs)
-(`(model_id, input_per_1m, output_per_1m)` tuples) and update this document. The
-lookup logic and cost math are covered by unit tests in that module.
+1. Verify the change against the provider's primary pricing and model-status
+   documentation.
+2. Edit `pricing/catalog.json` first, preserving a primary-source URL and
+   bumping its version.
+3. Mirror base/cache/tool changes in `src/policy/pricing_catalog.rs` and the
+   platform TypeScript table. Update long-context or scheduled rows in both
+   runtime mirrors where applicable.
+4. Add or update exact-value, family-boundary, cache, tier, reservation, and
+   settlement tests. A future scheduled price must also prove its activation
+   boundary and cache-rate rescaling.
+5. Update this guide only for behavior or high-value highlights; the JSON
+   manifest remains the complete row list.
+
+## Primary references
+
+- [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)
+- [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)
+- [Anthropic current model table](https://platform.claude.com/docs/en/about-claude/models/overview)
+- [Anthropic model deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations)
+- [Google Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing)
+- [xAI models and pricing](https://docs.x.ai/docs/models)
+- [xAI exact per-request cost tracking](https://docs.x.ai/developers/cost-tracking)
+- [Perplexity pricing](https://docs.perplexity.ai/getting-started/pricing)

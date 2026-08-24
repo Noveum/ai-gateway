@@ -1,27 +1,25 @@
 # GROQ Provider Integration
 
 ## Overview
-GROQ provider support in Noveum AI Gateway enables high-performance access to GROQ's inference infrastructure through an OpenAI-compatible API interface. This API also supports MultiModal vision models and tool use.
 
-## Supported Models
+Groq provider support routes the gateway's OpenAI Chat Completions interface to
+GroqCloud. Request capabilities such as vision, reasoning, structured output,
+and tool use depend on the selected Groq model; the gateway does not add a
+capability the upstream model lacks.
 
-| Model ID                               | Developer   | Context Window (tokens) | Max Tokens |
-|----------------------------------------|-------------|-------------------------|------------|
-| gemma2-9b-it                           | Google      | 8,192                   | -          |
-| gemma-7b-it                            | Google      | 8,192                   | -          |
-| llama3-groq-70b-8192-tool-use-preview  | Groq        | 8,192                   | -          |
-| llama3-groq-8b-8192-tool-use-preview   | Groq        | 8,192                   | -          |
-| llama-3.1-70b-versatile                | Meta        | 128,000                 | 32,768     |
-| llama-3.1-70b-specdec                  | Meta        | 128,000                 | 8,192      |
-| llama-3.1-8b-instant                   | Meta        | 128,000                 | 8,192      |
-| llama-3.2-1b-preview                   | Meta        | 128,000                 | 8,192      |
-| llama-3.2-3b-preview                   | Meta        | 128,000                 | 8,192      |
-| llama-3.2-11b-vision-preview           | Meta        | 128,000                 | 8,192      |
-| llama-3.2-90b-vision-preview           | Meta        | 128,000                 | 8,192      |
-| llama-guard-3-8b                       | Meta        | 8,192                   | -          |
-| llama3-70b-8192                        | Meta        | 8,192                   | -          |
-| llama3-8b-8192                         | Meta        | 8,192                   | -          |
-| mixtral-8x7b-32768                     | Mistral     | 32,768                  | -          |
+## Model availability
+
+The runnable examples and integration tests use `openai/gpt-oss-20b`, a Groq
+production model with a 131,072-token context window and 65,536 maximum output
+tokens. Groq changes production and preview availability independently of this
+gateway. Do not copy a frozen list from this repository; use Groq's
+[current model table](https://console.groq.com/docs/models) and
+[deprecation history](https://console.groq.com/docs/deprecations), or query
+Groq's authenticated `/openai/v1/models` endpoint.
+
+Groq retired `llama-3.1-8b-instant` for affected plans on August 16, 2026 and
+names `openai/gpt-oss-20b` as its replacement. The examples below therefore do
+not use the older Llama, Mixtral, or preview slugs.
 
 ## Configuration
 
@@ -40,42 +38,17 @@ curl http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer $GROQ_API_KEY" \
   -H "x-provider: groq" \
   -d '{
-    "model": "mixtral-8x7b-32768",
+    "model": "openai/gpt-oss-20b",
     "messages": [{"role": "user", "content": "Hello!"}],
-    "temperature": 0.7,
     "max_tokens": 500
   }'
 ```
 
-### MultiModal Vision Model Example (cURL)
-```bash
-curl --location 'localhost:3000/v1/chat/completions' \
---header 'Authorization: Bearer $GROQ_API_KEY' \
---header 'Content-Type: application/json' \
---header 'x-provider: groq' \
---data '{
-    "model": "llama-3.2-11b-vision-preview",
-    "messages": [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "What'\''s in this image?"
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "https://upload.wikimedia.org/wikipedia/commons/f/f2/LPU-v1-die.jpg"
-                    }
-                }
-            ]
-        }
-    ],
-    "stream": false,
-    "max_tokens": 300
-}'
-```
+### Vision requests
+
+The gateway forwards OpenAI `image_url` content, but the model ID must be one
+Groq currently marks as vision-capable. Check the live model table before using
+one; preview vision slugs in older versions of this guide have been retired.
 
 ### Tool Use Example (cURL)
 ```bash
@@ -84,7 +57,7 @@ curl --location 'localhost:3000/v1/chat/completions' \
 --header 'Content-Type: application/json' \
 --header 'x-provider: groq' \
 --data '{
-    "model": "llama-3.2-11b-vision-preview",
+    "model": "openai/gpt-oss-20b",
     "messages": [
         {
             "role": "user",
@@ -142,9 +115,8 @@ const client = new OpenAI({
 
 async function main() {
   const completion = await client.chat.completions.create({
-    model: "mixtral-8x7b-32768",
+    model: "openai/gpt-oss-20b",
     messages: [{ role: "user", content: "Hello!" }],
-    temperature: 0.7,
     max_tokens: 500,
     stream: false
   });
@@ -156,7 +128,7 @@ async function main() {
 ### Streaming Example
 ```typescript
 const stream = await client.chat.completions.create({
-  model: "mixtral-8x7b-32768",
+  model: "openai/gpt-oss-20b",
   messages: [{ role: "user", content: "Hello!" }],
   stream: true
 });
@@ -172,7 +144,7 @@ for await (const chunk of stream) {
   "id": "chatcmpl-f51b2cd2-bef7-417e-964e-a08f0b513c22",
   "object": "chat.completion",
   "created": 1730241104,
-  "model": "mixtral-8x7b-32768",
+  "model": "openai/gpt-oss-20b",
   "choices": [{
     "index": 0,
     "message": {
@@ -183,8 +155,8 @@ for await (const chunk of stream) {
   }],
   "usage": {
     "prompt_tokens": 18,
-    "completion_tokens": 556,
-    "total_tokens": 574
+    "completion_tokens": 56,
+    "total_tokens": 74
   }
 }
 ```

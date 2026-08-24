@@ -1,5 +1,12 @@
 name: Rust
 
+# The PR gate. Every check here is hermetic: no provider API keys, no network
+# calls to real LLM providers, no Noveum platform credentials. That is the whole
+# point — a green tick on this workflow has to mean the tests actually ran, so
+# reviewers can use it as evidence. Real-provider smoke tests live in
+# `provider-smoke.yml` (scheduled/manual) so a stale fixture or an expired key
+# can never make this gate flaky.
+
 on:
   push:
     branches: [ "main" ]
@@ -8,24 +15,189 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so a new upstream release can't change what the gate builds.
+  WORKER_BUILD_VERSION: "0.8.5"
+  WRANGLER_VERSION: "4.120.0"
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_DENY_VERSION: "0.20.2"
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-
+  native:
+    name: Format, lint, test (native)
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    # - name: Run tests
-    #   run: cargo test --verbose
-    #   env:
-    #     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-    #     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-    #     GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-    #     TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-    #     FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-    #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-    #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-    #     AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose
+
+      # Run the hermetic suites by name rather than `cargo test`, which would
+      # also run the live-provider cases in `run_integration_tests`; those need
+      # real keys and belong in the scheduled smoke workflow. The filtered step
+      # below runs only that target's three network-free helper regressions.
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Provider harness helper tests (no live calls)
+        run: |
+          cargo test --test run_integration_tests streaming_smoke_
+          cargo test --test run_integration_tests request_body_can_select_
+
+      - name: Nova Guard platform integration tests
+        run: cargo test --test novaguard_platform
+
+      - name: Policy middleware integration tests
+        run: cargo test --test policy_integration
+
+      - name: Reject whitespace errors in the diff
+        env:
+          DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DIFF_BASE}" || "${DIFF_BASE}" =~ ^0+$ ]]; then
+            DIFF_BASE="$(git merge-base HEAD origin/main)"
+          fi
+          # Ignore a developer's local core.whitespace override; the repository
+          # permits tab-indented JSON/TypeScript but still rejects trailing
+          # whitespace and spaces before tabs.
+          git -c core.whitespace=trailing-space,space-before-tab \
+            diff --check "${DIFF_BASE}...HEAD"
+
+  supply-chain:
+    name: Supply chain (advisories, licences, bans)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: supply-chain
+
+      # NOV-102: the Dockerfile does `COPY Cargo.toml Cargo.lock ./`, so an
+      # untracked lockfile makes `docker build` fail on a fresh clone. Both
+      # tools below also read Cargo.lock, so if it ever stops being committed
+      # they would be auditing a tree resolved on the fly rather than the one
+      # we ship. `--locked` additionally fails if the lockfile is stale
+      # relative to Cargo.toml.
+      - name: Cargo.lock is committed and current
+        run: |
+          git ls-files --error-unmatch Cargo.lock
+          cargo metadata --locked --format-version 1 > /dev/null
+
+      # Versions are pinned (see env above) so a new release of either tool
+      # cannot turn the gate red — or, worse, quietly green — on its own.
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked
+          cargo install cargo-deny --version "${CARGO_DENY_VERSION}" --locked
+
+      # `--deny warnings` is what stops this from silently passing: cargo-audit
+      # exits 0 on unmaintained/unsound findings by default. The two `--ignore`
+      # IDs are the waivers documented in deny.toml — deny.toml is the source of
+      # truth for *why* they are waived, and the two lists must stay in sync.
+      # Any advisory that is not one of those two fails the job.
+      - name: cargo audit
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2021-0141 \
+            --ignore RUSTSEC-2023-0086
+
+      # All four checks run explicitly rather than relying on defaults, so
+      # dropping one has to be a visible edit to this file.
+      - name: cargo deny
+        run: cargo deny check advisories licenses bans sources
+
+  worker:
+    name: Build and dry-run the Cloudflare Worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain with the WASM target
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: worker
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Workerd mock restart lifecycle regression
+        run: bash scripts/novaguard_worker_process_test.sh
+
+      - name: Install worker-build
+        run: cargo install worker-build --version "${WORKER_BUILD_VERSION}" --locked
+
+      # Compiles the crate for wasm32 and generates the JS shim. This is what
+      # catches a change that builds natively but breaks the edge target (a
+      # `tokio`/`reqwest` import leaking into shared code, say).
+      #
+      # Plain `--release`, deliberately: worker-build passes
+      # `--force-enable-abort-handler` on this path so a Rust panic comes back
+      # as a JS error instead of killing the isolate. Do NOT "fix" a failure
+      # here by adding `--no-panic-recovery` — that makes the build go green by
+      # throwing panic recovery away. The usual cause is [profile.release]
+      # `strip` being set back to `true`, which drops the `target_features`
+      # custom section that wasm-bindgen needs to enable externref. See the
+      # comment on `strip` in Cargo.toml.
+      - name: worker-build --release
+        run: worker-build --release
+
+      # The failure above is loud, but the *regression* this guards against is
+      # silent: if panic recovery is ever quietly disabled, the Worker still
+      # builds and still deploys — it just starts tearing down the isolate on
+      # any panic instead of returning an error. Assert the machinery is really
+      # in the artifact rather than trusting that the build command is intact.
+      - name: Assert the Worker bundle kept panic recovery
+        run: |
+          set -euo pipefail
+          fail=0
+          # Custom section wasm-bindgen reads to decide whether externref is on.
+          for sym in target_features __externref_table_alloc __wbindgen_exn_store; do
+            if ! grep -qa "$sym" build/index_bg.wasm; then
+              echo "::error::missing '$sym' in build/index_bg.wasm — panic recovery is not wired up"
+              fail=1
+            fi
+          done
+          # JS glue side of the catch wrappers.
+          for sym in JSTag abort_handler; do
+            if ! grep -qa "$sym" build/index.js; then
+              echo "::error::missing '$sym' in build/index.js — panic recovery is not wired up"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      # Validates wrangler.toml and the generated bundle without publishing.
+      - name: wrangler deploy --dry-run
+        run: npx --yes "wrangler@${WRANGLER_VERSION}" deploy --dry-run

@@ -5,7 +5,7 @@
 //! root-`usage` fallback); both non-streaming and SSE streaming are handled, and
 //! cost is priced via the shared table.
 
-use super::utils::log_tracking_headers;
+use super::utils::{log_tracking_headers, normalized_bearer_header};
 use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
@@ -66,7 +66,7 @@ impl Provider for GroqProvider {
             debug!("Using provided authorization header for Groq");
             headers.insert(
                 http::header::AUTHORIZATION,
-                http::header::HeaderValue::from_str(auth).map_err(|_| {
+                normalized_bearer_header(auth).map_err(|_| {
                     error!("Failed to process Groq authorization header");
                     AppError::InvalidHeader
                 })?,
@@ -349,6 +349,15 @@ impl MetricsExtractor for GroqMetricsExtractor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn process_headers_normalizes_case_insensitive_bearer() {
+        let p = GroqProvider::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "bearer groq-test".parse().unwrap());
+        let out = p.process_headers(&headers).unwrap();
+        assert_eq!(out.get("authorization").unwrap(), "Bearer groq-test");
+    }
 
     #[test]
     fn base_url_keeps_openai_segment() {

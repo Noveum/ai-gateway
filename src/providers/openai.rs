@@ -4,7 +4,7 @@
 //! (the gateway speaks the OpenAI wire format natively) and extracts token usage
 //! + cost from the standard `usage` object via the shared pricing table.
 
-use super::utils::log_tracking_headers;
+use super::utils::{log_tracking_headers, normalized_bearer_header};
 use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
@@ -15,7 +15,7 @@ use std::time::Duration;
 use tracing::{debug, error};
 
 /// Provider adapter for OpenAI (`x-provider: openai`). Base URL
-/// `https://api.openai.com`; passes the Bearer token through unchanged.
+/// `https://api.openai.com`; validates and canonicalizes Bearer auth.
 pub struct OpenAIProvider {
     base_url: String,
 }
@@ -28,9 +28,18 @@ impl Default for OpenAIProvider {
 
 impl OpenAIProvider {
     pub fn new() -> Self {
-        Self {
-            base_url: "https://api.openai.com".to_string(),
-        }
+        // `OPENAI_BASE_URL` override (standard OpenAI SDK convention) lets the
+        // gateway target a compatible upstream — chiefly a local mock in the
+        // hermetic E2E, or a self-hosted compatible endpoint. Normalize first
+        // (trim, drop trailing slashes) and only then reject empty values, so
+        // whitespace or a bare "///" can't produce a broken base URL.
+        let base_url = crate::routing::normalize_base_url(
+            std::env::var(crate::routing::OPENAI_BASE_URL_VAR)
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|| "https://api.openai.com".to_string());
+        Self { base_url }
     }
 }
 
@@ -65,7 +74,7 @@ impl Provider for OpenAIProvider {
             debug!("Using provided authorization header");
             headers.insert(
                 http::header::AUTHORIZATION,
-                http::header::HeaderValue::from_str(auth).map_err(|_| {
+                normalized_bearer_header(auth).map_err(|_| {
                     error!("Failed to process authorization header");
                     AppError::InvalidHeader
                 })?,
@@ -186,6 +195,9 @@ mod tests {
 
     #[test]
     fn base_url_and_name() {
+        // `new()` reads OPENAI_BASE_URL; clear it so the test asserts the
+        // default regardless of the process environment (e.g. a CI job).
+        std::env::remove_var("OPENAI_BASE_URL");
         let p = OpenAIProvider::new();
         assert_eq!(p.base_url(), "https://api.openai.com");
         assert_eq!(p.name(), "openai");
@@ -211,6 +223,11 @@ mod tests {
         assert_eq!(
             out.get(http::header::CONTENT_TYPE).unwrap(),
             "application/json"
+        );
+        let lower = p.process_headers(&hdr(Some("bearer sk-test"))).unwrap();
+        assert_eq!(
+            lower.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-test"
         );
     }
 

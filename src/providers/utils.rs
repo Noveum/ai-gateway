@@ -1,4 +1,5 @@
-use axum::http::HeaderMap;
+use crate::error::AppError;
+use axum::http::{HeaderMap, HeaderValue};
 use tracing::debug;
 
 /// List of tracking headers that should be preserved and logged
@@ -23,4 +24,13 @@ pub fn log_tracking_headers(headers: &HeaderMap) {
             debug!("{}: {}", header, value);
         }
     }
+}
+
+/// Parse an RFC case-insensitive Bearer scheme and emit one canonical header.
+/// Provider adapters and NovaGuard's pre-admission validation share this exact
+/// contract so a credential cannot pass admission and then fail locally before
+/// the provider call, leaving a conservative hold behind.
+pub fn normalized_bearer_header(value: &str) -> Result<HeaderValue, AppError> {
+    let token = crate::routing::authorization_bearer_token(value).ok_or(AppError::InvalidHeader)?;
+    HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| AppError::InvalidHeader)
 }

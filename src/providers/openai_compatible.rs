@@ -9,7 +9,7 @@
 //! model id, so every compatible provider gets accurate per-model pricing
 //! without a bespoke cost function.
 
-use super::utils::log_tracking_headers;
+use super::utils::{log_tracking_headers, normalized_bearer_header};
 use super::Provider;
 use crate::error::AppError;
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
@@ -72,23 +72,9 @@ impl Provider for OpenAICompatibleProvider {
             .get(http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
         {
-            // Validate the Bearer token shape locally so malformed credentials
-            // fail fast as InvalidHeader rather than being forwarded upstream
-            // (where they'd surface as an opaque 401 to the caller).
-            if !auth.starts_with("Bearer ") {
-                error!(
-                    "Invalid authorization format for {} request - must start with 'Bearer '",
-                    self.name
-                );
-                return Err(AppError::InvalidHeader);
-            }
-            if auth.len() <= 7 {
-                error!("Empty Bearer token for {} request", self.name);
-                return Err(AppError::InvalidHeader);
-            }
             headers.insert(
                 http::header::AUTHORIZATION,
-                http::header::HeaderValue::from_str(auth).map_err(|_| {
+                normalized_bearer_header(auth).map_err(|_| {
                     error!("Failed to process {} authorization header", self.name);
                     AppError::InvalidHeader
                 })?,
@@ -127,6 +113,23 @@ impl MetricsExtractor for OpenAICompatibleMetricsExtractor {
                 .get("total_tokens")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
+
+            // Some compat layers (notably Gemini's OpenAI endpoint) omit
+            // reasoning/thinking tokens from `completion_tokens` — or omit the
+            // field entirely — while still billing them in `total_tokens`.
+            // Billed output is total - prompt; take it when it exceeds the
+            // reported completion count so those tokens aren't priced as $0.
+            if let (Some(total), Some(prompt)) = (metrics.total_tokens, metrics.input_tokens) {
+                let billed_output = total.saturating_sub(prompt);
+                // Fill an absent count even when the derived value is 0 —
+                // input tokens are still billable and cost needs both counts.
+                if metrics
+                    .output_tokens
+                    .is_none_or(|reported| billed_output > reported)
+                {
+                    metrics.output_tokens = Some(billed_output);
+                }
+            }
         }
 
         if let (Some(i), Some(o)) = (metrics.input_tokens, metrics.output_tokens) {
@@ -171,6 +174,46 @@ mod tests {
     }
 
     #[test]
+    fn derives_billed_output_from_total_minus_prompt() {
+        // Gemini's OpenAI-compat layer can omit thinking tokens from
+        // completion_tokens (or omit the field): billed output must be derived
+        // from total - prompt so those tokens aren't priced as $0.
+        let body = serde_json::json!({
+            "model": "gemini-3.6-flash",
+            "usage": {"prompt_tokens": 5, "total_tokens": 18}
+        });
+        let m = OpenAICompatibleMetricsExtractor.extract_metrics(&body);
+        assert_eq!(m.input_tokens, Some(5));
+        assert_eq!(m.output_tokens, Some(13), "billed output = total - prompt");
+        let expected = (5.0 / 1e6) * 1.50 + (13.0 / 1e6) * 7.50;
+        assert!((m.cost.unwrap() - expected).abs() < 1e-12);
+        // An understated completion_tokens is corrected the same way.
+        let body2 = serde_json::json!({
+            "model": "gemini-3.6-flash",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 18}
+        });
+        let m2 = OpenAICompatibleMetricsExtractor.extract_metrics(&body2);
+        assert_eq!(m2.output_tokens, Some(13));
+        // A consistent usage object is left alone.
+        let body3 = serde_json::json!({
+            "model": "gemini-3.6-flash",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 13, "total_tokens": 18}
+        });
+        let m3 = OpenAICompatibleMetricsExtractor.extract_metrics(&body3);
+        assert_eq!(m3.output_tokens, Some(13));
+        // completion_tokens absent and total == prompt: the derived 0 must be
+        // filled in so the (billable) input tokens are still costed.
+        let body4 = serde_json::json!({
+            "model": "gemini-3.6-flash",
+            "usage": {"prompt_tokens": 7, "total_tokens": 7}
+        });
+        let m4 = OpenAICompatibleMetricsExtractor.extract_metrics(&body4);
+        assert_eq!(m4.output_tokens, Some(0));
+        let expected_input_only = (7.0 / 1e6) * 1.50;
+        assert!((m4.cost.unwrap() - expected_input_only).abs() < 1e-12);
+    }
+
+    #[test]
     fn requires_authorization() {
         let p = OpenAICompatibleProvider::new("deepseek", "https://api.deepseek.com", false);
         assert!(matches!(
@@ -208,6 +251,12 @@ mod tests {
         assert_eq!(
             out.get(http::header::CONTENT_TYPE).unwrap(),
             "application/json"
+        );
+        h.insert("authorization", "bearer sk-x".parse().unwrap());
+        let normalized = p.process_headers(&h).unwrap();
+        assert_eq!(
+            normalized.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer sk-x"
         );
     }
 

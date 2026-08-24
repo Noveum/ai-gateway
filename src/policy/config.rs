@@ -3,14 +3,27 @@
 //!
 //! A [`PolicyBundle`] is a portable, version-controllable list of [`Policy`]
 //! definitions. Each policy carries common fields (name, type, mode, priority,
-//! fail-closed) plus a type-specific `config` object. The per-type config structs
-//! defined here deserialize from that `config` object; unknown or future policy
-//! types deserialize into [`PolicyType::Unknown`] and are skipped by the engine
-//! with a warning rather than failing the whole bundle.
+//! fail-closed) plus a type-specific `config` object.
+//!
+//! **The policy type set is not defined here.** It lives in
+//! `policy_types.rs` (included below), alongside the embedded
+//! `schema/novaguard-policy.v1.json` that every `config` is validated against.
+//!
+//! Each policy's `config` is validated against that same schema by
+//! [`validate_policy`]. A `type` the schema does not define, or a `config` that
+//! does not satisfy it, is a hard, named error — never a silent skip.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
 
 use super::decision::{Phase, PolicyAction, PolicyMode};
+
+// The `PolicyType` enum, its wire/platform spellings, its enforcement
+// classification, and the embedded schema document.
+include!("policy_types.rs");
 
 /// The canonical bundle envelope (`nova-guard.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -22,6 +35,10 @@ pub struct PolicyBundle {
     pub exported_at: Option<String>,
     #[serde(default)]
     pub scope: Option<BundleScope>,
+    /// The version of `schema/novaguard-policy.v1.json` the bundle was authored
+    /// against. Absent means "the first published version".
+    #[serde(default)]
+    pub schema_version: Option<String>,
     #[serde(default)]
     pub policies: Vec<Policy>,
 }
@@ -45,6 +62,72 @@ impl PolicyBundle {
     pub fn from_json_str(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
     }
+
+    /// The major version of the schema this bundle declares.
+    ///
+    /// Absence is distinct from a present malformed value: only absence gets
+    /// the documented `1.0.0` default.
+    fn declared_major(&self) -> Result<Option<u32>, String> {
+        let Some(version) = self.schema_version.as_deref() else {
+            return Ok(None);
+        };
+        let components: Vec<_> = version.split('.').collect();
+        if components.len() != 3
+            || components.iter().any(|component| {
+                component.is_empty() || !component.chars().all(|c| c.is_ascii_digit())
+            })
+        {
+            return Err(format!(
+                "bundle declares malformed schemaVersion '{version}'; expected three numeric \
+                 components in MAJOR.MINOR.PATCH form"
+            ));
+        }
+        let major = components[0].parse::<u32>().map_err(|_| {
+            format!(
+                "bundle declares malformed schemaVersion '{version}'; its major component is \
+                 too large to compare with this build"
+            )
+        })?;
+        Ok(Some(major))
+    }
+
+    /// Validate every policy in the bundle against the checked-in schema.
+    ///
+    /// Returns one `(policy id, rejection)` per policy that cannot be compiled.
+    /// An empty vec means the whole bundle is enforceable as written.
+    ///
+    /// Disabled and `mode: off` policies are skipped: they are already inert by
+    /// the operator's own choice, and failing a deploy over a policy that was
+    /// deliberately turned off would be noise.
+    pub fn validate(&self) -> Vec<(String, PolicyRejection)> {
+        self.policies
+            .iter()
+            .filter(|p| p.is_active())
+            .filter_map(|p| validate_policy(p).err().map(|r| (p.id().to_string(), r)))
+            .collect()
+    }
+
+    /// Does this bundle declare a schema major version this build understands?
+    ///
+    /// A future major version means fields exist that this build would silently
+    /// ignore, so the honest answer is to refuse the bundle, not to half-apply it.
+    pub fn schema_version_supported(&self) -> Result<(), String> {
+        let expected: u32 = POLICY_SCHEMA_VERSION
+            .split('.')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        match self.declared_major()? {
+            None => Ok(()),
+            Some(major) if major == expected => Ok(()),
+            Some(major) => Err(format!(
+                "bundle declares schemaVersion '{}' (major {major}) but this build \
+                 implements NovaGuard policy schema {POLICY_SCHEMA_VERSION}; refusing \
+                 rather than silently ignoring fields it does not understand",
+                self.schema_version.as_deref().unwrap_or_default()
+            )),
+        }
+    }
 }
 
 /// One policy definition.
@@ -57,7 +140,7 @@ pub struct Policy {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(rename = "type")]
-    pub policy_type: PolicyType,
+    pub policy_type: PolicyTypeTag,
     #[serde(default)]
     pub mode: PolicyMode,
     #[serde(default)]
@@ -68,6 +151,12 @@ pub struct Policy {
     pub priority: i32,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Where the policy came from in the platform's merged `/effective` set:
+    /// `"project"` or `"org"`/`"organization"`. Org-sourced `cost_cap`/
+    /// `rate_limit` policies are evaluated against org-scope counters when the
+    /// control plane provides them. Absent for local bundles.
+    #[serde(default)]
+    pub source: Option<String>,
     /// Type-specific configuration, parsed by the matching rule.
     #[serde(default)]
     pub config: serde_json::Value,
@@ -89,78 +178,191 @@ impl Policy {
         self.policy_id.as_deref().unwrap_or(&self.name)
     }
 
+    /// The parsed policy type.
+    pub fn kind(&self) -> PolicyType {
+        self.policy_type.kind()
+    }
+
+    /// The `type` string exactly as it appeared on the wire, so an error about
+    /// an unrecognized type can name the value the operator actually typed.
+    pub fn type_name(&self) -> &str {
+        self.policy_type.raw()
+    }
+
     /// Should the engine consider this policy at all?
     pub fn is_active(&self) -> bool {
         self.enabled && self.mode != PolicyMode::Off
     }
 }
 
-/// The set of policy types. The deterministic types are enforced in-process by
-/// the gateway. The classifier types are reserved names that parse cleanly but
-/// are **not yet enforced** (they would require an external scoring service);
-/// they are accepted and skipped, like `Unknown`, so a forward-looking bundle
-/// does not error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PolicyType {
-    // --- deterministic, enforced in-process ---
-    CostCap,
-    RateLimit,
-    ModelAllowlist,
-    RegexMatch,
-    BannedSubstrings,
-    PiiDetection,
-    SecretsDetection,
-    JsonSchema,
-    TokenLengthCap,
-    // --- reserved classifier types: parsed but not yet enforced (skipped) ---
-    ScorerGate,
-    PromptInjection,
-    TopicRestriction,
-    ContentModeration,
-    GroundingCheck,
-    /// Any type this build does not recognize. Skipped with a warning.
-    #[serde(other)]
-    Unknown,
+/// A policy's `type` field: the parsed discriminant **plus** the raw wire string.
+///
+/// Keeping the raw string is what lets a rejection say `unknown policy type
+/// 'promt_injection'` instead of the useless `unknown`. A typo'd type in the UI
+/// is the exact failure this whole schema exists to make visible, so the error
+/// has to name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub struct PolicyTypeTag {
+    kind: PolicyType,
+    raw: String,
 }
 
-impl PolicyType {
-    /// The wire/string form, matching the Nova Guard SDK and CRUD API.
-    pub fn as_str(self) -> &'static str {
+impl PolicyTypeTag {
+    /// The parsed discriminant.
+    pub fn kind(&self) -> PolicyType {
+        self.kind
+    }
+
+    /// The `type` string exactly as it appeared on the wire.
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl From<String> for PolicyTypeTag {
+    fn from(raw: String) -> Self {
+        Self {
+            kind: PolicyType::from_wire(raw.trim()),
+            raw,
+        }
+    }
+}
+
+impl From<PolicyTypeTag> for String {
+    fn from(tag: PolicyTypeTag) -> Self {
+        tag.raw
+    }
+}
+
+impl From<PolicyType> for PolicyTypeTag {
+    fn from(kind: PolicyType) -> Self {
+        Self {
+            kind,
+            raw: kind.as_str().to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema validation.
+// ---------------------------------------------------------------------------
+
+/// Why a policy cannot be compiled. Each variant is an operator-visible error,
+/// never a silent skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyRejection {
+    /// The `type` string is not in `schema/novaguard-policy.v1.json`.
+    UnknownType { raw: String },
+    /// A present `source` is not one of the scope tags in the policy schema.
+    InvalidSource { raw: String },
+    /// The type is in the contract but its `config` violates the schema.
+    InvalidConfig { errors: Vec<String> },
+    /// The type is in the contract but this build cannot enforce it (it needs an
+    /// external scoring service). Accepted by the platform, inert here.
+    NotEnforceable,
+}
+
+impl std::fmt::Display for PolicyRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PolicyType::CostCap => "cost_cap",
-            PolicyType::RateLimit => "rate_limit",
-            PolicyType::ModelAllowlist => "model_allowlist",
-            PolicyType::RegexMatch => "regex_match",
-            PolicyType::BannedSubstrings => "banned_substrings",
-            PolicyType::PiiDetection => "pii_detection",
-            PolicyType::SecretsDetection => "secrets_detection",
-            PolicyType::JsonSchema => "json_schema",
-            PolicyType::TokenLengthCap => "token_length_cap",
-            PolicyType::ScorerGate => "scorer_gate",
-            PolicyType::PromptInjection => "prompt_injection",
-            PolicyType::TopicRestriction => "topic_restriction",
-            PolicyType::ContentModeration => "content_moderation",
-            PolicyType::GroundingCheck => "grounding_check",
-            PolicyType::Unknown => "unknown",
+            PolicyRejection::UnknownType { raw } => write!(
+                f,
+                "unknown policy type '{raw}'; this gateway build understands: {}",
+                POLICY_TYPE_NAMES.join(", ")
+            ),
+            PolicyRejection::InvalidSource { raw } => write!(
+                f,
+                "invalid policy source '{raw}'; expected project, org, organization, or an \
+                 omitted source for a local bundle"
+            ),
+            PolicyRejection::InvalidConfig { errors } => {
+                write!(f, "invalid config: {}", errors.join("; "))
+            }
+            PolicyRejection::NotEnforceable => write!(
+                f,
+                "policy type is reserved in the contract but requires an external \
+                 scoring service this gateway build does not call, so it can never \
+                 take effect"
+            ),
+        }
+    }
+}
+
+/// Compiled per-type config validators, built once from the embedded schema.
+fn config_validators() -> &'static HashMap<&'static str, Validator> {
+    static VALIDATORS: OnceLock<HashMap<&'static str, Validator>> = OnceLock::new();
+    VALIDATORS.get_or_init(|| {
+        // The schema is checked in and covered by `schema_document_is_valid`, so a
+        // parse failure here is a build-time bug, not a runtime input problem.
+        let schema: serde_json::Value = serde_json::from_str(POLICY_SCHEMA_JSON)
+            .expect("embedded novaguard schema is not valid JSON");
+        let defs = schema.get("$defs").cloned().unwrap_or_default();
+        let mut out = HashMap::new();
+        for ty in PolicyType::ALL {
+            let Some(def) = ty.config_def() else { continue };
+            // Validate the `config` object directly against its own subschema
+            // rather than the whole bundle: the bundle's `oneOf` would collapse
+            // every failure into "not valid under any of the schemas", which
+            // tells an operator nothing about what they got wrong.
+            let sub = serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$defs": defs,
+                "$ref": format!("#/$defs/{def}"),
+            });
+            match jsonschema::validator_for(&sub) {
+                Ok(v) => {
+                    out.insert(ty.as_str(), v);
+                }
+                Err(e) => panic!("config subschema '{def}' does not compile: {e}"),
+            }
+        }
+        out
+    })
+}
+
+/// Validate one policy against the checked-in schema.
+///
+/// Returns `Ok(())` only for a type and optional source in the contract, with a
+/// config the schema accepts, that this build can actually enforce.
+pub fn validate_policy(policy: &Policy) -> Result<(), PolicyRejection> {
+    let kind = policy.kind();
+    if kind == PolicyType::Unknown {
+        return Err(PolicyRejection::UnknownType {
+            raw: policy.type_name().to_string(),
+        });
+    }
+
+    if let Some(source) = policy.source.as_deref() {
+        if !matches!(source, "project" | "org" | "organization") {
+            return Err(PolicyRejection::InvalidSource {
+                raw: source.to_string(),
+            });
         }
     }
 
-    /// Is this a deterministic type the gateway enforces locally (no network)?
-    pub fn is_deterministic(self) -> bool {
-        matches!(
-            self,
-            PolicyType::CostCap
-                | PolicyType::RateLimit
-                | PolicyType::ModelAllowlist
-                | PolicyType::RegexMatch
-                | PolicyType::BannedSubstrings
-                | PolicyType::PiiDetection
-                | PolicyType::SecretsDetection
-                | PolicyType::JsonSchema
-                | PolicyType::TokenLengthCap
-        )
+    if let Some(validator) = config_validators().get(kind.as_str()) {
+        let errors: Vec<String> = validator
+            .iter_errors(&policy.config)
+            .map(|e| {
+                let path = e.instance_path().to_string();
+                if path.is_empty() {
+                    e.to_string()
+                } else {
+                    format!("{path}: {e}")
+                }
+            })
+            .take(10)
+            .collect();
+        if !errors.is_empty() {
+            return Err(PolicyRejection::InvalidConfig { errors });
+        }
     }
+
+    if !kind.is_enforced() {
+        return Err(PolicyRejection::NotEnforceable);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +493,28 @@ pub enum CostEnforcementMode {
     Strict,
 }
 
+/// Decide whether a request uses platform-atomic admission.
+///
+/// * an explicit `NOVEUM_GUARD_COST_ENFORCEMENT` overrides every policy (a
+///   deployment-wide kill switch, and a way to force strict without editing
+///   policies);
+/// * otherwise the policy decides — strict when the `cost_cap` under
+///   consideration declares `enforcementMode: strict`.
+///
+/// Lives here rather than in [`crate::policy::admission`] (which re-exports it)
+/// because both sides of the admission decision must agree, and one of those
+/// sides is the wasm32 Worker, where the native admission module does not
+/// exist. Admission-outage handling additionally mirrors the platform's wire
+/// contract in
+/// [`PolicyEngine::admission_unavailable_decision`](crate::policy::engine::PolicyEngine::admission_unavailable_decision).
+pub fn resolve_strict(override_mode: Option<CostEnforcementMode>, policy_strict: bool) -> bool {
+    match override_mode {
+        Some(CostEnforcementMode::Strict) => true,
+        Some(CostEnforcementMode::Advisory) => false,
+        None => policy_strict,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateWindow {
@@ -330,7 +554,8 @@ pub struct PiiDetectionConfig {
 pub struct SecretsDetectionConfig {
     #[serde(default = "default_phase_both")]
     pub phase: Phase,
-    /// Detector ids, e.g. `["aws_access_key", "openai_sk"]`. Empty = all known.
+    /// Detector ids, e.g. `["aws_access_key", "openai_key"]`. Empty = all known.
+    /// `SecretsRule::parse` rejects an id outside the supported set.
     #[serde(default)]
     pub detectors: Vec<String>,
     #[serde(default = "block_action")]
@@ -372,20 +597,277 @@ mod tests {
         let bundle = PolicyBundle::from_json_str(json).unwrap();
         assert_eq!(bundle.policies.len(), 1);
         let p = &bundle.policies[0];
-        assert_eq!(p.policy_type, PolicyType::RegexMatch);
+        assert_eq!(p.kind(), PolicyType::RegexMatch);
         assert_eq!(p.mode, PolicyMode::Enforce);
         assert!(p.is_active());
         assert_eq!(p.id(), "Block SSN");
     }
 
     #[test]
-    fn unknown_type_does_not_fail_bundle() {
+    fn unknown_type_parses_but_is_rejected_by_name() {
+        // Parsing stays tolerant so ONE bad policy cannot make the rest of the
+        // bundle unreadable — but the policy is then rejected, and the rejection
+        // has to name the string the operator actually typed.
         let json = r#"{"policies": [
             {"name": "future", "type": "quantum_entanglement_check", "config": {}}
         ]}"#;
         let bundle = PolicyBundle::from_json_str(json).unwrap();
-        assert_eq!(bundle.policies[0].policy_type, PolicyType::Unknown);
+        let p = &bundle.policies[0];
+        assert_eq!(p.kind(), PolicyType::Unknown);
+        assert_eq!(p.type_name(), "quantum_entanglement_check");
         assert!(!PolicyType::Unknown.is_deterministic());
+
+        let err = validate_policy(p).unwrap_err();
+        assert!(
+            matches!(&err, PolicyRejection::UnknownType { raw } if raw == "quantum_entanglement_check")
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("quantum_entanglement_check"), "{msg}");
+        // and it lists what IS valid, so the operator can fix it
+        assert!(msg.contains("prompt_injection"), "{msg}");
+
+        assert_eq!(bundle.validate().len(), 1);
+    }
+
+    #[test]
+    fn every_contract_type_round_trips_through_the_policy_type_tables() {
+        // The PolicyType enum, the wire names, the platform spellings and the
+        // schema's own enum must all describe the same set. If the Rust tables
+        // and the schema ever disagree this fails before any drift reaches a
+        // consumer.
+        let schema: serde_json::Value = serde_json::from_str(POLICY_SCHEMA_JSON).unwrap();
+        let schema_enum: Vec<&str> = schema["$defs"]["policyType"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let wire_names: Vec<&str> = PolicyType::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(wire_names, schema_enum);
+        assert_eq!(POLICY_TYPE_NAMES.to_vec(), schema_enum);
+
+        for ty in PolicyType::ALL {
+            assert_eq!(PolicyType::from_wire(ty.as_str()), ty);
+            assert_eq!(PolicyType::from_platform_enum(ty.platform_enum()), ty);
+            assert_eq!(ty.platform_enum(), ty.as_str().to_uppercase());
+            assert!(ty.config_def().is_some(), "{ty:?} has no config schema");
+            let parsed: PolicyType = serde_json::from_str(&format!("\"{}\"", ty.as_str())).unwrap();
+            assert_eq!(parsed, ty);
+        }
+    }
+
+    #[test]
+    fn enforcement_classification_matches_the_rule_layer() {
+        // The crux of NOV-107: 14 types parse, but only 9 do anything. Anyone
+        // reading `is_enforced` gets the honest answer.
+        let enforced: Vec<&str> = PolicyType::ALL
+            .iter()
+            .filter(|t| t.is_enforced())
+            .map(|t| t.as_str())
+            .collect();
+        assert_eq!(
+            enforced,
+            vec![
+                "cost_cap",
+                "rate_limit",
+                "model_allowlist",
+                "regex_match",
+                "banned_substrings",
+                "pii_detection",
+                "secrets_detection",
+                "json_schema",
+                "token_length_cap",
+            ]
+        );
+        let reserved: Vec<&str> = PolicyType::ALL
+            .iter()
+            .filter(|t| !t.is_enforced())
+            .map(|t| t.as_str())
+            .collect();
+        assert_eq!(
+            reserved,
+            vec![
+                "scorer_gate",
+                "prompt_injection",
+                "topic_restriction",
+                "content_moderation",
+                "grounding_check",
+            ]
+        );
+    }
+
+    #[test]
+    fn reserved_types_are_rejected_not_silently_skipped() {
+        // A `content_moderation` policy created in the UI used to vanish. Now it
+        // is a named rejection saying why it can never take effect.
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"mod","type":"content_moderation","mode":"enforce",
+                "config":{"categories":["hate"]}}]}"#,
+        )
+        .unwrap();
+        let rejections = bundle.validate();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].0, "mod");
+        assert_eq!(rejections[0].1, PolicyRejection::NotEnforceable);
+        assert!(rejections[0].1.to_string().contains("external scoring"));
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_with_the_offending_field() {
+        // Missing required field.
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"cap","type":"cost_cap","mode":"enforce",
+                "config":{"window":"30d_rolling"}}]}"#,
+        )
+        .unwrap();
+        let r = bundle.validate();
+        assert_eq!(r.len(), 1, "missing maxUsd must be rejected");
+        assert!(r[0].1.to_string().contains("maxUsd"), "{}", r[0].1);
+
+        // Value outside the contract's enum.
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"cap","type":"cost_cap","mode":"enforce",
+                "config":{"window":"3h_rolling","maxUsd":10.0,"action":"block"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            bundle.validate().len(),
+            1,
+            "unknown window must be rejected"
+        );
+
+        // A rate_limit period with no counter behind it.
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"policies":[{"name":"rl","type":"rate_limit","mode":"enforce",
+                "config":{"windows":[{"period":"7m","maxRequests":5,"action":"block"}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(bundle.validate().len(), 1, "unmeasurable period rejected");
+
+        // And the good version of each passes.
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"policies":[
+                {"name":"cap","type":"cost_cap","mode":"enforce",
+                 "config":{"window":"30d_rolling","maxUsd":10.0,"action":"block"}},
+                {"name":"rl","type":"rate_limit","mode":"enforce",
+                 "config":{"windows":[{"period":"1m","maxRequests":5,"action":"block"}]}}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(bundle.validate().is_empty());
+    }
+
+    #[test]
+    fn unknown_or_whitespace_policy_sources_are_rejected() {
+        for source in ["org ", " project", "workspace", ""] {
+            let json = format!(
+                r#"{{"policies":[{{"name":"cap","type":"cost_cap","mode":"enforce",
+                    "source":{source:?},
+                    "config":{{"window":"30d_rolling","maxUsd":10.0,"action":"block"}}}}]}}"#
+            );
+            let bundle = PolicyBundle::from_json_str(&json).unwrap();
+
+            let rejections = bundle.validate();
+            assert_eq!(rejections.len(), 1, "source {source:?} must be rejected");
+            assert_eq!(
+                rejections[0].1,
+                PolicyRejection::InvalidSource {
+                    raw: source.to_string()
+                },
+                "rejection must preserve source {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_and_absent_policy_sources_remain_valid() {
+        for source in [None, Some("project"), Some("org"), Some("organization")] {
+            let source_field = source
+                .map(|value| format!(r#""source":{value:?},"#))
+                .unwrap_or_default();
+            let json = format!(
+                r#"{{"policies":[{{"name":"cap","type":"cost_cap","mode":"enforce",
+                    {source_field}
+                    "config":{{"window":"30d_rolling","maxUsd":10.0,"action":"block"}}}}]}}"#
+            );
+            let bundle = PolicyBundle::from_json_str(&json).unwrap();
+
+            assert!(
+                bundle.validate().is_empty(),
+                "source {source:?} must remain valid"
+            );
+        }
+    }
+
+    #[test]
+    fn inactive_policies_are_not_validated() {
+        // A policy the operator turned off is already inert by choice; failing a
+        // deploy over it would be noise.
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"policies":[
+                {"name":"a","type":"quantum_entanglement_check","enabled":false,"config":{}},
+                {"name":"b","type":"cost_cap","mode":"off","config":{}}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(bundle.validate().is_empty());
+    }
+
+    #[test]
+    fn schema_document_is_valid_and_self_consistent() {
+        let schema: serde_json::Value = serde_json::from_str(POLICY_SCHEMA_JSON).unwrap();
+        jsonschema::validator_for(&schema).expect("the bundle schema must compile");
+        assert_eq!(schema["x-schema-version"], POLICY_SCHEMA_VERSION);
+        let registry = schema["x-policy-types"].as_object().unwrap();
+        assert_eq!(registry.len(), PolicyType::ALL.len());
+        for ty in PolicyType::ALL {
+            let meta = &registry[ty.as_str()];
+            assert_eq!(meta["platformEnum"], ty.platform_enum());
+            assert_eq!(meta["configRef"], ty.config_def().unwrap());
+            let expected = if ty.is_enforced() {
+                "enforced"
+            } else {
+                "reserved"
+            };
+            assert_eq!(meta["enforcement"], expected, "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn future_major_schema_version_is_refused() {
+        let ok = PolicyBundle::from_json_str(r#"{"schemaVersion":"1.4.0","policies":[]}"#).unwrap();
+        assert!(ok.schema_version_supported().is_ok());
+        let absent = PolicyBundle::from_json_str(r#"{"policies":[]}"#).unwrap();
+        assert!(absent.schema_version_supported().is_ok());
+        let future =
+            PolicyBundle::from_json_str(r#"{"schemaVersion":"2.0.0","policies":[]}"#).unwrap();
+        let err = future.schema_version_supported().unwrap_err();
+        assert!(err.contains("2.0.0"), "{err}");
+    }
+
+    #[test]
+    fn malformed_present_schema_version_is_refused() {
+        for version in ["v2.0.0", "+1.0.0", "", "1.x.0", "1.0", "1.0.0.0"] {
+            let bundle = PolicyBundle::from_json_str(&format!(
+                r#"{{"schemaVersion":"{version}","policies":[]}}"#
+            ))
+            .unwrap();
+            let err = bundle
+                .schema_version_supported()
+                .expect_err("a present malformed schemaVersion must not be treated as absent");
+            assert!(err.contains(version), "{version:?}: {err}");
+            assert!(err.contains("malformed"), "{version:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn numeric_minor_and_patch_components_follow_the_json_schema_without_u32_limits() {
+        let bundle = PolicyBundle::from_json_str(
+            r#"{"schemaVersion":"1.4294967296.999999999999999999999","policies":[]}"#,
+        )
+        .unwrap();
+
+        assert!(bundle.schema_version_supported().is_ok());
     }
 
     #[test]

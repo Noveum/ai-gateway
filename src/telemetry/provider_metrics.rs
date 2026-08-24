@@ -47,6 +47,78 @@ impl ProviderMetrics {
         estimated_tokens
     }
 
+    /// Whether a model id is a real identifier (vs. an extractor placeholder
+    /// like `"claude"`, `"llama"`, or `"unknown"` used when a chunk carries no
+    /// model field).
+    /// Ids that mean "this chunk did not name the model", not "the model is
+    /// called this".
+    ///
+    /// Streaming extractors substitute one of these when an individual event
+    /// carries no `model` field. None of them is a real catalog id, so letting
+    /// one reach the pricing table is not a lookup miss on a real model — it is
+    /// pricing a call whose model was never learned. That is how a Groq
+    /// `llama-3.3-70b` stream came to be metered at the catalog maximum
+    /// ($15/$60 per 1M), roughly 50x its real rate. The cure is to resolve the
+    /// id from the request, not to weaken the unknown-model assumption; see
+    /// `resolve_model_for_metering` in `crate::telemetry::middleware`.
+    pub(crate) fn is_placeholder_model(model: &str) -> bool {
+        matches!(model.trim(), "" | "unknown" | "claude" | "llama")
+    }
+
+    /// Fold metrics extracted from a later streaming chunk into this running
+    /// accumulation. Streaming providers spread metrics across events (e.g.
+    /// Anthropic sends the model + input tokens in `message_start` and the
+    /// output tokens in `message_delta`), so a later chunk must never wipe
+    /// fields an earlier chunk already supplied.
+    pub fn merge_streaming(&mut self, newer: ProviderMetrics) {
+        // A later chunk that changes a priced value without carrying a usable
+        // cost invalidates any earlier cost. `None -> Some` counts as a change:
+        // Anthropic commonly supplies the input and output halves in separate
+        // events, so the first event's input-only cost is stale once output
+        // tokens arrive.
+        fn changes<T: PartialEq + Copy>(old: Option<T>, new: Option<T>) -> bool {
+            matches!(new, Some(value) if old != Some(value))
+        }
+        let model_replaced = !Self::is_placeholder_model(&newer.model)
+            && !Self::is_placeholder_model(&self.model)
+            && newer.model != self.model;
+        // Extractors use a placeholder when a chunk does not carry a model.
+        // If the accumulator already has a real model, a cost calculated under
+        // that placeholder is not authoritative for the model we retain.
+        let placeholder_cost_mismatch = Self::is_placeholder_model(&newer.model)
+            && !Self::is_placeholder_model(&self.model)
+            && newer.cost.is_some();
+        let priced_values_changed = model_replaced
+            || changes(self.input_tokens, newer.input_tokens)
+            || changes(self.output_tokens, newer.output_tokens);
+        let cost_is_stale =
+            priced_values_changed && (newer.cost.is_none() || placeholder_cost_mismatch);
+        let newer_cost = if placeholder_cost_mismatch {
+            None
+        } else {
+            newer.cost
+        };
+
+        if (!Self::is_placeholder_model(&newer.model) || Self::is_placeholder_model(&self.model))
+            && !newer.model.is_empty()
+        {
+            self.model = newer.model;
+        }
+        self.input_tokens = newer.input_tokens.or(self.input_tokens);
+        self.output_tokens = newer.output_tokens.or(self.output_tokens);
+        self.total_tokens = newer.total_tokens.or(self.total_tokens);
+        self.cost = if cost_is_stale {
+            None // downstream recomputes from the merged model + tokens
+        } else {
+            newer_cost.or(self.cost)
+        };
+        self.request_id = newer.request_id.or(self.request_id.take());
+        self.project_id = newer.project_id.or(self.project_id.take());
+        self.organization_id = newer.organization_id.or(self.organization_id.take());
+        self.user_id = newer.user_id.or(self.user_id.take());
+        self.experiment_id = newer.experiment_id.or(self.experiment_id.take());
+    }
+
     /// Extract tracking headers from the original request headers
     pub fn extract_tracking_headers(headers: &HeaderMap) -> Self {
         let mut metrics = Self::default();
@@ -229,5 +301,164 @@ pub fn get_metrics_extractor(provider: &str) -> Box<dyn MetricsExtractor> {
         "together" | "mistral" | "cohere" | "google" | "gemini" | "deepseek" | "xai" | "grok"
         | "openrouter" | "perplexity" => Box::new(OpenAICompatibleMetricsExtractor),
         _ => Box::new(OpenAIMetricsExtractor), // Default to OpenAI format
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extractor_dispatch_is_case_insensitive() {
+        // `x-provider` reaches us exactly as the client typed it, so `Anthropic`
+        // must dispatch to the Anthropic extractor and not fall through to the
+        // OpenAI default. Asserted behaviorally on an Anthropic-shaped SSE
+        // event, whose token counts the OpenAI extractor does not understand.
+        let event = r#"{"type":"message_start","message":{"model":"claude-sonnet-5","usage":{"input_tokens":13,"output_tokens":4}}}"#;
+        let lower = get_metrics_extractor("anthropic").extract_streaming_metrics(event);
+        assert!(
+            lower.as_ref().is_some_and(|m| m.input_tokens == Some(13)),
+            "baseline: lowercase `anthropic` reads the event, got {lower:?}"
+        );
+        for spelling in ["Anthropic", "ANTHROPIC", "aNtHrOpIc"] {
+            let got = get_metrics_extractor(spelling).extract_streaming_metrics(event);
+            assert_eq!(
+                got.map(|m| (m.model, m.input_tokens, m.output_tokens)),
+                lower
+                    .clone()
+                    .map(|m| (m.model, m.input_tokens, m.output_tokens)),
+                "{spelling} must dispatch like `anthropic`"
+            );
+        }
+        // Sanity: the dispatch really is what differentiates — the default
+        // (OpenAI) extractor does not read Anthropic's token shape.
+        let default = get_metrics_extractor("openai").extract_streaming_metrics(event);
+        assert_ne!(
+            default.map(|m| m.input_tokens),
+            Some(Some(13)),
+            "test would pass vacuously if every extractor read this event"
+        );
+    }
+
+    #[test]
+    fn merge_streaming_combines_fields_across_chunks() {
+        // Anthropic shape: message_start carries model + input tokens, a later
+        // message_delta carries output tokens under the placeholder model
+        // "claude". The merge must keep the real model and both token counts.
+        let mut acc = ProviderMetrics::default();
+        acc.merge_streaming(ProviderMetrics {
+            model: "claude-sonnet-5".to_string(),
+            input_tokens: Some(13),
+            ..Default::default()
+        });
+        acc.merge_streaming(ProviderMetrics {
+            model: "claude".to_string(), // placeholder — must not clobber
+            output_tokens: Some(4),
+            ..Default::default()
+        });
+        assert_eq!(acc.model, "claude-sonnet-5");
+        assert_eq!(acc.input_tokens, Some(13));
+        assert_eq!(acc.output_tokens, Some(4));
+    }
+
+    #[test]
+    fn merge_streaming_rejects_a_placeholder_models_cost_for_a_real_model() {
+        let mut acc = ProviderMetrics {
+            model: "claude-sonnet-5".to_string(),
+            input_tokens: Some(13),
+            cost: Some(0.000_039),
+            ..Default::default()
+        };
+
+        acc.merge_streaming(ProviderMetrics {
+            model: "claude".to_string(),
+            cost: Some(9.99),
+            ..Default::default()
+        });
+
+        assert_eq!(acc.model, "claude-sonnet-5");
+        assert_eq!(
+            acc.cost,
+            Some(0.000_039),
+            "a cost computed for a placeholder model must not replace the real model's cost"
+        );
+    }
+
+    #[test]
+    fn merge_streaming_clears_cost_when_a_placeholder_chunk_adds_priced_tokens() {
+        // Anthropic's message_start can price the input side under the real
+        // model, while message_delta adds output tokens under the extractor's
+        // `claude` placeholder. The placeholder chunk's own cost cannot be
+        // paired with the retained real model; the merged view must be repriced.
+        let mut acc = ProviderMetrics {
+            model: "claude-sonnet-5".to_string(),
+            input_tokens: Some(13),
+            cost: Some(0.000_039),
+            ..Default::default()
+        };
+
+        acc.merge_streaming(ProviderMetrics {
+            model: "claude".to_string(),
+            output_tokens: Some(4),
+            cost: Some(9.99),
+            ..Default::default()
+        });
+
+        assert_eq!(acc.model, "claude-sonnet-5");
+        assert_eq!(acc.input_tokens, Some(13));
+        assert_eq!(acc.output_tokens, Some(4));
+        assert_eq!(
+            acc.cost, None,
+            "changed billable tokens must force downstream repricing"
+        );
+    }
+
+    #[test]
+    fn merge_streaming_invalidates_cost_when_tokens_are_replaced() {
+        // A later chunk replaces a populated token count without carrying a new
+        // cost: the earlier cost is now stale and must be cleared so the
+        // middleware recomputes it from the merged view.
+        let mut acc = ProviderMetrics {
+            model: "gpt-4o".to_string(),
+            input_tokens: Some(10),
+            cost: Some(0.01),
+            ..Default::default()
+        };
+        acc.merge_streaming(ProviderMetrics {
+            model: "unknown".to_string(),
+            input_tokens: Some(12), // a later, better value wins
+            ..Default::default()
+        });
+        assert_eq!(acc.model, "gpt-4o");
+        assert_eq!(acc.input_tokens, Some(12));
+        assert_eq!(acc.cost, None, "replaced tokens must invalidate the cost");
+    }
+
+    #[test]
+    fn merge_streaming_keeps_cost_when_nothing_it_priced_changes() {
+        let mut acc = ProviderMetrics {
+            model: "gpt-4o".to_string(),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cost: Some(0.01),
+            ..Default::default()
+        };
+        // Same values re-reported, plus a field that was previously None.
+        acc.merge_streaming(ProviderMetrics {
+            model: "gpt-4o".to_string(),
+            input_tokens: Some(10),
+            total_tokens: Some(15),
+            ..Default::default()
+        });
+        assert_eq!(acc.cost, Some(0.01), "unchanged tokens keep the cost");
+        // A newer chunk carrying its own cost always wins.
+        acc.merge_streaming(ProviderMetrics {
+            model: "gpt-4o".to_string(),
+            output_tokens: Some(9),
+            cost: Some(0.02),
+            ..Default::default()
+        });
+        assert_eq!(acc.cost, Some(0.02));
+        assert_eq!(acc.output_tokens, Some(9));
     }
 }

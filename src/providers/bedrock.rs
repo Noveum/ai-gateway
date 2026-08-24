@@ -26,9 +26,7 @@ use uuid;
 /// Constants for default values
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
-const DEFAULT_MAX_TOKENS: u64 = 1000;
-const DEFAULT_TEMPERATURE: f64 = 0.7;
-const DEFAULT_TOP_P: f64 = 1.0;
+const MAX_EVENT_STREAM_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// BedrockProvider handles AWS Bedrock API integration
 #[derive(Clone)]
@@ -84,39 +82,13 @@ impl BedrockProvider {
             return Ok(body);
         }
 
-        let messages = body
-            .get("messages")
+        body.get("messages")
             .and_then(Value::as_array)
             .ok_or_else(|| {
                 error!("Invalid request format: messages array not found");
                 AppError::InvalidRequestFormat
             })?;
-
-        let transformed_messages = messages
-            .iter()
-            .map(|msg| {
-                let content = msg["content"].as_str().unwrap_or_default();
-                json!({
-                    "role": msg["role"].as_str().unwrap_or("user"),
-                    "content": [{ "text": content }]
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let transformed = json!({
-            "messages": transformed_messages,
-            "inferenceConfig": {
-                "maxTokens": body.get("max_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(DEFAULT_MAX_TOKENS),
-                "temperature": body.get("temperature")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(DEFAULT_TEMPERATURE),
-                "topP": body.get("top_p")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(DEFAULT_TOP_P)
-            }
-        });
+        let transformed = crate::routing::openai_to_bedrock_converse(&body);
 
         debug!("Transformed body: {:#?}", transformed);
         Ok(transformed)
@@ -209,7 +181,7 @@ impl BedrockProvider {
         if let Some(usage) = json.get("usage") {
             let final_message = self.create_final_response(usage);
             Ok(vec![format!(
-                "data: {}\ndata: [DONE]\n\n",
+                "data: {}\n\ndata: [DONE]\n\n",
                 final_message.to_string()
             )])
         } else {
@@ -297,77 +269,15 @@ impl BedrockProvider {
         bedrock_response: Value,
     ) -> Result<Value, AppError> {
         debug!("Transforming Bedrock response to OpenAI format");
-
-        // Extract content from Bedrock response
-        let content = bedrock_response
-            .get("output")
-            .and_then(|output| output.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(|content| content.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|first| first.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        // Extract usage metrics
-        let usage = bedrock_response.get("usage").cloned().unwrap_or_else(|| {
-            json!({
-                "inputTokens": 0,
-                "outputTokens": 0,
-                "totalTokens": 0
-            })
-        });
-
-        // Get stop reason
-        let finish_reason = bedrock_response
-            .get("stopReason")
-            .and_then(Value::as_str)
-            .unwrap_or("stop");
-
-        // Map Bedrock finish reason to OpenAI format
-        let openai_finish_reason = match finish_reason {
-            "end_turn" => "stop",
-            "max_tokens" => "length",
-            "stop_sequence" => "stop",
-            _ => "stop",
-        };
-
-        // Create OpenAI format response
-        let openai_response = json!({
-            "id": format!("chatcmpl-{}", uuid::Uuid::new_v4().to_string().replace("-", "").chars().take(10).collect::<String>()),
-            "object": "chat.completion",
-            "created": chrono::Utc::now().timestamp(),
-            "model": self.current_model.read().as_str(),
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                    "refusal": null
-                },
-                "logprobs": null,
-                "finish_reason": openai_finish_reason
-            }],
-            "usage": {
-                "prompt_tokens": usage.get("inputTokens").and_then(Value::as_u64).unwrap_or(0),
-                "completion_tokens": usage.get("outputTokens").and_then(Value::as_u64).unwrap_or(0),
-                "total_tokens": usage.get("totalTokens").and_then(Value::as_u64).unwrap_or(0),
-                "prompt_tokens_details": {
-                    "cached_tokens": 0,
-                    "audio_tokens": 0
-                },
-                "completion_tokens_details": {
-                    "reasoning_tokens": 0,
-                    "audio_tokens": 0,
-                    "accepted_prediction_tokens": 0,
-                    "rejected_prediction_tokens": 0
-                }
-            },
-            "service_tier": "default",
-            "system_fingerprint": format!("fp_{}", uuid::Uuid::new_v4().to_string().replace("-", "").chars().take(10).collect::<String>())
-        });
-
-        Ok(openai_response)
+        let model = self.current_model.read().clone();
+        let mut response = crate::routing::bedrock_converse_to_openai(
+            &bedrock_response,
+            &model,
+            chrono::Utc::now().timestamp(),
+        );
+        response["service_tier"] = json!("default");
+        response["system_fingerprint"] = json!(self.system_fingerprint.read().clone());
+        Ok(response)
     }
 }
 
@@ -522,21 +432,63 @@ impl Provider for BedrockProvider {
         {
             debug!("Processing Bedrock event stream response");
 
-            // Create transformed stream
+            // AWS EventStream message boundaries are independent of HTTP body
+            // chunks. Buffer until the 4-byte prelude announces a complete
+            // message; parsing each transport chunk independently loses any
+            // frame fragmented by the network.
             let provider = self.clone();
-            let stream = response
-                .into_body()
-                .into_data_stream()
-                .map(move |chunk| match chunk {
-                    Ok(bytes) => match provider.transform_bedrock_chunk(bytes) {
-                        Ok(transformed) => Ok(transformed),
-                        Err(e) => {
-                            error!("Error transforming chunk: {}", e);
-                            Err(std::io::Error::other(e))
+            let mut upstream = response.into_body().into_data_stream();
+            let stream = async_stream::stream! {
+                let mut buffered = bytes::BytesMut::new();
+                while let Some(chunk) = upstream.next().await {
+                    let bytes = match chunk {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::other(error));
+                            return;
                         }
-                    },
-                    Err(e) => Err(std::io::Error::other(e)),
-                });
+                    };
+                    buffered.extend_from_slice(&bytes);
+                    loop {
+                        if buffered.len() < 4 {
+                            break;
+                        }
+                        let total_len = u32::from_be_bytes(
+                            buffered[..4].try_into().expect("four-byte prelude"),
+                        ) as usize;
+                        if !(16..=MAX_EVENT_STREAM_MESSAGE_BYTES).contains(&total_len) {
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("invalid AWS EventStream message length {total_len}"),
+                            ));
+                            return;
+                        }
+                        if buffered.len() < total_len {
+                            break;
+                        }
+                        let frame = buffered.split_to(total_len).freeze();
+                        let transformed = match provider.transform_bedrock_chunk(frame) {
+                            Ok(transformed) => transformed,
+                            Err(error) => {
+                                yield Err::<Bytes, std::io::Error>(std::io::Error::other(error));
+                                return;
+                            }
+                        };
+                        if !transformed.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(transformed);
+                        }
+                    }
+                }
+                if !buffered.is_empty() {
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "Bedrock event stream ended with {} bytes of an incomplete message",
+                            buffered.len()
+                        ),
+                    ));
+                }
+            };
 
             // Build response with transformed stream and all necessary headers
             let mut builder = Response::builder()
@@ -812,6 +764,89 @@ mod tests {
             p.transform_path("/v1/chat/completions"),
             "/model/anthropic.claude-3-5-sonnet-20240620-v1:0/converse-stream"
         );
+    }
+
+    #[test]
+    fn native_request_hook_honors_every_gateway_output_limit_alias() {
+        let provider = BedrockProvider::new();
+        for alias in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+            let mut body = json!({
+                "model": "amazon.nova-micro-v1:0",
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            body[alias] = json!(321);
+            let converted = provider.transform_request_body(body).unwrap();
+            assert_eq!(converted["inferenceConfig"]["maxTokens"], 321, "{alias}");
+        }
+    }
+
+    #[test]
+    fn native_response_hook_does_not_fabricate_partial_usage() {
+        let provider = BedrockProvider::new();
+        let response = provider
+            .transform_bedrock_to_openai_format(json!({
+                "output": {"message": {"content": [{"text": "ok"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 7}
+            }))
+            .unwrap();
+        assert_eq!(
+            crate::policy::metering::extract_actual_usage(&response),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn native_event_stream_reassembles_transport_fragmented_messages() {
+        use aws_event_stream_parser::{Header, HeaderBlock};
+
+        fn event(kind: &str, body: Value) -> Vec<u8> {
+            Message::build(
+                HeaderBlock {
+                    headers: vec![Header::from_pair(":event-type", kind)],
+                },
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .as_buffer()
+            .to_vec()
+        }
+
+        let provider = BedrockProvider::new();
+        *provider.current_model.write() = "amazon.nova-micro-v1:0".to_string();
+        let wire = [
+            event("contentBlockDelta", json!({"delta": {"text": "Hello"}})),
+            event(
+                "metadata",
+                json!({"usage": {"inputTokens": 7, "outputTokens": 2, "totalTokens": 9}}),
+            ),
+        ]
+        .concat();
+        let chunks = wire
+            .into_iter()
+            .map(|byte| Ok::<Bytes, std::io::Error>(Bytes::from(vec![byte])))
+            .collect::<Vec<_>>();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/vnd.amazon.eventstream")
+            .body(Body::from_stream(futures_util::stream::iter(chunks)))
+            .unwrap();
+
+        let transformed = provider.process_response(response).await.unwrap();
+        let bytes = axum::body::to_bytes(transformed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let sse = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(sse.contains("Hello"), "{sse:?}");
+        assert!(sse.contains("\"prompt_tokens\":7"), "{sse:?}");
+        assert!(sse.contains("\n\ndata: [DONE]\n\n"), "{sse:?}");
+        let mut scanner = crate::policy::metering::StreamUsageScanner::new();
+        scanner.push(sse.as_bytes());
+        scanner.finish();
+        let usage = scanner
+            .usage_priced("amazon.nova-micro-v1:0", "bedrock")
+            .expect("the terminal metadata frame must settle the reservation");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 2);
     }
 
     #[test]

@@ -7,4 +7,11 @@
 
 pub mod console;
 
+// Reports ALLOWED usage to the Noveum platform (native-only; the reporter uses
+// reqwest + a background tokio task).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod nova_guard_usage;
+
 pub use console::ConsolePlugin;
+#[cfg(not(target_arch = "wasm32"))]
+pub use nova_guard_usage::NovaGuardUsagePlugin;
