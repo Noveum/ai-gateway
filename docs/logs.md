@@ -1,272 +1,133 @@
-Example Request
-[
-  {
-    // The timestamp when this log was created (ISO 8601 or Unix time).
-    "timestamp": "2025-03-05T16:03:20.123Z",
+# Telemetry and log handling
 
-    // Identifies your service; helps group logs in observability tools.
-    "resource": {
-      "service.name": "noveum_ai_gateway",
-      "service.version": "1.0.0",
-      "deployment.environment": "production"
-    },
+The native gateway builds one `RequestMetrics` record for each proxied request.
+It includes provider/model identity, timing, sizes, status codes, token usage,
+estimated cost, attribution fields, and request/response bodies. Registered
+`MetricsExporter` plugins receive independent copies asynchronously.
 
-    // A short name or type for the log record.
-    "name": "ai_gateway_request_log",
+The built-in console exporter is disabled by default. Enable it only for a
+controlled diagnostic session:
 
-    // Additional attributes capturing the details of this request/response cycle.
-    "attributes": {
-      // Basic identifying fields for the request.
-      "id": "msg_29",
-      "threadId": "thread_29",
-      "org_id": "org_123",                    // Example org identifier
-      "user_id": "user_456",                  // Example user identifier
-      "project_id": "proj_design",            // Aligns with metadata.projectId
+```bash
+DEBUG_METRICS=true DEPLOYMENT_ENVIRONMENT=development RUST_LOG=info \
+  noveum-ai-gateway
+```
 
-      // Provider/model details
-      "provider": "azure",
-      "model": "gpt-4-turbo",
+It prints both the Rust debug representation and an OpenTelemetry-compatible
+JSON log. See [Telemetry exporters](telemetry-plugins.md) to implement a durable
+sink.
 
-      // Full request object (as-is from your logs).
-      "request": {
-        "model": "gpt-4-turbo",
-        "messages": [
-          {
-            "role": "user",
-            "content": "I'm designing a mobile app for personal finance management. Can you help me create user personas..."
-          }
-        ],
-        "temperature": 0.7
-      },
+## Record shape
 
-      // Full response object (as-is from your logs).
-      "response": {
-        "id": "chatcmpl-az-gpt4-001",
-        "choices": [
-          {
-            "message": {
-              "role": "assistant",
-              "content": "# User Personas for Personal Finance Management App\n\n## Persona 1: Career-Focused Millennial..."
-            },
-            "finish_reason": "stop"
-          }
-        ],
-        "usage": {
-          "prompt_tokens": 48,
-          "completion_tokens": 865,
-          "total_tokens": 913
-        }
-      },
+Fields are omitted or `null` when a provider does not report them. This is a
+representative, abbreviated record; version and values come from the running
+request:
 
-      // Metadata stored from your logs (latency, cost, tokens, statuses, etc.)
-      "metadata": {
-        "projectId": "proj_design",
-        "projectName": "UX Design",
-        "latency": 6250,
-        "tokens": { "input": 48, "output": 865, "total": 913 },
-        "cost": 0.0456,
-        "status": "success",
-        "provider_request_id": "chatcmpl-az-gpt4-001"
-      }
-    }
+```json
+{
+  "timestamp": "2026-08-24T12:00:00Z",
+  "resource": {
+    "service.name": "noveum_ai_gateway",
+    "service.version": "2.0.1",
+    "deployment.environment": "production"
   },
-  {
-    "timestamp": "2025-03-05T16:18:20.456Z",
-    "resource": {
-      "service.name": "noveum_ai_gateway",
-      "service.version": "1.0.0",
-      "deployment.environment": "production"
+  "name": "ai_gateway_request_log",
+  "attributes": {
+    "id": "msg_1234abcd",
+    "thread_id": "thread_1234abcd",
+    "org_id": "org_example",
+    "project_id": "project_example",
+    "user_id": "user_example",
+    "experiment_id": "experiment_example",
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "request": {
+      "model": "gpt-4o-mini",
+      "messages": [{"role": "user", "content": "Example prompt"}],
+      "max_tokens": 32
     },
-    "name": "ai_gateway_request_log",
-
-    "attributes": {
-      "id": "msg_30",
-      "threadId": "thread_30",
-      "org_id": "org_789",                    // Example org identifier
-      "user_id": "user_999",                  // Example user identifier
-      "project_id": "proj_education",
-
-      "provider": "together",
-      "model": "llama-3-70b-instruct",
-
-      "request": {
-        "model": "llama-3-70b-instruct",
-        "messages": [
-          {
-            "role": "user",
-            "content": "I need to explain quantum computing to high school students. Can you provide a simple explanation..."
-          }
-        ],
-        "temperature": 0.5
-      },
-
-      "response": {
-        "id": "chatcmpl-tog-llama-001",
-        "choices": [
-          {
-            "message": {
-              "role": "assistant",
-              "content": "# Quantum Computing for High School Students\n\n## Simple Explanation\n\nQuantum computing..."
-            },
-            "finish_reason": "stop"
-          }
-        ],
-        "usage": {
-          "prompt_tokens": 36,
-          "completion_tokens": 595,
-          "total_tokens": 631
-        }
-      },
-
-      "metadata": {
-        "projectId": "proj_education",
-        "projectName": "Educational Content",
-        "latency": 5320,
-        "tokens": { "input": 36, "output": 595, "total": 631 },
-        "cost": 0.0315,
-        "status": "success",
-        "provider_request_id": "chatcmpl-tog-llama-001"
-      }
-    }
-  },
-  {
-    "timestamp": "2025-03-05T16:25:30.789Z",
-    "resource": {
-      "service.name": "noveum_ai_gateway",
-      "service.version": "1.0.0",
-      "deployment.environment": "production"
+    "response": {
+      "choices": [{"message": {"role": "assistant", "content": "Example response"}}]
     },
-    "name": "ai_gateway_request_log",
-
-    "attributes": {
-      "id": "msg_31",
-      "threadId": "thread_31",
-      "org_id": "org_123",
-      "user_id": "user_456",
-      "project_id": "proj_chat",
-
-      "provider": "groq",
-      "model": "llama-3.1-8b-instant",
-
-      "request": {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-          {
-            "role": "user",
-            "content": "Write a poem"
-          }
-        ],
-        "stream": true,
-        "max_tokens": 500
-      },
-
-      // For streaming responses, the response includes both the final response and all streamed chunks
-      "response": {
-        "id": "chatcmpl-ec855684-8495-420d-8807-9259228ac717",
-        "model": "llama-3.1-8b-instant",
-        "choices": [
-          {
-            "delta": {
-              "role": "assistant",
-              "content": "\"Moonlit Dreams\"\n\nThe night is dark, the stars are bright,\nA silver glow, a gentle light.\nThe moon, a crescent in the sky,\nLures me to dream, to wonder why.\n\nThe world is hushed, a peaceful sight,\nAs shadows dance, in the moon's pale light.\nThe trees, like sentinels of old,\nStand guard, their branches, stories untold.\n\nIn this quiet hour, I find my peace,\nA sense of calm, my worries release.\nThe moon's soft beams, upon my face,\nIlluminate my soul, a gentle, loving space.\n\nMy heart beats slow, my spirit free,\nAs I let go, and let the moment be.\nThe world, in all its beauty, shines,\nA reflection of the love that's mine.\n\nIn this moonlit night, I find my way,\nA path of dreams, that lead me to a brighter day.\nSo let the moon, its gentle light,\nGuide me through, the darkness of night.\n\nAnd when the dawn, breaks through the sky,\nAnd the sun's warm rays, upon my face, do lie,\nI'll hold on tight, to the memories of this night,\nAnd let the moon's soft beams, shine with all their might."
-            }
-          }
-        ],
-        "x_groq": {
-          "id": "req_01jnkrrz2ken1bej7emqf9j2af",
-          "usage": {
-            "queue_time": 0.291194089,
-            "prompt_tokens": 38,
-            "prompt_time": 0.002701306,
-            "completion_tokens": 256,
-            "completion_time": 0.341333333,
-            "total_tokens": 294,
-            "total_time": 0.344034639
-          }
-        },
-        // The streamed_data field contains all individual chunks received during streaming
-        "streamed_data": [
-          {
-            "nonce": "0955",
-            "id": "chatcmpl-ec855684-8495-420d-8807-9259228ac717",
-            "object": "chat.completion.chunk",
-            "created": 1741199015,
-            "model": "llama-3.1-8b-instant",
-            "system_fingerprint": "fp_fd87957473",
-            "choices": [
-              {
-                "index": 0,
-                "delta": {
-                  "role": "assistant",
-                  "content": ""
-                },
-                "logprobs": null,
-                "finish_reason": null
-              }
-            ],
-            "x_groq": {
-              "id": "req_01jnkrrz2ken1bej7emqf9j2af"
-            }
-          },
-          {
-            "nonce": "ef5fe2",
-            "id": "chatcmpl-ec855684-8495-420d-8807-9259228ac717",
-            "object": "chat.completion.chunk",
-            "created": 1741199015,
-            "model": "llama-3.1-8b-instant",
-            "system_fingerprint": "fp_fd87957473",
-            "choices": [
-              {
-                "index": 0,
-                "delta": {
-                  "content": "\"M"
-                },
-                "logprobs": null,
-                "finish_reason": null
-              }
-            ]
-          },
-          // Additional chunks omitted for brevity
-          {
-            "nonce": "d4fe",
-            "id": "chatcmpl-ec855684-8495-420d-8807-9259228ac717",
-            "object": "chat.completion.chunk",
-            "created": 1741199015,
-            "model": "llama-3.1-8b-instant",
-            "system_fingerprint": "fp_fd87957473",
-            "choices": [
-              {
-                "index": 0,
-                "delta": {},
-                "logprobs": null,
-                "finish_reason": "stop"
-              }
-            ],
-            "x_groq": {
-              "id": "req_01jnkrrz2ken1bej7emqf9j2af",
-              "usage": {
-                "queue_time": 0.291194089,
-                "prompt_tokens": 38,
-                "prompt_time": 0.002701306,
-                "completion_tokens": 256,
-                "completion_time": 0.341333333,
-                "total_tokens": 294,
-                "total_time": 0.344034639
-              }
-            }
-          }
-        ]
-      },
-
-      "metadata": {
-        "projectId": "proj_chat",
-        "projectName": "Chat Application",
-        "latency": 1244,
-        "tokens": { "input": 38, "output": 256, "total": 294 },
-        "cost": 0.0263,
-        "status": "success",
-        "provider_request_id": "req_01jnkrrz2ken1bej7emqf9j2af"
-      }
+    "metadata": {
+      "latency": 420,
+      "ttfb": 190,
+      "provider_latency": 400,
+      "tokens": {"input": 12, "output": 4, "total": 16},
+      "cost": 0.0000042,
+      "pricing_version": "2026.08.23",
+      "status": "success",
+      "path": "/v1/chat/completions",
+      "method": "POST",
+      "request_size": 152,
+      "response_size": 244,
+      "status_code": 200,
+      "provider_status_code": 200,
+      "error_count": 0,
+      "error_type": null,
+      "provider_error_count": 0,
+      "provider_error_type": null,
+      "provider_request_id": "provider-request-id"
     }
   }
-]
+}
+```
+
+When cost can be computed, `metadata.cost_breakdown` also itemizes uncached
+input, cache reads, cache writes, output, tool fees, total, completeness,
+missing dimensions, pricing version, whether an unknown-model assumption was
+used, and whether the value came from catalog arithmetic or an authoritative
+provider total. See [Pricing](PRICING.md) for the accounting contract.
+
+## Attribution headers
+
+The native middleware reads:
+
+- `x-project-id`
+- `x-organization-id` (and the `x-organisation-id` spelling where supported)
+- `x-user-id`
+- `x-experiment-id`
+
+These values are caller input, not trusted identity in transparent/dedicated
+mode. In native shared tenancy, project and organization are checked against the
+tenant derived from `x-noveum-api-key` before policy enforcement. Exporters
+should preserve that distinction.
+
+## Sensitive-data warning
+
+`DEBUG_METRICS=true` can print full prompts, model responses, tool arguments,
+and streaming chunks. Provider-specific `RUST_LOG=debug` targets can also log
+request bodies, response JSON, or stream chunks during ordinary tracing. The
+serializer normalizes some JSON shapes; it does **not** anonymize or remove
+confidential content. Therefore:
+
+- keep the console exporter off in normal production;
+- keep `RUST_LOG=info` in production and use narrowly targeted debug filters
+  only for brief, controlled sessions with protected log storage;
+- apply minimization/redaction before sending records to an external sink;
+- set retention and access controls appropriate for prompt content;
+- never emit provider, Noveum, or AWS credential headers;
+- configure ingress, reverse-proxy, APM, and Cloudflare logs to redact sensitive
+  headers independently; and
+- use synthetic, non-sensitive prompts during production probes.
+
+The built-in metrics record does not serialize request headers, but that does
+not prevent another proxy or debug layer from logging them.
+
+## Operational signals
+
+At minimum collect and alert on:
+
+- gateway and provider status code/error type;
+- total latency, provider latency, and TTFB;
+- restarts, panics, and sustained 5xx;
+- missing or incomplete token/cost dimensions;
+- Nova Guard blocks and policy/configuration rejections;
+- platform state/admission failures, especially fail-closed blocks;
+- abandoned reservations and settlement retry exhaustion; and
+- usage queue overflow/drop warnings.
+
+The Cloudflare Worker does not run native `MetricsExporter` plugins. Use
+`wrangler tail` for real-time diagnostics and enable Workers Logs (or an
+approved export) for persistent edge observability; see the
+[Worker runbook](CLOUDFLARE_WORKER.md#observability).

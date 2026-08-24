@@ -14,8 +14,6 @@ env:
 
 jobs:
   docker:
-    # Skip this job if it's a push event on a non-main branch
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -25,7 +23,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Validate workflow release and secret-ref guards
+        run: bash scripts/validate_docker_release.sh workflows
 
       # Generate Cargo.lock if it doesn't exist
       - name: Generate Cargo.lock
@@ -37,30 +39,64 @@ jobs:
       - name: Extract version from Cargo.toml
         id: version
         run: |
-          VERSION=$(awk -F '"' '/^version = / {print $2}' Cargo.toml)
-          echo "CARGO_VERSION=${VERSION}" >> $GITHUB_ENV
+          set -euo pipefail
+          VERSION="$(bash scripts/validate_docker_release.sh package-version)"
+          echo "CARGO_VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "Version found: ${VERSION}"
+
+      - name: Select build-only or immutable release mode
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          MODE="$(bash scripts/validate_docker_release.sh mode "${EVENT_NAME}" "${GIT_REF}")"
+          if [[ "${MODE}" == "release" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Docker workflow mode: ${MODE}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      # Always build to verify Dockerfile, but push only on main
-      - name: Build Docker image (non-main branch)
-        if: github.ref != 'refs/heads/main'
+      - name: Prove the Docker context excludes local secrets and state
+        run: bash scripts/validate_docker_release.sh context
+
+      # Every event builds and runs the exact image before any registry login.
+      # Pull requests, main pushes, and manual runs never publish it.
+      - name: Build Docker image for runtime verification
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: false
+          tags: noveum-ai-gateway:ci-${{ github.sha }}
           # Match local build platform for consistency
           platforms: linux/amd64
+          build-args: |
+            VERSION=${{ env.CARGO_VERSION }}
+            REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # Add load flag to ensure it can be tested locally
           load: true
 
-      # Main branch handling - build and push
+      - name: Validate the hardened runtime image
+        run: bash scripts/validate_docker_release.sh runtime-image "noveum-ai-gateway:ci-${{ github.sha }}" "${{ github.sha }}"
+
+      # A versioned image is published only for an exact v${Cargo version} tag.
+      # It must also point to a commit already contained in trusted main.
+      - name: Verify release commit provenance against main
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          bash scripts/validate_docker_release.sh provenance HEAD refs/remotes/origin/main
+
       - name: Log in to GitHub Container Registry
-        if: github.ref == 'refs/heads/main'
+        if: steps.release.outputs.publish == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -68,7 +104,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata for GHCR
-        if: github.ref == 'refs/heads/main'
+        if: steps.release.outputs.publish == 'true'
         id: meta-ghcr
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
@@ -78,27 +114,30 @@ jobs:
             type=raw,value=${{ env.CARGO_VERSION }}
 
       - name: Build and push to GitHub Container Registry
-        if: github.ref == 'refs/heads/main'
+        if: steps.release.outputs.publish == 'true'
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: true
           tags: ${{ steps.meta-ghcr.outputs.tags }}
           labels: ${{ steps.meta-ghcr.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.CARGO_VERSION }}
+            REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # Match local build platform for GHCR build too
           platforms: linux/amd64
 
       - name: Login to Docker Hub
-        if: github.ref == 'refs/heads/main'
+        if: steps.release.outputs.publish == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push to Docker Hub
-        if: github.ref == 'refs/heads/main'
+        if: steps.release.outputs.publish == 'true'
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
@@ -106,6 +145,9 @@ jobs:
           tags: |
             noveum/noveum-ai-gateway:latest
             noveum/noveum-ai-gateway:${{ env.CARGO_VERSION }}
+          build-args: |
+            VERSION=${{ env.CARGO_VERSION }}
+            REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64

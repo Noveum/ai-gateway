@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-08-24
+
+### Added
+
+- Added a static, no-JavaScript landing page at `GET /` and `HEAD /` for native
+  and Cloudflare runtimes. It reports the runtime and package version, links to
+  health and public project resources, sends a restrictive content-security
+  policy, and is cached for five minutes. `HEAD` preserves the response contract
+  without a body. `/docs` and `/openapi.json` remain unimplemented.
+- Native Bedrock signing now accepts the optional `x-aws-session-token` header,
+  bringing temporary STS credential support to both native and Cloudflare
+  runtimes.
+
+### Fixed
+
+- Cloudflare Worker Bedrock requests with `stream: true` now fail with a
+  deterministic OpenAI-shaped HTTP 400 with
+  `error.code = "unsupported_feature"` before Nova Guard admission or AWS
+  dispatch. A present non-Boolean `stream` value is likewise rejected with a
+  deterministic HTTP 400 instead of being treated as buffered mode. Native
+  Bedrock ConverseStream remains supported; Worker Bedrock streaming is not
+  implemented and is no longer allowed to enter an invalid signing/response
+  path.
+- The native server now honors the configured `HOST` when binding its TCP
+  listener. The previous startup path logged `HOST` but always bound the
+  wildcard address.
+- `WORKER_THREADS` now determines the native Tokio runtime's worker count; the
+  previous startup path applied the value only after Tokio had already created
+  its runtime.
+- The container image now sets `HOST=0.0.0.0` so published ports and
+  orchestrator probes can reach the process, while native installations retain
+  the loopback default. Release builds pass the Cargo version into the OCI
+  image label instead of permanently labeling the image `latest`, record the
+  exact source revision, and run as the fixed unprivileged UID/GID
+  `65532:65532`.
+- Container automation now publishes versioned GHCR and Docker Hub images (and
+  advances `latest`) only for a pushed `v${Cargo package version}` tag. Pull
+  requests, `main`, and manual runs build without publishing; a mismatched tag
+  or a tag whose commit is outside trusted `main` fails before registry login.
+  Every event validates the image with a read-only root filesystem, all
+  capabilities dropped, `no-new-privileges`, the exact OCI labels, and a live
+  versioned health response. The BuildKit context is deny-by-default and
+  contains only the Cargo manifests, Rust source, policy schema, and pricing
+  catalog.
+- Cross-provider credential headers are stripped from generic upstream
+  requests. `x-api-key` is reconstructed only for Anthropic, and `x-aws-*`
+  headers are consumed only by Bedrock, so a credential for one provider is not
+  leaked to another provider.
+- Cloudflare version and alias preview URLs are explicitly disabled in
+  `wrangler.toml`. This keeps preview hostnames dark after the deleted-version
+  routing incident and makes future preview exposure an intentional,
+  reviewable configuration change.
+- Live-provider smoke defaults now use the model IDs verified on 2026-08-24,
+  accept per-provider model overrides through repository/environment variables,
+  can pass an optional AWS STS session token without storing it in source, and
+  require authoritative terminal streaming usage. OpenAI and Groq request that
+  usage explicitly; Together and Fireworks rely on their provider-emitted final
+  chunks rather than an undocumented OpenAI option.
+- Native Bedrock event-stream decoding now uses AWS's maintained Smithy parser,
+  validates both frame checksums before translating a message to SSE, and
+  propagates corrupt-frame failures to the downstream body. This removes the
+  legacy parser chain that pulled in the unsound `lexical-core 0.7.6`.
+- Native and integration-test environment loading now uses the maintained
+  `dotenvy` fork instead of the unmaintained `dotenv 0.15.0`. Together with the
+  Bedrock parser migration, the Rust security gates now carry no explicit
+  advisory waivers.
+- The integration harness no longer falls back to the repository's production
+  `.env` when `.env.test` is absent. Hermetic CI now runs all eight network-free
+  provider-helper regressions, including model override and provider-aware
+  terminal-usage selection.
+- The Workerd suite now verifies `HEAD /` parity, cross-provider credential
+  stripping, the complete OpenAI-shaped Worker Bedrock `unsupported_feature`
+  error envelope, and rejection of a non-Boolean Bedrock `stream` field rather
+  than checking only a status or one field.
+
+### Documentation
+
+- Added a v1.2-to-v2 migration guide, a five-minute quick start, an explicit
+  credential/scope matrix, production deployment and rollback runbooks, and a
+  repeatable native/Worker/live-provider validation checklist.
+- Made the packaged README's repository links resolve through the immutable
+  `v2.0.1` Git tag instead of crates.io's moving `HEAD` rewrite.
+- Preserved the v2.0.0 Cloudflare deployment as a dated release baseline and
+  clarified, without pinning the current production version, that a shared
+  hostname must remain transparent unless it is split into dedicated
+  project-bound deployments.
+- Replaced stale Fireworks and Together model inventories with dated,
+  production-verified examples and documented the native/Worker Bedrock
+  streaming split and AWS credential boundary.
+
 ## [2.0.0] - 2026-08-24
 
 ### Breaking changes
@@ -21,9 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway can preserve and report an invalid wire-level policy name. Use
   `Policy::kind()` to read its parsed `PolicyType` and `Policy::type_name()` to
   read the original string.
-- `PolicyEngine::from_env` is now synchronous and returns `Result<Self,
+- `PolicyEngine::from_env` remains asynchronous but now returns `Result<Self,
   String>` so malformed or unsupported configuration fails explicitly instead
-  of producing an apparently valid engine.
+  of producing an apparently valid engine. Callers must continue to `.await`
+  it and now handle the error.
 
 ### Added
 
@@ -277,10 +368,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error handling
 - Basic documentation
 
-[Unreleased]: https://github.com/Noveum/ai-gateway/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/Noveum/ai-gateway/compare/v2.0.1...main
+[2.0.1]: https://github.com/Noveum/ai-gateway/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/Noveum/ai-gateway/compare/v1.2.0...v2.0.0
-[1.2.0]: https://github.com/Noveum/ai-gateway/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/Noveum/ai-gateway/compare/v1.0.1...v1.1.0
+[1.2.0]: https://github.com/Noveum/ai-gateway/compare/65f678294a0609dcd1482bf2b1b9b830dcde42c5...v1.2.0
+[1.1.0]: https://github.com/Noveum/ai-gateway/compare/v1.0.1...65f678294a0609dcd1482bf2b1b9b830dcde42c5
 [1.0.1]: https://github.com/noveum/ai-gateway/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/noveum/ai-gateway/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/noveum/ai-gateway/compare/v0.1.7...v0.2.0

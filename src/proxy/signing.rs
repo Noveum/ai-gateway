@@ -12,14 +12,21 @@ pub async fn sign_aws_request(
     body: &[u8],
     access_key: &str,
     secret_key: &str,
+    session_token: Option<&str>,
     region: &str,
     service: &str,
 ) -> Result<HeaderMap, AppError> {
     debug!("Signing request with method: {}, url: {}", method, url);
 
     // Create credentials
-    let identity =
-        Credentials::new(access_key, secret_key, None, None, "signing-credentials").into();
+    let identity = Credentials::new(
+        access_key,
+        secret_key,
+        session_token.map(str::to_owned),
+        None,
+        "signing-credentials",
+    )
+    .into();
 
     // Create signing parameters
     let signing_settings = SigningSettings::default();
@@ -65,6 +72,47 @@ pub async fn sign_aws_request(
         final_headers.insert(key.clone(), value.clone());
     }
 
-    debug!("Final signed headers: {:?}", final_headers);
+    // Never log signed header values: `authorization` is credential-derived and
+    // temporary credentials add the raw `x-amz-security-token` value.
+    debug!("AWS request signed with {} headers", final_headers.len());
     Ok(final_headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sign_aws_request;
+
+    #[tokio::test]
+    async fn temporary_credentials_sign_and_forward_the_security_token() {
+        let headers = sign_aws_request(
+            "POST",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/amazon.nova-micro-v1:0/converse",
+            br#"{"inputText":"hello"}"#,
+            "AKID",
+            "secret",
+            Some("session-token-123"),
+            "us-east-1",
+            "bedrock",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            headers
+                .get("x-amz-security-token")
+                .and_then(|value| value.to_str().ok()),
+            Some("session-token-123")
+        );
+        assert!(headers.contains_key("authorization"));
+        for raw_header in [
+            "x-aws-access-key-id",
+            "x-aws-secret-access-key",
+            "x-aws-session-token",
+        ] {
+            assert!(
+                !headers.contains_key(raw_header),
+                "raw caller credential header leaked into the signed request: {raw_header}"
+            );
+        }
+    }
 }

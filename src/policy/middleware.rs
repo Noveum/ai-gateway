@@ -329,6 +329,22 @@ pub async fn guard_middleware(
             )
             .into_response();
         }
+        let region = match parts.headers.get("x-aws-region") {
+            Some(value) => match value.to_str() {
+                Ok(region) => region,
+                Err(_) => {
+                    return crate::error::AppError::RequestError(
+                        "x-aws-region must be a valid UTF-8 AWS region such as us-east-1"
+                            .to_string(),
+                    )
+                    .into_response();
+                }
+            },
+            None => crate::routing::BEDROCK_DEFAULT_REGION,
+        };
+        if let Err(message) = crate::routing::validate_aws_region(region) {
+            return crate::error::AppError::RequestError(message).into_response();
+        }
     } else if engine.stateful_policy_count() > 0 {
         let bearer = parts
             .headers
@@ -1540,8 +1556,8 @@ impl SharedTenancy {
 
 /// Does this path require an authenticated tenant? **Pure.**
 ///
-/// Only the proxy surface. `/health` stays reachable so liveness/readiness
-/// probes do not need a tenant credential.
+/// Only the proxy surface. `/` and `/health` stay reachable so visitors and
+/// liveness/readiness probes do not need a tenant credential.
 pub fn requires_tenant(path: &str) -> bool {
     path.starts_with("/v1/")
 }

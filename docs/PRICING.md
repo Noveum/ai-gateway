@@ -167,16 +167,19 @@ available **at least through November 21, 2026**. It has not published an exact
 end date or replacement rates, so the catalog carries the promotion as the
 current rate and intentionally has no scheduled rollback.
 
-### Current Anthropic rows
+### Selected Anthropic catalog rows
 
-| Model | Availability note | Input | Output | Cache hit | 5m write | 1h write |
+These are selected non-legacy pricing rows, not an inventory of models enabled
+for a particular Anthropic account. Verify model availability separately.
+
+| Model | Catalog note | Input | Output | Cache hit | 5m write | 1h write |
 |---|---|---:|---:|---:|---:|---:|
-| `claude-sonnet-5` | Active; $2/$10 launch pricing is permanent | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
-| `claude-opus-5` | Active | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
-| `claude-opus-4-8` | Active | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
-| `claude-opus-4-5-20251101` | Active dated model ID | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
-| `claude-fable-5` | Active | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
-| `claude-mythos-5` | Active, limited/invitation-only availability | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+| `claude-sonnet-5` | Non-legacy row; no scheduled increase | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
+| `claude-opus-5` | Non-legacy row | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| `claude-opus-4-8` | Non-legacy row | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| `claude-opus-4-5-20251101` | Non-legacy dated row | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| `claude-fable-5` | Non-legacy row | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+| `claude-mythos-5` | Non-legacy row | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
 
 Anthropic publishes cache hits at 0.1x input, 5-minute writes at 1.25x,
 1-hour writes at 2x, US-only inference at 1.1x for eligible models, and fast

@@ -1,6 +1,8 @@
 # Cloudflare deployment architecture
 
-Current as of **August 2026**.
+Applies to gateway **v2.0.1** (August 2026). The production evidence in this
+document is the dated v2.0.0 baseline; release preparation does not establish
+that v2.0.1 has been deployed or promoted.
 
 The repository ships two deployment shapes from the same Rust crate:
 
@@ -21,7 +23,12 @@ For operator commands and the platform-bridge runbook, use
 
 The Worker implementation includes:
 
-- `/health`, CORS, request-size limits, and `/v1/*` routing.
+- A static, no-JavaScript `GET /` information page with bodyless `HEAD /`
+  parity, `/health`, CORS, request-size limits, and `/v1/*` routing. `/docs` and
+  `/openapi.json` remain 404.
+- Explicitly disabled version-prefix and alias preview URLs. Release candidates
+  are attached at zero percent and exercised through Cloudflare's
+  version-override header before canary traffic.
 - Transparent proxying for the OpenAI-compatible provider routes.
 - Anthropic OpenAI Chat Completions ↔ Messages translation for requests,
   successful buffered responses, and successful SSE streams, including function
@@ -29,8 +36,11 @@ The Worker implementation includes:
   survive both response paths for settlement. Client function tools are
   supported; native Anthropic server/MCP tool definitions are not. The exact
   subset is documented in [providers/anthropic.md](providers/anthropic.md).
-- Bedrock Converse conversion and SigV4 signing in pure Rust (`sha2` + `hmac`),
-  including temporary credentials through `x-aws-session-token` on the Worker.
+- Buffered Bedrock Converse conversion and SigV4 signing in pure Rust (`sha2` +
+  `hmac`), including temporary credentials through `x-aws-session-token` on the
+  Worker. Worker `stream: true` is rejected with an OpenAI-shaped HTTP 400
+  `unsupported_feature` before admission/AWS; native ConverseStream remains
+  supported and now also accepts temporary credentials.
 - Inline stateless Nova Guard policies.
 - Dedicated platform-managed Nova Guard: effective policies, project **and
   organization** live counters, atomic admission, and reservation settlement.
@@ -38,21 +48,31 @@ The Worker implementation includes:
   through; successful Anthropic SSE is translated to OpenAI chunks before it is
   metered and returned.
 
-This document does not assert that the latest working tree is deployed on a
-production Cloudflare account. The reproducible PR evidence is:
+The v2.0.0 release was deployed to Cloudflare and verified on both
+`https://gate.noveum.ai` and its `workers.dev` hostname. The production service
+is intentionally **transparent**: it has no project-bound Noveum bridge because
+the hostname is shared. Dedicated bridge behavior was validated with isolated
+preview versions against the production control plane, including two projects
+sharing one organization counter, without assigning that preview project to all
+production callers.
+
+Release evidence has five layers:
 
 1. native formatting, lint, build, and hermetic tests;
 2. wasm compilation and `worker-build --release`;
 3. `wrangler deploy --dry-run`; and
 4. `scripts/novaguard_worker_e2e.sh`, a 13-phase suite running the generated
    bundle in real local `workerd` against mock Noveum, OpenAI, and Anthropic
-   upstreams.
+   upstreams; and
+5. an immutable Cloudflare preview and production promotion, followed by live
+   buffered/SSE checks through OpenAI, Anthropic, and Groq.
 
 The workerd suite covers `worker::Fetch`, policy/state/admission calls,
 `ctx.wait_until` settlement, incomplete streams, strict failure behavior,
 Anthropic tool-stream translation, mixed concurrent agents, and the matrix that
 selects which unbounded requests require a strict output limit. A real edge
-deployment and live-provider smoke test remain separate release activities.
+smoke remains mandatory for every new deployment; the v2.0.0 result is evidence
+for that immutable release, not for future working trees.
 
 ## Architecture
 
@@ -68,7 +88,7 @@ Cloudflare Worker (workerd / WASM)
   |-- provider adapter
   |     |-- OpenAI-compatible: transparent HTTP/SSE proxy
   |     |-- Anthropic: OpenAI request -> Messages; response/SSE -> OpenAI
-  |     `-- Bedrock: OpenAI request -> Converse + SigV4; response -> OpenAI
+  |     `-- Bedrock: OpenAI request -> buffered Converse + SigV4; response -> OpenAI
   |-- Nova Guard buffered output phase (streaming output phase is skipped)
   `-- reservation completion/abandon/cancel through ctx.wait_until
 ```
@@ -83,13 +103,13 @@ supplied per request. Platform-managed Nova Guard does require a scoped
 |---|---|---|
 | Outbound HTTP | `worker::Fetch` | `reqwest` |
 | Server runtime | `workerd` isolate | Tokio + Axum |
-| Bedrock signing | Pure Rust `sha2` + `hmac`; accepts optional session token | Native AWS signing path; session-token parity is tracked separately |
+| Bedrock signing | Pure Rust `sha2` + `hmac`; accepts optional session token | Native AWS SDK signer; accepts optional session token |
 | Caller tenancy | Dedicated project only; `NOVEUM_GUARD_TENANCY=shared` is refused with 503 | Dedicated or shared, with tenant derived from `x-noveum-api-key` |
 | Local policy source | Inline Worker var/secret; filesystem paths are unavailable | Inline JSON or file |
 | Stateful inline policy | Inline `cost_cap` / `rate_limit` is refused with 503 because it has no backend | Without platform state, stateful rules fail open and warn |
 | Platform state | Dedicated policy fetch, project/org counters, admission, settlement | Dedicated or per-derived-tenant clients |
 | Deployment-wide cost-mode override | Not implemented; each policy's `enforcementMode` decides | `NOVEUM_GUARD_COST_ENFORCEMENT=strict\|advisory` |
-| Streaming | OpenAI-compatible pass-through; Anthropic translated incrementally; no output-phase Guard enforcement | Same protocol-level behavior through the native transport |
+| Streaming | OpenAI-compatible pass-through; Anthropic translated incrementally; Bedrock rejected with HTTP 400 `unsupported_feature`; no output-phase Guard enforcement | OpenAI-compatible/Anthropic behavior plus Bedrock ConverseStream translation |
 | Telemetry export | No full native exporter; platform settlement is supported | Native telemetry plugins/exporters |
 
 ## Nova Guard correctness at the edge
@@ -190,32 +210,29 @@ Before deploying a release candidate:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib
-cargo test --test novaguard_platform
-cargo test --test policy_integration
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --lib
+cargo test --locked --test novaguard_platform
+cargo test --locked --test policy_integration
+cargo check --locked --target wasm32-unknown-unknown --no-default-features --lib
 worker-build --release
 npx --yes wrangler@4.120.0 deploy --dry-run
 scripts/novaguard_worker_e2e.sh
 git diff --check
 ```
 
-Then perform an explicitly authorized staged deployment and smoke test with
-scoped credentials. At minimum verify `/health`, one buffered and one streaming
-OpenAI call, one buffered and one tool-streaming Anthropic call, an organization
-cap, a strict unbounded 400, and reservation settlement. Do not infer a live
-result from the hermetic suite.
+Then follow the explicitly authorized staged deployment and rollback runbook in
+[CLOUDFLARE_WORKER.md](CLOUDFLARE_WORKER.md#production-deployment-runbook).
+At minimum verify `/health`, one buffered and one streaming OpenAI call, one
+buffered and one tool-streaming Anthropic call, an organization cap, a strict
+unbounded 400, and reservation settlement. Do not infer a live result from the
+hermetic suite.
 
 ## Remaining work
 
-- Add a Worker-native telemetry sink (for example Analytics Engine or Queues).
-- Add Workers KV policy loading if globally distributed stateless bundles are a
-  requirement; this release reads Worker vars/secrets, not KV.
-- Re-enable `wasm-opt` after preserving panic recovery and bundle checks.
-- Decide whether the native Bedrock path should accept temporary credentials for
-  parity with the Worker.
-- Add an authorized staged-deployment smoke workflow if the organization wants a
-  repeatable live edge gate separate from hermetic PR CI.
+Worker-native telemetry, distributed policy storage, Bedrock feature expansion,
+and automated authorized smoke coverage are tracked in the [current
+roadmap](TODO.md). That roadmap is not a release promise.
 
 ## Primary sources
 

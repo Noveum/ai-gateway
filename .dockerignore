@@ -1,10 +1,18 @@
-target/
-.git/
-.github/
-.env
-**/*.rs.bk
-Dockerfile
-.dockerignore
-.gitignore
-README.md
-*.log 
+# Deny the entire repository by default. The release image needs only the
+# manifest/lockfile plus the source and compile-time data directories copied by
+# Dockerfile. This prevents local .env files, Wrangler state, credentials,
+# generated bundles, logs, and unrelated working-tree files from being sent to
+# a local or remote BuildKit daemon.
+**
+
+!Cargo.toml
+!Cargo.lock
+
+!src/
+!src/**
+
+!schema/
+!schema/**
+
+!pricing/
+!pricing/**

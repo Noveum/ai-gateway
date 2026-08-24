@@ -723,8 +723,9 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(req.get("stream_options"), dict) else False
         )
         log("POST /v1/chat/completions (mock provider) model=%s stream=true "
-            "stream_options.include_usage=%s -> 200 text/event-stream"
-            % (model, include_usage))
+            "stream_options.include_usage=%s x_api_key_present=%s "
+            "-> 200 text/event-stream"
+            % (model, include_usage, bool(self.headers.get("x-api-key"))))
         if not include_usage:
             log("  !! include_usage was NOT set on the inbound request; the gateway "
                 "is supposed to FORCE it while metering")

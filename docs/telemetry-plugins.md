@@ -1,15 +1,15 @@
-# Telemetry Exporters Guide
+# Telemetry exporter development
 
 This guide explains how per-request telemetry flows through the gateway and how to
 add a new exporter.
 
 ## Overview
 
-For every proxied request the gateway builds a [`RequestMetrics`] value (provider,
-model, token usage, cost, latency, status, request/response bodies, and tracking
-ids from headers). The [`MetricsRegistry`] fans that value out to every registered
-[`MetricsExporter`] concurrently, so adding a destination is just implementing one
-trait and registering it at startup.
+For every proxied request the native gateway builds a [`RequestMetrics`] value
+(provider, model, token usage, cost, latency, status, request/response bodies,
+and tracking IDs from headers). The [`MetricsRegistry`] spawns an independent
+export task for each registered [`MetricsExporter`]. Export failures are logged
+and do not change the already-proxied response.
 
 - `RequestMetrics` and the `to_otel_log` serializer — `src/telemetry/mod.rs`
 - `MetricsExporter` trait + `MetricsRegistry` — `src/telemetry/metrics.rs`
@@ -17,9 +17,9 @@ trait and registering it at startup.
   - **Console** (`src/telemetry/plugins/console.rs`) — pretty-prints metrics for
     local debugging. Enabled with `DEBUG_METRICS=true`.
 
-  Shipping traffic to an external observability backend (e.g. a Noveum trace
-  exporter) is a matter of implementing `MetricsExporter` and registering it in
-  `main.rs` — see below.
+Shipping records to an external observability backend requires implementing
+`MetricsExporter` and registering it in `main.rs` as described below. The
+Cloudflare Worker does not run these native exporters.
 
 ## The `MetricsExporter` trait
 
@@ -28,15 +28,20 @@ trait and registering it at startup.
 pub trait MetricsExporter: Send + Sync {
     /// Ship one request's metrics. Errors are logged by the registry and never
     /// block the proxied response.
-    async fn export_metrics(&self, metrics: RequestMetrics) -> Result<(), Box<dyn std::error::Error>>;
+    async fn export_metrics(
+        &self,
+        metrics: RequestMetrics,
+    ) -> Result<(), Box<dyn std::error::Error>>;
 
     /// Stable name for logging.
     fn name(&self) -> &str;
 }
 ```
 
-Exporters run off the request hot path, so a slow or failing exporter degrades
-telemetry only — never the proxied request.
+Exporter tasks run after recording is scheduled, so a slow or failing exporter
+degrades telemetry only. Add explicit timeouts, bounded queues, retry limits,
+and shutdown behavior when delivery guarantees matter; the trait itself does
+not provide them.
 
 ## Adding a new exporter
 
@@ -78,9 +83,16 @@ telemetry only — never the proxied request.
 
 ## Project / org attribution
 
-`RequestMetrics` carries `project_id`, `org_id`, `user_id`, and `experiment_id`,
-populated from the `x-project-id`, `x-organization-id`, `x-user-id`, and
-`x-experiment-id` request headers. Exporters should attribute data using these.
+`RequestMetrics` carries `project_id`, `org_id`, `user_id`, and `experiment_id`.
+In transparent and dedicated modes these begin as caller-supplied attribution,
+not authenticated identity. Native shared tenancy validates project and
+organization against the tenant derived from `x-noveum-api-key`. Exporters must
+preserve that distinction.
+
+Request and response bodies can contain prompts, tool arguments, personal data,
+and confidential output. Apply minimization/redaction before external export,
+keep provider/Noveum/AWS credentials out of records, and define retention and
+access controls. See [Telemetry and log handling](logs.md).
 
 [`RequestMetrics`]: ../src/telemetry/mod.rs
 [`MetricsRegistry`]: ../src/telemetry/metrics.rs

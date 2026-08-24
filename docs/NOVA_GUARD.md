@@ -1,8 +1,10 @@
 # Nova Guard — Policy Enforcement in the Gateway
 
 Nova Guard is the policy-enforcement layer built into the Noveum AI Gateway. It
-inspects every LLM request and response flowing through the gateway and can
-**block**, **redact / mask**, or **flag** based on policies you define. It runs
+inspects JSON requests and buffered JSON responses and can **block**, **redact /
+mask**, or **flag** based on policies you define. Streaming requests still run
+input policies and usage metering, but streaming output content is not buffered
+for output-phase enforcement in v2.0.x. It runs
 the deterministic policy types entirely in-process (no network dependency), from
 a **local policy bundle** (file or inline env) — the gateway enforces guardrails
 standalone (BYOK mode) with no external service.
@@ -36,7 +38,7 @@ Policies can come from either of two places:
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `NOVEUM_GUARD_ENABLED` | `true` | Master switch. `false`/`0` makes the gateway a pure pass-through. |
+| `NOVEUM_GUARD_ENABLED` | `true` | Master switch. A false value disables policy evaluation. A configured platform bridge may still initialize and report usage, so remove the bridge settings too when transparent mode is intended. |
 | `NOVEUM_GUARD_POLICIES_FILE` | _(unset)_ | Path to a `nova-guard.json` bundle. |
 | `NOVEUM_GUARD_POLICIES` | _(unset)_ | Inline JSON bundle (used if no file is set). |
 | `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` (HTTP 200 with a refusal completion) or `provider_error` (HTTP 403 with the provider's error envelope). |
@@ -44,8 +46,8 @@ Policies can come from either of two places:
 | `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Fallback completion estimate for advisory cost caps and rate-only admission. It is not a substitute for the explicit output limit required by an applicable enforcing/blocking strict cost cap. |
 
 When the engine is disabled or has zero active policies, the middleware
-short-circuits without buffering the body, so guardrails add **no overhead** when
-unused.
+short-circuits without buffering the body or evaluating rules. Normal gateway
+routing and telemetry still run.
 
 ## Policy bundle
 
@@ -77,11 +79,10 @@ The bundle format (`nova-guard.json`) is shared with the Nova Guard SDK:
       }
     },
     {
-      "name": "Monthly LLM budget",
-      "type": "cost_cap",
+      "name": "Bound prompt length",
+      "type": "token_length_cap",
       "mode": "enforce",
-      "failClosed": true,
-      "config": { "window": "1mo_calendar", "maxUsd": 1500, "action": "block" }
+      "config": { "phase": "input", "maxTokens": 100000, "action": "block" }
     }
   ]
 }
@@ -116,10 +117,12 @@ not call.
 
 A policy the engine cannot enforce is never silently skipped. It is logged at
 `error!` naming the policy and the reason, counted by
-`PolicyEngine::rejected_policies()`, and refuses startup when it came from a
-local bundle. If the policy is marked `failClosed`, it blocks traffic: a policy
-that can never compile can never be evaluated, which is exactly what
-`failClosed` is for. Shadow mode still never blocks.
+`PolicyEngine::rejected_policies()`, and refuses native startup when it came
+from a local bundle. A Worker inline bundle is evaluated per proxy request, so
+an invalid bundle returns a configuration error on `/v1/*` while `/` and
+`/health` can remain available. If the policy is marked `failClosed`, it blocks
+traffic: a policy that can never compile can never be evaluated, which is
+exactly what `failClosed` is for. Shadow mode still never blocks.
 
 | Type | Phase(s) | What it does |
 |---|---|---|
@@ -182,17 +185,24 @@ deployment serves more than one tenant.
 | `NOVEUM_API_URL` | optional | optional |
 | `NOVEUM_GUARD_TENANT_TTL_SECS` | n/a | optional, default `300` |
 | `NOVEUM_GUARD_TENANT_CACHE_MAX` | n/a | optional, default `1024` |
-| `NOVEUM_GUARD_POLICIES[_FILE]` | allowed | **refused at startup** |
+| `NOVEUM_GUARD_POLICIES[_FILE]` | not combined with the platform source; remove for clarity | **refused at startup** |
 
 Configuring both modes at once aborts startup rather than resolving by
 precedence, and shared mode is never inferred — it is only entered by asking
 for it, so an existing dedicated deployment cannot drift into it.
 
-**Dedicated** pins the whole process to one project. Every request a replica
+The Cloudflare Worker implements dedicated mode only. Do not attach one
+dedicated project to a hostname shared by unrelated callers: every call would
+be attributed and capped against that project. Keep that Worker transparent,
+deploy a dedicated Worker/domain per project, or use the native shared mode.
+
+**Dedicated** pins the whole deployment to one project. Every request a replica
 handles is metered and capped against it regardless of who sent it, which is
 correct for a gateway fronting one team and wrong for anything else. The policy
-set is fetched at startup (a failed first fetch aborts) and refreshed by a
-background poller.
+set is fetched before guarded traffic is allowed. Native refreshes it with a
+background poller; the Worker revalidates its per-isolate cache on requests. A
+failed first fetch refuses startup/native traffic or the Worker request unless
+the explicit emergency unguarded-start override is enabled.
 
 **Shared** authenticates each caller and derives its tenant server-side:
 
@@ -328,7 +338,8 @@ they reach the client, including function tool calls and terminal usage.
 
 Adding a new deterministic policy type is local:
 
-1. Add a variant to `PolicyType` (`src/policy/config.rs`) and a config struct.
+1. Add a variant to `PolicyType` (`src/policy/policy_types.rs`) and a config
+   struct.
 2. Implement `PolicyRule` in `src/policy/rules/<your_rule>.rs`.
 3. Add a `parse` arm in `compile_rule` (`src/policy/rules/mod.rs`).
 
@@ -337,21 +348,13 @@ no further changes.
 
 ## Cost / pricing
 
-Per-request cost is computed from the model pricing catalog in
-`pricing/catalog.json`, mirrored by hand into
-`src/policy/pricing_catalog.rs`, and used by `src/policy/pricing.rs`. The catalog
-version is `2026.08.23`; it includes provider-prefixed model ids, cache
-dimensions, tool fees, long-context tiers in both runtime mirrors, and supported
-request/response multipliers. Current OpenAI rows include GPT-5.6 Sol's $4/$20
-promotional Standard card, GPT-5.6 Cyber at $12.50/$75, and published GPT-5.6
-long-context cache rates. Current Anthropic
-rows include Sonnet 5 at the now
-permanent **$2 / million input** and **$10 / million output**, Opus 5 and the
-dated Opus 4.5 ID at $5/$25, and limited-availability Mythos 5 at $10/$50.
-Unknown models use the compiled runtime rows' derived $15/$75 maximum rather
-than $0. Missing billable
-dimensions use a conservative bound and mark the cost incomplete. A zero-output
-Anthropic pre-output refusal keeps token counts but settles at $0; partial-output
-refusals are billed normally. Rates remain policy estimates, not an invoice.
-See the [pricing guide](PRICING.md) and verify time-sensitive Anthropic values
-against [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
+Per-request cost is computed from the versioned manifest in
+`pricing/catalog.json`, mirrored into `src/policy/pricing_catalog.rs`, and used
+by `src/policy/pricing.rs`. Catalog membership is a pricing capability, not a
+claim that the caller's provider account can still invoke that model. Unknown
+models use the compiled runtime's conservative maximum rather than $0, and
+missing billable dimensions are bounded and marked incomplete. A zero-output
+Anthropic pre-output refusal keeps token counts but settles at $0;
+partial-output refusals are billed normally. Rates remain policy estimates, not
+an invoice. The catalog version, current rows, update procedure, and primary
+sources live in the single [pricing guide](PRICING.md).

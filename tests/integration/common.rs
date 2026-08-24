@@ -1,4 +1,4 @@
-use dotenv::from_filename;
+use dotenvy::from_filename;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::{
@@ -52,6 +52,76 @@ impl ProviderTestConfig {
         self.output_limit_field = OutputLimitField::MaxCompletionTokens;
         self
     }
+
+    /// Override the verified default model for a scheduled/manual smoke run.
+    /// Empty or whitespace-only repository variables intentionally keep the
+    /// checked-in default so a missing optional override cannot break CI.
+    pub fn with_model_from_env(mut self, env_var_name: &str) -> Self {
+        // Provider fixtures construct their config before `get_api_key` runs;
+        // load the ignored test environment here so file-backed overrides and
+        // workflow-provided variables have identical precedence.
+        init_test_env();
+        if let Ok(value) = env::var(env_var_name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                self.model = value.to_string();
+            }
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::ProviderTestConfig;
+    use std::{env, fs};
+
+    #[test]
+    fn dotenvy_from_filename_loads_values_without_overriding_the_process() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+        let file_key = format!("NOVEUM_DOTENVY_FILE_{suffix}");
+        let process_key = format!("NOVEUM_DOTENVY_PROCESS_{suffix}");
+        let path = env::temp_dir().join(format!("noveum-dotenvy-{suffix}.env"));
+
+        env::remove_var(&file_key);
+        env::set_var(&process_key, "from-process");
+        fs::write(
+            &path,
+            format!("{file_key}=from-file\n{process_key}=from-file\n"),
+        )
+        .unwrap();
+
+        dotenvy::from_filename(&path).unwrap();
+
+        assert_eq!(env::var(&file_key).unwrap(), "from-file");
+        assert_eq!(env::var(&process_key).unwrap(), "from-process");
+
+        env::remove_var(file_key);
+        env::remove_var(process_key);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn model_override_uses_only_a_non_empty_environment_value() {
+        const KEY: &str = "NOVEUM_TEST_ONLY_PROVIDER_MODEL_OVERRIDE";
+        std::env::remove_var(KEY);
+
+        let default = ProviderTestConfig::new("test", "TEST_API_KEY", "default-model")
+            .with_model_from_env(KEY);
+        assert_eq!(default.model, "default-model");
+
+        std::env::set_var(KEY, "   ");
+        let blank = ProviderTestConfig::new("test", "TEST_API_KEY", "default-model")
+            .with_model_from_env(KEY);
+        assert_eq!(blank.model, "default-model");
+
+        std::env::set_var(KEY, " verified-model ");
+        let overridden = ProviderTestConfig::new("test", "TEST_API_KEY", "default-model")
+            .with_model_from_env(KEY);
+        assert_eq!(overridden.model, "verified-model");
+
+        std::env::remove_var(KEY);
+    }
 }
 
 /// Initialize environment variables from .env.test file for tests
@@ -67,11 +137,9 @@ pub fn init_test_env() {
     }
 
     if !loaded_test_env {
-        if dotenv::dotenv().is_ok() {
-            println!("No .env.test found. Using .env file instead.");
-        } else {
-            println!("Warning: Neither .env.test nor .env files were found. Make sure you have proper environment variables set.");
-        }
+        println!(
+            "No .env.test found. Using only environment variables already exported by the caller."
+        );
     }
 }
 
@@ -96,6 +164,14 @@ pub fn setup_test_headers(provider: &str, api_key: &str) -> HeaderMap {
                 "x-aws-secret-access-key",
                 HeaderValue::from_str(&aws_secret_key).unwrap(),
             );
+            if let Ok(session_token) = env::var("AWS_SESSION_TOKEN") {
+                if !session_token.trim().is_empty() {
+                    headers.insert(
+                        "x-aws-session-token",
+                        HeaderValue::from_str(session_token.trim()).unwrap(),
+                    );
+                }
+            }
             headers.insert("x-aws-region", HeaderValue::from_str(&aws_region).unwrap());
         }
         _ => {
@@ -145,6 +221,18 @@ pub fn create_test_request_body(config: &ProviderTestConfig, stream: bool) -> Va
         OutputLimitField::MaxCompletionTokens => "max_completion_tokens",
     };
     body[field] = json!(config.max_tokens);
+    if stream
+        && matches!(
+            config.provider_name.to_ascii_lowercase().as_str(),
+            "openai" | "groq"
+        )
+    {
+        // These APIs support OpenAI's explicit usage option. Together and
+        // Fireworks report usage in their final chunks without this
+        // undocumented request field; Anthropic/Bedrock usage comes from the
+        // gateway's response translators.
+        body["stream_options"] = json!({"include_usage": true});
+    }
     body
 }
 
@@ -269,6 +357,7 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
 struct StreamingSmokeState {
     data_chunks: Vec<Value>,
     saw_done: bool,
+    latest_data_has_usage: bool,
 }
 
 impl StreamingSmokeState {
@@ -283,6 +372,13 @@ impl StreamingSmokeState {
         }
         if let Some(json_str) = line.strip_prefix("data: ") {
             if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                self.latest_data_has_usage = json.get("usage").is_some_and(|usage| {
+                    usage.get("prompt_tokens").and_then(Value::as_u64).is_some()
+                        && usage
+                            .get("completion_tokens")
+                            .and_then(Value::as_u64)
+                            .is_some()
+                });
                 self.data_chunks.push(json);
             }
         }
@@ -294,6 +390,9 @@ impl StreamingSmokeState {
         }
         if !self.saw_done {
             return Err("Streaming response ended without the required data: [DONE] marker");
+        }
+        if !self.latest_data_has_usage {
+            return Err("Streaming response ended without terminal token usage");
         }
         Ok(())
     }
@@ -391,10 +490,40 @@ mod tests {
     }
 
     #[test]
+    fn streaming_smoke_rejects_a_stream_without_terminal_usage() {
+        let mut state = StreamingSmokeState::default();
+        state.process_line(r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#);
+        state.process_line("data: [DONE]");
+
+        let message = state
+            .validate_complete()
+            .expect_err("a stream without terminal usage must fail the smoke test");
+        assert!(message.contains("usage"), "unexpected failure: {message}");
+    }
+
+    #[test]
+    fn streaming_smoke_requires_usage_on_the_final_data_event() {
+        let mut state = StreamingSmokeState::default();
+        state.process_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
+        );
+        state.process_line(r#"data: {"choices":[{"delta":{"content":"late"}}]}"#);
+        state.process_line("data: [DONE]");
+
+        let message = state
+            .validate_complete()
+            .expect_err("usage on an earlier event must not satisfy terminal usage");
+        assert!(message.contains("usage"), "unexpected failure: {message}");
+    }
+
+    #[test]
     fn streaming_smoke_accepts_tool_calls_without_text_content() {
         let mut state = StreamingSmokeState::default();
         state.process_line(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
+        );
+        state.process_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
         );
         state.process_line("data: [DONE]");
 
@@ -403,11 +532,28 @@ mod tests {
 
     #[test]
     fn request_body_can_select_max_completion_tokens_without_leaking_max_tokens() {
-        let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-5.6-luna")
+        let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-4o-mini")
             .with_max_completion_tokens(16);
         let body = create_test_request_body(&config, false);
 
         assert_eq!(body["max_completion_tokens"], 16);
         assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn streaming_smoke_requests_terminal_usage() {
+        let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-4o-mini");
+        let body = create_test_request_body(&config, true);
+
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn streaming_smoke_does_not_send_undocumented_usage_options() {
+        for provider in ["together", "fireworks"] {
+            let config = ProviderTestConfig::new(provider, "TEST_API_KEY", "verified-model");
+            let body = create_test_request_body(&config, true);
+            assert!(body.get("stream_options").is_none(), "{provider}: {body}");
+        }
     }
 }

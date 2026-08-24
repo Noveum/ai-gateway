@@ -7,6 +7,11 @@
 # The native binary / Docker image (the published `noveum-ai-gateway` crate) is
 # unaffected by this file — it is a separate deployment shape of the same package.
 name = "noveum-ai-gateway"
+# Preview URLs are intentionally disabled. Deleted preview versions can remain
+# routable at Cloudflare's edge even after the Versions API returns 404; keep
+# this service's version-prefix and alias hosts dark unless a bounded preview
+# campaign explicitly re-enables them and rotates any preview-only credentials.
+preview_urls = false
 # `build/index.js` is the canonical entry point emitted by worker-build. The
 # older `build/worker/shim.mjs` still exists but is only a re-export alias that
 # worker-build keeps for backwards compatibility, so point at the real thing.

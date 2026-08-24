@@ -53,14 +53,17 @@ jobs:
       # Run the hermetic suites by name rather than `cargo test`, which would
       # also run the live-provider cases in `run_integration_tests`; those need
       # real keys and belong in the scheduled smoke workflow. The filtered step
-      # below runs only that target's three network-free helper regressions.
+      # below runs only that target's eight network-free helper regressions.
       - name: Unit tests
-        run: cargo test --lib
+        run: |
+          cargo test --lib
+          cargo test --bin noveum-ai-gateway runtime_uses_the_configured_worker_thread_count
 
       - name: Provider harness helper tests (no live calls)
         run: |
           cargo test --test run_integration_tests streaming_smoke_
           cargo test --test run_integration_tests request_body_can_select_
+          cargo test --test run_integration_tests model_override_
 
       - name: Nova Guard platform integration tests
         run: cargo test --test novaguard_platform
@@ -116,15 +119,10 @@ jobs:
           cargo install cargo-deny --version "${CARGO_DENY_VERSION}" --locked
 
       # `--deny warnings` is what stops this from silently passing: cargo-audit
-      # exits 0 on unmaintained/unsound findings by default. The two `--ignore`
-      # IDs are the waivers documented in deny.toml — deny.toml is the source of
-      # truth for *why* they are waived, and the two lists must stay in sync.
-      # Any advisory that is not one of those two fails the job.
+      # exits 0 on unmaintained/unsound findings by default. There are no
+      # advisory exemptions; any finding fails the job.
       - name: cargo audit
-        run: |
-          cargo audit --deny warnings \
-            --ignore RUSTSEC-2021-0141 \
-            --ignore RUSTSEC-2023-0086
+        run: cargo audit --deny warnings
 
       # All four checks run explicitly rather than relying on defaults, so
       # dropping one has to be a visible edit to this file.

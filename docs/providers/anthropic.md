@@ -37,37 +37,23 @@ precedence and becomes the upstream `x-api-key`.
 on both runtimes. The gateway appends `/v1/messages`; use this only for a
 compatible proxy or a test server.
 
-## Current models and pricing
+## Model availability and pricing
 
-Examples below use `claude-sonnet-5`, an active Claude API model ID in
-[Anthropic's current model table](https://platform.claude.com/docs/en/about-claude/models/overview).
-The gateway does not restrict requests to this list, but Nova Guard catalog
-version `2026.08.23` includes these current high-value rows:
+Runnable examples below use `claude-haiku-4-5-20251001`, which passed buffered
+and streaming production probes on **2026-08-24**. Treat it as a dated verified
+example and check
+[Anthropic's current model table](https://platform.claude.com/docs/en/about-claude/models/overview)
+before deployment. Model IDs and account availability change independently of
+gateway releases; also check Anthropic's
+[deprecation table](https://platform.claude.com/docs/en/about-claude/model-deprecations).
 
-| Model | Availability note | Input | Output | Cache hit | 5m write | 1h write |
-|---|---|---:|---:|---:|---:|---:|
-| `claude-sonnet-5` | Active; $2/$10 launch pricing is permanent | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
-| `claude-opus-5` | Active | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
-| `claude-opus-4-8` | Active | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
-| `claude-opus-4-5-20251101` | Active dated model ID | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
-| `claude-fable-5` | Active | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
-| `claude-mythos-5` | Active, limited/invitation-only availability | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
-
-All values are USD per million tokens. Anthropic made Sonnet 5's $2/$10
-launch pricing permanent, so the catalog deliberately has no scheduled $3/$15
-increase. Model availability and IDs change independently of gateway releases;
-verify them against the
-[model table](https://platform.claude.com/docs/en/about-claude/models/overview)
-and [deprecation table](https://platform.claude.com/docs/en/about-claude/model-deprecations).
-
-These rates are policy estimates, not an invoice. Nova Guard models cache,
-US-only inference, and supported fast-mode premiums; batch discounts,
-negotiated pricing, taxes, and later provider changes can still differ. See the
-[pricing and accounting guide](../PRICING.md) and verify time-sensitive rates
-against [Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
-
-For a simple uncached call with 1,000 input and 500 output tokens, the catalog
-estimate is `(1,000 / 1,000,000 × $2) + (500 / 1,000,000 × $10) = $0.007`.
+Nova Guard's versioned catalog models token, cache, eligible inference-geo, and
+supported fast-mode pricing. Catalog membership is not a promise that a model
+is available to the caller. These values are policy estimates, not an invoice;
+batch discounts, negotiated pricing, taxes, and later provider changes can
+differ. Use the single [pricing and accounting guide](../PRICING.md) for exact
+rows and verify time-sensitive values against
+[Anthropic's pricing page](https://platform.claude.com/docs/en/about-claude/pricing).
 
 ## Examples
 
@@ -79,7 +65,7 @@ curl http://localhost:3000/v1/chat/completions \
   -H "x-provider: anthropic" \
   -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
   -d '{
-    "model": "claude-sonnet-5",
+    "model": "claude-haiku-4-5-20251001",
     "messages": [
       {"role": "system", "content": "Be concise."},
       {"role": "user", "content": "Explain atomic admission in one sentence."}
@@ -96,7 +82,7 @@ curl -N http://localhost:3000/v1/chat/completions \
   -H "x-provider: anthropic" \
   -H "x-api-key: $ANTHROPIC_API_KEY" \
   -d '{
-    "model": "claude-sonnet-5",
+    "model": "claude-haiku-4-5-20251001",
     "messages": [{"role": "user", "content": "Count to three."}],
     "max_completion_tokens": 64,
     "stream": true
@@ -120,7 +106,7 @@ const client = new OpenAI({
 });
 
 const response = await client.chat.completions.create({
-  model: "claude-sonnet-5",
+  model: "claude-haiku-4-5-20251001",
   messages: [{ role: "user", content: "Hello!" }],
   max_tokens: 128,
 });
@@ -132,7 +118,7 @@ console.log(response.choices[0].message.content);
 
 ```json
 {
-  "model": "claude-sonnet-5",
+  "model": "claude-haiku-4-5-20251001",
   "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
   "max_output_tokens": 256,
   "tools": [
@@ -281,7 +267,7 @@ when those features are required.
 | Applicable enforcing/blocking strict Nova Guard cost cap without a positive explicit output limit | Gateway HTTP 400 with `error.code: "missing_output_limit"`, before admission or provider dispatch |
 
 Output-phase Nova Guard enforcement is skipped for all streaming providers in
-the current release; input-phase policies still run. For platform-managed
+v2.0.1; input-phase policies still run. For platform-managed
 metering, translated terminal usage is used to settle the reservation only when
 Anthropic supplied both input and output token counts. The buffered and stream
 converters preserve missing or partial usage as missing; they never manufacture

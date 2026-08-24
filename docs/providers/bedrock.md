@@ -1,9 +1,12 @@
 # AWS Bedrock provider
 
 The Bedrock adapter accepts OpenAI-shaped **text chat-completions** requests and
-converts them to the AWS Bedrock Converse API. Buffered Converse responses and
-AWS EventStream responses are converted back to OpenAI chat-completions/SSE
-shapes.
+converts them to the AWS Bedrock Converse API. Buffered Converse responses are
+converted back to OpenAI chat-completions shape on both runtimes. Native Axum
+also supports ConverseStream and converts AWS EventStream frames to OpenAI SSE.
+The Cloudflare Worker does not implement Bedrock streaming in v2.0.1 and
+rejects `stream: true` with an OpenAI-shaped HTTP 400 and
+`error.code = "unsupported_feature"` before admission or AWS dispatch.
 
 This is not full OpenAI feature parity. In particular, OpenAI `tools`,
 `tool_calls`, multimodal parts, and provider-native Bedrock request extensions
@@ -21,12 +24,26 @@ x-aws-secret-access-key: <secret key>
 x-aws-region: us-east-1
 ```
 
-`x-aws-region` defaults to `us-east-1`. The Cloudflare Worker also accepts
-`x-aws-session-token` for temporary credentials. The native adapter does not
-yet have session-token parity.
+`x-aws-region` defaults to `us-east-1`. Both runtimes accept the optional
+`x-aws-session-token` header for temporary STS credentials.
 
-Grant the credentials only the model resources they need. The minimum runtime
-actions are normally:
+For STS credentials, add this header to the request; omit it for a long-lived
+access-key pair:
+
+```bash
+-H "x-aws-session-token: $AWS_SESSION_TOKEN"
+```
+
+These headers contain AWS signing credentials. Do **not** send them through the
+public/shared `gate.noveum.ai` service, a browser, or a gateway operated by a
+third party. Use a private gateway deployment you control, TLS, sensitive-header
+redaction at every proxy, and narrowly scoped credentials. Prefer short-lived
+session credentials on either runtime. Instance-role assumption is not
+implemented by this adapter; credentials still arrive in request headers.
+
+Grant the credentials only the model resources they need. Buffered requests
+need `bedrock:InvokeModel`; add `bedrock:InvokeModelWithResponseStream` only to
+credentials used for native streaming:
 
 ```json
 {
@@ -34,8 +51,7 @@ actions are normally:
   "Statement": [{
     "Effect": "Allow",
     "Action": [
-      "bedrock:InvokeModel",
-      "bedrock:InvokeModelWithResponseStream"
+      "bedrock:InvokeModel"
     ],
     "Resource": "<foundation-model-or-inference-profile-arn>"
   }]
@@ -54,7 +70,7 @@ The adapter currently maps:
 | `temperature` | `inferenceConfig.temperature` |
 | `top_p` | `inferenceConfig.topP` |
 | `stop` | `inferenceConfig.stopSequences` |
-| `stream: true` | Converse Stream + OpenAI SSE translation |
+| `stream: true` | Native only: ConverseStream + OpenAI SSE translation; Worker returns HTTP 400 `unsupported_feature` |
 
 Under an enforcing strict NovaGuard cost cap, output-limit aliases must agree,
 the body must be bounded JSON `/v1/chat/completions`, and provider-native fields
@@ -64,12 +80,12 @@ reserved by NovaGuard tied to the request that Bedrock receives.
 ## Example
 
 ```bash
-curl http://localhost:3000/v1/chat/completions \
+curl --fail-with-body http://127.0.0.1:3000/v1/chat/completions \
   -H 'content-type: application/json' \
   -H 'x-provider: bedrock' \
-  -H 'x-aws-access-key-id: YOUR_ACCESS_KEY' \
-  -H 'x-aws-secret-access-key: YOUR_SECRET_KEY' \
-  -H 'x-aws-region: us-east-1' \
+  -H "x-aws-access-key-id: $AWS_ACCESS_KEY_ID" \
+  -H "x-aws-secret-access-key: $AWS_SECRET_ACCESS_KEY" \
+  -H "x-aws-region: ${AWS_REGION:-us-east-1}" \
   -d '{
     "model": "amazon.nova-micro-v1:0",
     "max_tokens": 64,
@@ -116,22 +132,32 @@ settlement.
 
 ## Streaming and settlement
 
-Bedrock's `application/vnd.amazon.eventstream` response is preserved until the
-Bedrock decoder has reassembled complete AWS frames. The adapter then emits
-separate OpenAI SSE events and a final `[DONE]`. NovaGuard reads the native
-`inputTokens`, `outputTokens`, `cacheReadInputTokens`, and
+On the native gateway, Bedrock's `application/vnd.amazon.eventstream` response
+is preserved until the decoder has reassembled complete AWS frames. The adapter
+then emits separate OpenAI SSE events and a final `[DONE]`. NovaGuard reads the
+native `inputTokens`, `outputTokens`, `cacheReadInputTokens`, and
 `cacheWriteInputTokens` counters before the OpenAI response conversion so a
 strict reservation settles across every reported token/cache dimension.
+
+On the Worker, use buffered Bedrock requests only. A streaming request returns
+HTTP 400 `unsupported_feature` before any strict reservation or provider call;
+it is never silently downgraded to buffered mode.
 
 ## Known limitations
 
 - OpenAI function/tool definitions and Bedrock `toolUse`/`toolResult` blocks are
   not translated yet.
 - Multimodal Converse content is not exposed by the current OpenAI adapter.
-- Native temporary-session credential support is not yet at Worker parity.
-- A live Bedrock provider call still requires credentials and model entitlement;
-  the repository's hermetic tests cover signing, conversion, fragmented AWS
-  EventStream reassembly, SSE framing, and usage settlement without an AWS bill.
+- Worker Bedrock streaming is not implemented; native Bedrock streaming is.
+- Native and Worker signing both accept temporary session credentials; the
+  Worker remains buffered-only while native supports ConverseStream.
+- A live gateway Bedrock call still requires safely forwarding AWS credentials
+  plus model entitlement. The 2026-08-24 release-hardening audit confirmed
+  direct AWS Nova Micro buffered and streaming access, but did not forward
+  those AWS credentials through the gateway. Treat gateway-level Bedrock as
+  unverified in that audit rather than inferring a pass from direct AWS success.
+  Hermetic tests cover signing, buffered conversion, native fragmented AWS
+  EventStream reassembly/SSE framing, and usage settlement without an AWS bill.
 
 ## References
 

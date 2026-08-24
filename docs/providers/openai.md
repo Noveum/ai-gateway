@@ -7,29 +7,21 @@ without changing their JSON shape. Model availability is determined by the
 caller's OpenAI project. Nova Guard pricing and strict admission use the
 gateway's versioned [pricing catalog](../PRICING.md).
 
-## Supported Models
+## Model availability and pricing
 
-### Current catalog rows
+`gpt-4o-mini`, used below, passed buffered and streaming production probes on
+**2026-08-24**. That result is a dated example, not a supported-model inventory:
+the caller's OpenAI project and OpenAI's current model lifecycle determine what
+it can invoke.
 
-- `gpt-5.6-luna` — $0.20/M input, $1.20/M output at standard short-context rates
-- `gpt-5.6-terra` — $2/M input, $12/M output
-- `gpt-5.6-sol` — promotional Standard rates of $4/M input, $0.40/M cached
-  input, $5/M cache writes, and $20/M output; above 272K input, the whole
-  request uses $8/$0.80/$10/$30 respectively
-- `gpt-5.6-cyber` — $12.50/M input, $75/M output
-- `gpt-5.6` and `daybreak-blue-latest` resolve to Sol for pricing;
-  `daybreak-red-latest` resolves to Cyber
-
-OpenAI says the Sol promotion is available at least through November 21, 2026.
-It has not published an exact end date or replacement rates, so Nova Guard does
-not schedule a rollback.
-
-The catalog also contains the supported GPT-4.x, reasoning, embedding, image,
-and audio rows listed in [Pricing](../PRICING.md). A model that OpenAI still
-accepts but the current catalog does not price is never treated as free: strict
-fail-closed cost caps reject it, while other modes use the conservative catalog
-maximum. See [OpenAI's current pricing](https://developers.openai.com/api/docs/pricing)
-for the upstream source of truth.
+The gateway pricing catalog includes many current and legacy OpenAI rows,
+aliases, cache rates, and long-context tiers. Catalog membership means the
+gateway can estimate a row; it does not prove upstream availability. An
+uncatalogued model is never treated as free: a fail-closed cost cap rejects the
+assumption, while other modes use the conservative catalog maximum. Use the
+single [pricing guide](../PRICING.md) for exact rates and update rules, and
+[OpenAI's pricing reference](https://developers.openai.com/api/docs/pricing) for
+the upstream source of truth.
 
 ## Configuration
 
@@ -53,9 +45,9 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "x-provider: openai" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "gpt-5.6-luna",
+    "model": "gpt-4o-mini",
     "messages": [{"role": "user", "content": "Hello!"}],
-    "max_completion_tokens": 128,
+    "max_tokens": 128,
     "service_tier": "default"
   }'
 ```
@@ -67,9 +59,9 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "x-provider: openai" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d '{
-    "model": "gpt-5.6-luna",
+    "model": "gpt-4o-mini",
     "messages": [{"role": "user", "content": "Hello!"}],
-    "max_completion_tokens": 128,
+    "max_tokens": 128,
     "stream": true,
     "stream_options": {"include_usage": true}
   }'
@@ -89,12 +81,12 @@ const openai = new OpenAI({
 
 async function getChatCompletion() {
   const response = await openai.chat.completions.create({
-    model: "gpt-5.6-luna",
+    model: "gpt-4o-mini",
     messages: [{ role: "user", content: "Hello!" }],
-    max_completion_tokens: 128,
+    max_tokens: 128,
     service_tier: "default"
   });
-  console.log(response.data);
+  console.log(response.choices[0]?.message.content);
 }
 
 getChatCompletion();
@@ -121,9 +113,8 @@ getChatCompletion();
    - Log errors appropriately
 
 3. **Performance**
-   - Use an explicit output bound. GPT-5.6 uses `max_completion_tokens`; the
-     legacy `max_tokens` field is rejected by the upstream API for these models.
-   - Batch requests when possible
+   - Use an explicit output bound. Some reasoning/newer model families require
+     `max_completion_tokens`; follow the selected model's current OpenAI contract.
    - Implement caching for repeated requests
 
 When an enforcing/blocking strict Nova Guard cost cap applies, the gateway also
@@ -133,8 +124,7 @@ that cannot be reserved safely. Direct OpenAI strict traffic is pinned to
 
 ## Monitoring
 
-### Available Metrics (Coming Soon)
-- Request latency
-- Token usage
-- Error rates
-- Request volume
+The native telemetry record includes latency, TTFB, status, provider status,
+token usage, cost, and pricing completeness. See
+[Telemetry and log handling](../logs.md). For streaming settlement, request a
+terminal usage frame with `stream_options.include_usage`.

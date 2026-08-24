@@ -19,8 +19,11 @@ The tests are organized as follows:
 To run these tests, you need:
 
 1. A running instance of the AI Gateway (either locally or in a development environment)
-2. API keys for the providers you want to test
-3. A `.env.test` file with the required environment variables
+2. Credentials for all six current fixtures (OpenAI, Anthropic, Groq,
+   Fireworks, Together, and Bedrock) in an unfiltered/full run, or the selected
+   provider's credentials when using a provider-specific filter
+3. Provider credentials supplied through the environment or an ignored
+   `.env.test` file
 
 ## Environment Setup
 
@@ -31,13 +34,16 @@ The AI Gateway uses different environment files for different purposes:
 - **Production**: Uses the standard `.env` file in the project root
 - **Tests**: Uses a separate `.env.test` file to avoid conflicts with production settings
 
-For running tests, creating a `.env.test` file is recommended to keep your test configuration separate from your production settings.
+Prefer short-lived/development credentials exported by your shell or secret
+manager. If you use `.env.test`, the repository ignores it; never copy a
+production credential into source control, logs, issues, or pull requests.
 
 ### Setting Up Test Environment
 
-1. Copy the sample environment file and modify it with your actual keys:
+1. Copy the sample environment file and restrict it to your user:
    ```bash
    cp tests/.env.test.example .env.test
+   chmod 600 .env.test
    ```
 
 2. Edit the `.env.test` file to include your actual API keys and configuration:
@@ -55,25 +61,39 @@ For running tests, creating a `.env.test` file is recommended to keep your test 
    # AWS Bedrock Credentials
    AWS_ACCESS_KEY_ID=your_aws_access_key_id
    AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
+   AWS_SESSION_TOKEN=your_temporary_session_token
    AWS_REGION=us-east-1
    ```
 
-> **Note**: You can place the `.env.test` file either in the project root directory or in the `tests` directory. The tests will check both locations, prioritizing `.env.test` over the standard `.env` file.
+> **Note**: You can place the file at either `.env.test` in the project root or
+> `tests/.env.test`. The root `.env.test` takes priority. The integration
+> harness never reads the standard production `.env` file.
 
 ## Provider-Specific Test Information
 
 ### AWS Bedrock
 
-The AWS Bedrock integration test uses `amazon.titan-text-express-v1` by default. Unlike other providers that use API keys, Bedrock uses AWS credentials for authentication. The fixture is intentionally not changed without first verifying that the replacement model is enabled for the smoke-test AWS account.
+The native Bedrock integration test uses the production-verified
+`amazon.nova-micro-v1:0` by default. Unlike the other providers, Bedrock uses
+AWS credentials. Prefer a short-lived STS session and include
+`AWS_SESSION_TOKEN`. The native server validates buffered and ConverseStream
+responses; the Cloudflare Worker is buffered-only in 2.0.1 and rejects
+`stream:true` before admission or AWS.
 
 - **AWS_ACCESS_KEY_ID**: Your AWS access key with Bedrock permissions
 - **AWS_SECRET_ACCESS_KEY**: Your AWS secret key
+- **AWS_SESSION_TOKEN**: Required when using temporary AWS credentials
 - **AWS_REGION**: The AWS region where Bedrock is available (e.g., us-east-1)
 
 The test validates that:
 1. Request IDs are properly extracted from the AWS Bedrock response headers
 2. Streaming and non-streaming modes work correctly
 3. Token usage is present and correct in the gateway response
+
+The checked-in provider defaults were verified on 2026-08-24. Override one
+without editing source by setting `OPENAI_TEST_MODEL`, `ANTHROPIC_TEST_MODEL`,
+`GROQ_TEST_MODEL`, `TOGETHER_TEST_MODEL`, `FIREWORKS_TEST_MODEL`, or
+`BEDROCK_TEST_MODEL`. Empty variables retain the verified default.
 
 ## Running the Tests
 
@@ -157,7 +177,10 @@ If you encounter test failures, check the following:
 
 3. **Console Output**: Look at the test output for detailed error messages, which often point to specific configuration issues.
 
-5. **Environment File Not Found**: The tests will show which environment file was loaded. If you see "Warning: Neither .env.test nor .env files were found", you need to create one of these files with your test configuration.
+4. **Environment File Not Found**: If no `.env.test` is found, the tests use
+   only variables already exported by the caller. Create an ignored
+   `.env.test` or export the required values; the harness never falls back to
+   the repository's production `.env`.
 
 ## Extending the Tests
 
@@ -203,7 +226,10 @@ pub mod groq_test; // Add the new module here
 
 3. **Test Failures**: The tests validate the gateway's proxied response (status, OpenAI-compatible shape, token usage). If tests fail, review the test output for details on which validation failed.
 
-5. **Environment File Not Found**: The tests will show which environment file was loaded. If you see "Warning: Neither .env.test nor .env files were found", you need to create one of these files with your test configuration.
+4. **Environment File Not Found**: If no `.env.test` is found, the tests use
+   only variables already exported by the caller. Create an ignored
+   `.env.test` or export the required values; the harness never falls back to
+   the repository's production `.env`.
 
 ### Viewing Test Logs
 
@@ -220,7 +246,8 @@ This will provide more information about request processing and metric extractio
 The common test module provides a flexible way to customize test cases. You can adjust the test parameters using the fluent interface provided by `ProviderTestConfig`:
 
 ```rust
-let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-5.6-luna")
+let config = ProviderTestConfig::new("openai", "OPENAI_API_KEY", "gpt-4o-mini")
+    .with_model_from_env("OPENAI_TEST_MODEL")
     .with_prompt("Explain quantum computing in simple terms")
     .with_max_completion_tokens(200);
 ```

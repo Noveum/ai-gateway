@@ -8,7 +8,7 @@ transport and tenancy differences are called out below.
 | Shape | Build | Entry |
 |---|---|---|
 | Native binary / Docker | `cargo build --release` | `src/main.rs` (Axum + Tokio) |
-| Rust library | `noveum-ai-gateway` dep (rlib) | `lib.rs` |
+| Rust library | `noveum-ai-gateway` dependency (`rlib`) | `src/lib.rs` |
 | **Cloudflare Worker** | `worker-build --release` (`cargo … --target wasm32 --no-default-features`) | `src/worker_rt.rs` (`#[event(fetch)]`) |
 
 ## Prerequisites (one-time)
@@ -45,24 +45,25 @@ worker-build --release
 npx --yes wrangler@4.120.0 dev --port 8787
 ```
 
-Then exercise it exactly like the native gateway:
+Then exercise it exactly like the native gateway. A v2.0.1 source build reports
+that version:
 
 ```bash
 # Health
 curl localhost:8787/health
-# → {"status":"healthy","version":"1.2.0","runtime":"cloudflare-worker"}
+# → {"status":"healthy","version":"2.0.1","runtime":"cloudflare-worker"}
 
 # Proxy an OpenAI-compatible provider (x-provider + Bearer key, OpenAI body)
 curl localhost:8787/v1/chat/completions \
   -H "Authorization: Bearer $OPENAI_API_KEY" -H "x-provider: openai" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
 ```
 
 The checked-in `wrangler.toml` is deliberately transparent: it does not enable
 the commented SSN example or any other policy. Real-provider smoke tests require
-your own key; the PR gate and the end-to-end test below are hermetic and use no
-provider or Noveum credentials.
+your own key; CI and the end-to-end test below are hermetic and use no provider
+or Noveum credentials.
 
 ### Hermetic end-to-end proof of the platform bridge
 
@@ -105,24 +106,153 @@ the tee recovered 11 input / 4 output tokens from the terminal usage frame, so
 the hold is reconciled down by ~600x. Without the tee, every streamed request on
 the edge would bill at its ceiling.
 
-## Deploy to the global edge
+## Production deployment runbook
+
+Cloudflare separates a Worker **version** (code, bindings, and compatibility
+settings) from a **deployment** (the version or traffic split serving routes).
+Upload and test an immutable candidate before assigning production traffic.
+
+The v2.0.0 release was validated on `gate.noveum.ai` and its `workers.dev`
+hostname with buffered and SSE calls through OpenAI, Anthropic, and Groq.
+Production was deliberately deployed in transparent mode. This is evidence for
+that release, not permission to skip the following checks for a new version.
+
+### 1. Authenticate, build, and validate
 
 ```bash
-npx --yes wrangler@4.120.0 login          # authenticate to your Cloudflare account
-# Provider keys are passed PER REQUEST (Authorization header), so the Worker
-# itself needs no provider secrets. Set a stateless Nova Guard policy inline or
-# as a secret:
-#   - inline: edit NOVEUM_GUARD_POLICIES in wrangler.toml ([vars])
-#   - secret: npx --yes wrangler@4.120.0 secret put NOVEUM_GUARD_POLICIES
-npx --yes wrangler@4.120.0 deploy         # publish the Worker
+npx --yes wrangler@4.120.0 login
+npx --yes wrangler@4.120.0 whoami
+worker-build --release
+npx --yes wrangler@4.120.0 deploy --dry-run
+scripts/novaguard_worker_e2e.sh
 ```
 
-After deploy, the gateway answers at `https://noveum-ai-gateway.<account>.workers.dev`
-(or a custom route/domain) from the nearest PoP to each caller.
+Provider keys are passed per request and must not be Worker secrets. For a
+transparent shared hostname, confirm `wrangler.toml` has no Noveum project var
+and `wrangler secret list` has no `NOVEUM_API_KEY`. For a dedicated guarded
+Worker, configure the scoped bridge secret described below and verify that its
+fixed project is the only tenant this domain serves.
+
+### 2. Upload without production traffic
+
+```bash
+npx --yes wrangler@4.120.0 versions upload \
+  --tag v2.0.1-candidate \
+  --message "Noveum AI Gateway v2.0.1 candidate"
+npx --yes wrangler@4.120.0 versions list --json
+```
+
+Record the candidate version ID, export it in the operator shell, and inspect
+it before creating a deployment:
+
+```bash
+: "${CANDIDATE_VERSION_ID:?export the uploaded candidate version ID}"
+npx --yes wrangler@4.120.0 versions view "$CANDIDATE_VERSION_ID"
+```
+
+The checked-in `preview_urls = false` deliberately
+prevents [version-prefix and alias hostnames](https://developers.cloudflare.com/workers/versions-and-deployments/preview-urls/)
+from becoming public. Do not turn it on ad hoc for a production service; target
+the candidate through a zero-percent deployment and version override in the
+next step. Preview URLs that are intentionally enabled for another Worker must
+be protected with Cloudflare Access and removed after their bounded test
+campaign.
+
+### 3. Promote and observe
+
+First record the active deployment and its previous stable version. Attach the
+candidate at zero percent, then use Cloudflare's
+[version-override header](https://developers.cloudflare.com/workers/versions-and-deployments/version-overrides/)
+to exercise that exact version through the real custom domain without routing
+ordinary traffic to it:
+
+```bash
+: "${PREVIOUS_VERSION_ID:?export the recorded stable version ID}"
+: "${CANDIDATE_VERSION_ID:?export the uploaded candidate version ID}"
+npx --yes wrangler@4.120.0 deployments list
+npx --yes wrangler@4.120.0 versions deploy \
+  "${PREVIOUS_VERSION_ID}@100%" "${CANDIDATE_VERSION_ID}@0%" \
+  --message "Attach v2.0.1 for targeted smoke" -y
+
+curl --fail --silent https://gate.noveum.ai/health \
+  -H "Cloudflare-Workers-Version-Overrides: noveum-ai-gateway=\"${CANDIDATE_VERSION_ID}\""
+```
+
+With the same override header, verify `GET /`, bodyless `HEAD /`, `/health`, a
+bounded buffered request, and a bounded SSE request. Beginning with v2.0.1,
+`/` is a static no-JavaScript information page; `/docs` and `/openapi.json` are not
+API-documentation routes and remain 404. Confirm in logs that the override was
+applied; an invalid or not-yet-propagated override otherwise follows the normal
+traffic split.
+
+For a guarded candidate, also verify policy fetch/state, a successful strict
+admission, actual-usage settlement, a strict unbounded 400, organization scope,
+and zero leftover active test reservations. Use low-budget test credentials and
+remove temporary policies when finished.
+
+After the exact-version smoke passes, assign explicit canary percentages,
+observe, then promote the candidate to 100%:
+
+```bash
+: "${PREVIOUS_VERSION_ID:?export the recorded stable version ID}"
+: "${CANDIDATE_VERSION_ID:?export the uploaded candidate version ID}"
+npx --yes wrangler@4.120.0 versions deploy \
+  "${PREVIOUS_VERSION_ID}@90%" "${CANDIDATE_VERSION_ID}@10%" \
+  --message "Canary v2.0.1" -y
+
+npx --yes wrangler@4.120.0 versions deploy \
+  "${CANDIDATE_VERSION_ID}@100%" \
+  --message "Promote v2.0.1" -y
+```
+
+Check both the custom domain and `workers.dev` hostname. `/health` must report
+the promoted package version. Repeat buffered/SSE provider probes through the
+real production route and watch errors during the observation window:
+
+```bash
+curl --fail --silent https://gate.noveum.ai/health
+npx --yes wrangler@4.120.0 tail --status error
+```
+
+### 4. Roll back
+
+Rollback creates a new deployment immediately across all routes and domains.
+Use the exact stable version recorded before promotion:
+
+```bash
+: "${PREVIOUS_VERSION_ID:?export the recorded stable version ID}"
+npx --yes wrangler@4.120.0 rollback "$PREVIOUS_VERSION_ID" \
+  --message "Rollback failed gateway deployment"
+```
+
+After rollback, verify both health endpoints, repeat one buffered and one SSE
+call, and inspect errors. Do not delete the stable rollback version during
+candidate-version cleanup.
+
+### Observability
+
+`wrangler tail` provides real-time logs. For persistent Workers Logs, explicitly
+enable observability in `wrangler.toml`, choose a sampling rate appropriate for
+traffic and data sensitivity, and redeploy:
+
+```toml
+[observability]
+enabled = true
+head_sampling_rate = 0.1
+```
+
+Worker versions include configuration, so verify observability and bindings on
+the exact candidate. Alert on Worker exceptions, sustained 5xx, fail-closed
+admission outages, settlement retry exhaustion, and unexpected version skew.
+Cloudflare's [Workers Logs documentation](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
+describes retention and export options.
 
 ### Configuration (Worker `[vars]` / secrets)
 - The checked-in default is a **transparent proxy** — no policies, so nothing is
   mutated or blocked until you opt in.
+- `preview_urls = false` — version-prefix and alias preview hostnames remain
+  disabled even though the production `workers.dev` route is enabled. Candidate
+  smoke tests use a zero-percent deployment plus the version-override header.
 - `NOVEUM_GUARD_POLICIES` — inline `nova-guard.json` (same schema as the native
   `NOVEUM_GUARD_POLICIES`/file). Setting it activates stateless Nova Guard.
   Workers KV policy loading is not implemented in this release; use a Worker
@@ -151,9 +281,10 @@ After deploy, the gateway answers at `https://noveum-ai-gateway.<account>.worker
   reservation lease can be reaped while a Cloudflare stream is still connected.
 - `OPENAI_BASE_URL` — send `x-provider: openai` traffic to a compatible upstream
   instead of `api.openai.com`. The same override the native gateway honors, and
-  normalized by the same rule (trim, drop trailing slashes, reject empty). It is
-  what lets the Worker be tested against a local mock; in production leave it
-  unset.
+  normalized by the same rule (trim and drop trailing slashes); empty or
+  whitespace-only values are treated as unset and use the canonical default. It
+  is what lets the Worker be tested against a local mock; in production leave
+  it unset.
 - `ANTHROPIC_BASE_URL` — override the Anthropic upstream on the same terms; the
   Worker still appends `/v1/messages`. Leave unset in production unless the
   target is an Anthropic-compatible proxy.
@@ -218,6 +349,7 @@ conservative reservation estimate.
 | Configuration | Worker behavior |
 |---|---|
 | `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` set | **Platform-managed Nova Guard**, in dedicated mode. Policies, live state and admission come from the control plane; any inline `NOVEUM_GUARD_POLICIES` is ignored (with a warning) — the platform is the source of truth. |
+| `x-provider: bedrock` with `stream: true` | **400 `unsupported_feature` before admission or AWS dispatch.** The v2.0.1 Worker supports buffered Converse only; use the native gateway for ConverseStream. |
 | Applicable `mode: enforce`, `action: block`, `enforcementMode: strict` cost cap, but no positive explicit output limit | **400 `missing_output_limit`.** The Worker does not call `/admit` or the provider. Add `max_tokens`, `max_completion_tokens`, or `max_output_tokens`. |
 | Strict request supplies conflicting non-null output-limit aliases | **400 `unsupported_strict_input`.** The Worker does not reserve or forward a request whose admitted and upstream ceilings could differ. |
 | Advisory, shadow, or model-scoped-away cost cap; or `rate_limit` only | No strict output-limit rejection. When an estimate is needed, the Worker uses `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS`. Cost/rate policy actions are `block`; use shadow mode or `softUsd` for nonblocking observation. |
@@ -244,18 +376,45 @@ allocate the isolate to death. Over the cap → **413**.
 
 **Enable the bridge**
 
+Do not use `wrangler secret put` for a production bridge change: that command
+creates a version and immediately deploys it. A key-only or project-only version
+is intentionally rejected by `/v1/*`, so sequential immediate mutations cause
+an avoidable outage. Instead, have the approved secret manager materialize a
+mode-`0600` JSON file outside the repository with both bindings:
+
+```json
+{
+  "NOVEUM_API_KEY": "replace-with-scoped-service-key",
+  "NOVEUM_GUARD_PROJECT_ID": "replace-with-dedicated-project-id"
+}
+```
+
+Create one **undeployed** version containing both secrets. Passing the project
+ID as a secret is allowed and makes the binding change atomic even though that
+identifier is not itself confidential:
+
 ```bash
-npx --yes wrangler@4.120.0 secret put NOVEUM_API_KEY
-# Paste a key with guardrails:read + guardrails:ingest.
-# NOVEUM_GUARD_PROJECT_ID is not a secret — put it in [vars] or:
-npx --yes wrangler@4.120.0 secret put NOVEUM_GUARD_PROJECT_ID
-npx --yes wrangler@4.120.0 deploy
+: "${NOVEUM_BRIDGE_SECRETS_FILE:?export the secure JSON file path}"
+npx --yes wrangler@4.120.0 versions secret bulk \
+  "$NOVEUM_BRIDGE_SECRETS_FILE" \
+  --tag novaguard-dedicated-enable \
+  --message "Stage dedicated Nova Guard bridge"
+npx --yes wrangler@4.120.0 versions list --json
 ```
 
 `NOVEUM_API_KEY` must be a **secret**, never a `[vars]` entry: `[vars]` is
-committed to `wrangler.toml` and readable in the dashboard. Both values are read
-with `env.secret()` first and `env.var()` as a fallback, so either mechanism
-works for the project id.
+committed to `wrangler.toml` and readable in the dashboard. Both values are
+read with `env.secret()` first and `env.var()` as a fallback, so using a secret
+for the project ID preserves the same runtime semantics. Record the new version
+as `CANDIDATE_VERSION_ID`, then follow the zero-percent override, guarded smoke,
+canary, and promotion process in [Promote and observe](#3-promote-and-observe).
+Only the final `versions deploy` step changes production traffic. Remove the
+local secrets file according to the secret manager's cleanup policy after the
+version is verified.
+
+Cloudflare documents that the ordinary secret commands deploy immediately,
+whereas the `versions secret` commands only create a version for later
+promotion; see [Workers secrets](https://developers.cloudflare.com/workers/configuration/secrets/).
 
 **Verify it is live**
 
@@ -275,20 +434,62 @@ name every admission block, fail-closed decision, and abandoned settlement.
 | Symptom | Cause | Action |
 |---|---|---|
 | Every `/v1/*` returns 503 `gateway_configuration_error` | Half-applied credentials, a blank secret, an inline `cost_cap`, or a malformed bundle — the message says which | Fix the named variable and redeploy. |
-| 503 naming "policy set could not be fetched" | The control plane is unreachable or the key is rejected | Check the key's scopes and `NOVEUM_API_URL`. To keep serving *unguarded* meanwhile: `npx --yes wrangler@4.120.0 secret put NOVEUM_GUARD_ALLOW_UNGUARDED_START` → `true`. Caps are NOT enforced while it is set — unset it as soon as the fetch recovers. |
+| 503 naming "policy set could not be fetched" | The control plane is unreachable or the key is rejected | Check the key's scopes and `NOVEUM_API_URL`. If an audited emergency decision permits unguarded traffic, stage `NOVEUM_GUARD_ALLOW_UNGUARDED_START=true` with `versions secret put` and the versioned promotion flow. The ordinary `secret put` command deploys immediately and is break-glass only. Caps are **not** enforced while the flag is set; stage its removal as soon as the fetch recovers. |
 | 400 with `error.code: "missing_output_limit"` | This model is covered by an enforcing/blocking strict cost cap and the request is unbounded | Send a positive `max_tokens`, `max_completion_tokens`, or `max_output_tokens`. Do not raise the assumed-output heuristic: strict mode deliberately refuses a heuristic bound. |
 | 400 `invalid_value` naming an output-limit field | The selected limit is zero, negative, non-integer, or above 10,000,000 | Correct the named field. The request was rejected before admission and provider dispatch. |
 | Anthropic 400 `invalid_request_error` naming `fallbacks`, `speed`, `inference_geo`, sampling, `cache_control`, thinking, or assistant prefill | The OpenAI-to-Messages adapter rejected an unsupported or unmeterable request shape | Follow the exact matrix in [the Anthropic provider guide](providers/anthropic.md). The Worker has not admitted the request or called Anthropic. |
 | Requests blocked with "platform admission unavailable … failing closed" | Admission returned 503 / exceeded its 2 s budget while a fail-closed strict cap is active | This is the policy working as written. Investigate the platform; setting the cap to fail-open trades enforcement for availability. |
-| Spend looks ~100x too high on streaming | `stream_options.include_usage` was stripped by something between the Worker and the provider, so streams settle at their estimate | Check `wrangler tail` for `abandon` settlements on streaming requests. |
+| OpenAI streaming spend remains near the reservation ceiling | `stream_options.include_usage` was stripped by something between the Worker and OpenAI, so the stream kept its estimate | Check `wrangler tail` for `abandon` settlement; Together and Fireworks use their provider-emitted terminal chunks instead of this option. |
 | `reservation … gave up after 3 attempts` in the logs | Settlement could not reach the platform | The hold expires server-side at `expiresAt` — conservatively, i.e. still counted until then. No action beyond fixing connectivity. |
 
-Removing the bridge means removing **both** values. Delete the API key with
-`npx --yes wrangler@4.120.0 secret delete NOVEUM_API_KEY`. If
-`NOVEUM_GUARD_PROJECT_ID` is also a secret, delete it with
-`npx --yes wrangler@4.120.0 secret delete NOVEUM_GUARD_PROJECT_ID`; if it is the
-usual `[vars]` entry, remove that entry from `wrangler.toml` and redeploy. During
-any half-applied interval the Worker deliberately returns 503.
+**Remove the bridge with an atomic traffic cutover**
+
+Make the change atomic **to production traffic** by creating only undeployed
+versions until the final transparent version has been inspected. Wrangler
+4.120.0 preserves secrets during `versions upload`, while each
+`versions secret delete` command creates another undeployed version from the
+latest version, as described in Cloudflare's
+[secret-management reference](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
+Serialize these commands under an operator lock—do not allow a concurrent
+upload to change what “latest” means.
+
+First, in the exact reviewed release checkout, remove any legacy
+`NOVEUM_GUARD_PROJECT_ID` entry from `[vars]`. Upload that configuration without
+`--keep-vars`; this removes the plain-text variable but deliberately inherits
+the secrets. Do not assign traffic to this intermediate version. Then delete
+each secret from the latest undeployed version:
+
+```bash
+npx --yes wrangler@4.120.0 versions upload \
+  --strict \
+  --tag novaguard-remove-config \
+  --message "Stage Nova Guard bridge variable removal"
+npx --yes wrangler@4.120.0 versions list --json
+: "${CONFIG_VERSION_ID:?export the just-uploaded configuration version ID}"
+npx --yes wrangler@4.120.0 versions view "$CONFIG_VERSION_ID"
+
+# Run each delete only when `versions view` identifies that name as a secret.
+npx --yes wrangler@4.120.0 versions secret delete NOVEUM_API_KEY \
+  --tag novaguard-remove-api-key \
+  --message "Stage Nova Guard API-key removal"
+npx --yes wrangler@4.120.0 versions secret delete NOVEUM_GUARD_PROJECT_ID \
+  --tag novaguard-remove-project \
+  --message "Stage Nova Guard project-secret removal"
+
+npx --yes wrangler@4.120.0 versions list --json
+: "${FINAL_VERSION_ID:?export the final removal version ID from the list}"
+npx --yes wrangler@4.120.0 versions view "$FINAL_VERSION_ID"
+```
+
+If a binding is not a secret in the inspected intermediate version, skip its
+`versions secret delete` command; it was removed with `[vars]`. The
+`--secrets-file` option is additive and cannot delete a secret, and
+`versions secret bulk` cannot remove a legacy `[vars]` entry, so neither is a
+one-command removal mechanism. Do not use the non-versioned `wrangler secret
+delete` command because it deploys immediately. Inspect the final version and
+verify that it contains neither binding before assigning traffic with the
+zero-percent override and promotion flow. Preview URLs must remain disabled,
+and no half-applied intermediate version may receive production traffic.
 
 ## Implemented edge behavior and verification scope
 
@@ -307,8 +508,8 @@ any half-applied interval the Worker deliberately returns 503.
   and error contract in [the Anthropic provider guide](providers/anthropic.md).
 - **Bedrock**: OpenAI → Bedrock **Converse** request, **AWS SigV4**-signed in pure
   Rust (`sha2`+`hmac`; see `src/sigv4.rs`) with credentials from `x-aws-*` headers,
-  and the Converse response converted back to OpenAI shape. Unlike native, the
-  edge also accepts **temporary credentials** via `x-aws-session-token`. Pass
+  and the Converse response converted back to OpenAI shape. Like native, the
+  edge accepts **temporary credentials** via `x-aws-session-token`. Pass
   `x-aws-access-key-id`, `x-aws-secret-access-key`, `x-aws-region` (+ optional
   `x-aws-session-token`) instead of `Authorization`:
 
@@ -320,6 +521,10 @@ any half-applied interval the Worker deliberately returns 503.
     -H "x-aws-region: us-east-1" -H "Content-Type: application/json" \
     -d '{"model":"amazon.nova-micro-v1:0","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
   ```
+  This Worker path is buffered only. `stream: true` returns an OpenAI-shaped
+  HTTP 400 with `error.code: "unsupported_feature"` before a Nova Guard
+  reservation or AWS request. The native gateway implements Bedrock
+  ConverseStream.
 - **SSE streaming**: OpenAI-compatible streams pass through unbuffered.
   Successful Anthropic streams are translated incrementally into OpenAI chunks;
   text, function tool calls, finish reason, terminal usage, and `[DONE]` are
@@ -355,16 +560,14 @@ The same Nova Guard policy schema, decisions, and redactions run here as on the
 native server (the engine + request/response shaping are one shared codebase).
 Note the redact replacement key is **`redactWith`** (see `wrangler.toml`).
 
-The PR's reproducible evidence is local/CI evidence: wasm compilation,
-`worker-build --release`, `wrangler deploy --dry-run`, native unit/integration
-tests, and the 13-phase hermetic `workerd` suite. That suite exercises actual
+The v2.0.0 release evidence includes wasm compilation, `worker-build --release`,
+`wrangler deploy --dry-run`, native unit/integration tests, the 13-phase
+hermetic `workerd` suite, dedicated guarded previews against the production
+control plane, and a transparent production deployment with live OpenAI,
+Anthropic, and Groq buffered/SSE probes. The hermetic suite exercises actual
 `worker::Fetch`, Anthropic translation, `ctx.wait_until`, concurrent agents,
-stream settlement, and strict-policy selection against mocks. It does **not**
-claim that this exact working tree has been published to or smoke-tested on a
-production Cloudflare account.
+stream settlement, and strict-policy selection against mocks. Future working
+trees need their own edge evidence.
 
-**Next (see [CLOUDFLARE_DEPLOYMENT.md](CLOUDFLARE_DEPLOYMENT.md)):**
-- Edge telemetry sink (Workers Analytics Engine / Queues) and Workers-KV policies.
-- Re-enable `wasm-opt` after preserving the panic-recovery bundle assertions.
-- Optionally add `x-aws-session-token` support to the **native** Bedrock path too
-  (the edge already supports temporary credentials).
+Known follow-up work is centralized in the [current roadmap](TODO.md); it is not
+a release promise.

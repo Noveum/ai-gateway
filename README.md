@@ -2,914 +2,366 @@
 
 # Noveum AI Gateway
 
-🚀 The world's fastest AI Gateway proxy, written in Rust and optimized for maximum performance. This high-performance API gateway routes requests to various AI providers (OpenAI, Anthropic, GROQ, Fireworks, Together, AWS Bedrock) with streaming support, making it perfect for developers who need reliable and blazing-fast AI API access.
+An OpenAI-compatible, multi-provider AI gateway written in Rust, with streaming,
+provider-aware cost accounting, and Nova Guard policy enforcement.
 
 [![Rust](https://github.com/Noveum/ai-gateway/actions/workflows/rust.yml/badge.svg)](https://github.com/Noveum/ai-gateway/actions/workflows/rust.yml)
 [![Crates.io](https://img.shields.io/crates/v/noveum-ai-gateway.svg)](https://crates.io/crates/noveum-ai-gateway)
-[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
-[![Docker Pulls](https://img.shields.io/docker/pulls/noveum/noveum-ai-gateway)](https://hub.docker.com/r/noveum/noveum-ai-gateway)
+[![docs.rs](https://docs.rs/noveum-ai-gateway/badge.svg)](https://docs.rs/noveum-ai-gateway)
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](https://github.com/Noveum/ai-gateway/blob/v2.0.1/LICENSE-MIT)
 
-[Quick Start](#quick-start) • 
-[Documentation](docs/) • 
-[Pricing](docs/PRICING.md) • 
-[Docker](docs/deployment.md) • 
-[Contributing](docs/CONTRIBUTING.md)
+[Quick start](#five-minute-quick-start) ·
+[Documentation](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/README.md) ·
+[v2 migration](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/MIGRATING_TO_V2.md) ·
+[Nova Guard](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/NOVA_GUARD.md) ·
+[Operations](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/deployment.md)
 
 </div>
 
-## ✨ Features
+## What it does
 
-- 🚀 **Blazing fast performance**: Built in Rust with zero-cost abstractions
-- ⚡ **Optimized for low latency and high throughput**
-- 🔄 **Unified API interface for multiple AI providers**:
-  - OpenAI — [guide](docs/providers/openai.md)
-  - AWS Bedrock — [guide](docs/providers/bedrock.md)
-  - Anthropic — [guide](docs/providers/anthropic.md)
-  - GROQ — [guide](docs/providers/groq.md)
-  - Fireworks — [guide](docs/providers/fireworks.md)
-  - Together AI — [guide](docs/providers/together.md)
-  - Mistral, Cohere, Google Gemini, DeepSeek, xAI (Grok), OpenRouter, Perplexity — [OpenAI-compatible providers guide](docs/providers/openai-compatible.md)
-- 💰 **Per-request cost tracking** across all providers from a built-in,
-  versioned model pricing catalog — see [docs/PRICING.md](docs/PRICING.md).
-- 📡 **Real-time Streaming**: Optimized for minimal latency
-- 🛡️ **Nova Guard policy enforcement**: In-process guardrails — model allow/deny, regex, banned substrings, PII & secrets detection, JSON-schema validation, token caps — that block, redact, or flag requests and responses, loaded from a local policy bundle (file or inline). See [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md).
-- 🛡️ **Production Ready**: Battle-tested in high-load environments
-- 🔍 **Health Checking**: Built-in monitoring
-- 📊 **Telemetry & Metrics**: Per-request token usage and cost tracking with a pluggable `MetricsExporter` trait; ships with a console exporter (set `DEBUG_METRICS=true`) for local debugging. See [docs/telemetry-plugins.md](docs/telemetry-plugins.md).
-- 🌐 **CORS Support**: Configurable cross-origin resource sharing
-- 🛠️ **SDK Compatibility**: Uses the OpenAI Chat Completions contract;
-  provider-specific supported-field subsets are documented in each guide
-- 🌍 **Deploy anywhere — one package, three shapes**: the same crate runs as a
-  native binary / **Docker** image, a **Rust library**, **or** a
-  **Cloudflare Worker** (WASM, true per‑PoP edge) sharing the same Nova Guard
-  engine. See [docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md).
+The gateway exposes one OpenAI Chat Completions surface. Select an upstream with
+the `x-provider` header; an absent header defaults to OpenAI. It supports:
 
-## ⚡ Performance
+- OpenAI, Anthropic, Groq, Fireworks, Together AI, and AWS Bedrock;
+- OpenAI-compatible routes for Mistral, Cohere, Gemini, DeepSeek, xAI,
+  OpenRouter, and Perplexity;
+- buffered and SSE responses, including Anthropic Messages-to-OpenAI stream
+  translation and Bedrock Converse translation (Bedrock streaming is native
+  only in v2.0.1);
+- a versioned pricing catalog with token, cache, long-context, and supported
+  tool-fee accounting;
+- local or platform-managed Nova Guard policies; and
+- native binary, Docker, Rust library, and Cloudflare Worker deployment shapes.
 
-Built in Rust (Axum + Tokio). The gateway adds negligible overhead on top of the
-upstream provider's own latency. Measured locally (release build, localhost,
-includes client + loopback round-trip):
+Provider features are not identical. Check the relevant
+[provider guide](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/README.md#providers)
+before relying on tools, vision,
+provider-native fields, or strict cost-cap admission.
 
-| Path | p50 | p99 |
-|---|---|---|
-| Health check (gateway processing only) | ~0.46 ms | ~0.87 ms |
-| Full Nova Guard path (JSON parse + regex + PII scan, request blocked, no upstream) | ~0.60 ms | ~1.08 ms |
+## Version 2.0.1
 
-So Nova Guard policy evaluation adds roughly **~0.15 ms** at p50, and when the
-engine is disabled or has no active policies the middleware short-circuits with
-**zero** body buffering. (Numbers vary by hardware; reproduce with the steps in
-[docs/deployment.md](docs/deployment.md).)
+The 2.0 line introduced platform-managed Nova Guard and its SemVer-major public
+API changes. Version 2.0.1 adds the static landing page, clearer runtime
+boundaries, and post-release hardening described in the
+[changelog](https://github.com/Noveum/ai-gateway/blob/v2.0.1/CHANGELOG.md#201---2026-08-24).
+Release resources:
 
-## 🚀 Quick Start
+- [crates.io package](https://crates.io/crates/noveum-ai-gateway)
+- [Rust API documentation](https://docs.rs/noveum-ai-gateway)
+- [GitHub releases](https://github.com/Noveum/ai-gateway/releases)
 
-### Installation
+Source, package, documentation, container, and production deployment can advance
+at different times. Confirm that each surface reports 2.0.1 before treating it
+as the release artifact or promotion target.
 
-You can install Noveum Gateway using one of these methods:
+The 2.0 line is SemVer-major relative to 1.x. Library consumers must account
+for changes to
+`AppState::new`, `Policy::policy_type`, and `PolicyEngine::from_env`; follow the
+[v1.2 → v2 migration guide](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/MIGRATING_TO_V2.md).
 
-### One Line Install & Run (With Cargo Install)
+## Five-minute quick start
+
+### 1. Install and start
+
+Rust 1.94.1 or newer is required. Choose the registry package after the release
+is published, or build a reviewed source checkout directly.
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh && cargo install noveum-ai-gateway && noveum-ai-gateway
+# Registry installation (available after v2.0.1 is published)
+cargo install noveum-ai-gateway --version 2.0.1 --locked
+RUST_LOG=info noveum-ai-gateway
 ```
 
-#### Using Cargo Install
-
 ```bash
-cargo install noveum-ai-gateway
+# Reviewed source checkout (also works before registry publication)
+cargo build --release --locked
+RUST_LOG=info ./target/release/noveum-ai-gateway
 ```
 
-After installation, you can start the gateway by running:
+The native server listens on `http://127.0.0.1:3000` by default and honors
+`HOST`. Confirm the exact binary version before sending provider traffic:
+
 ```bash
-noveum-ai-gateway
+curl --fail --silent http://127.0.0.1:3000/health
+# {"status":"healthy","version":"2.0.1"}
 ```
 
-#### Building from Source
+### 2. Send one provider request
 
-1. Clone the repository:
-```bash
-git clone https://github.com/noveum/ai-gateway
-cd ai-gateway
-```
-
-2. Build the project:
-```bash
-cargo build --release
-```
-
-3. Run the server:
-```bash
-cargo run --release
-```
-
-The server will start on `http://127.0.0.1:3000` by default.
-
-### Running the Gateway
+Provider credentials are supplied per request; the gateway does not keep them
+in its configuration. This OpenAI example uses an explicit output bound, which
+also makes it compatible with strict Nova Guard cost caps:
 
 ```bash
-# Basic configuration
-export RUST_LOG=info
-
-# Start the gateway
-noveum-ai-gateway
-
-# Or with custom port
-PORT=8080 noveum-ai-gateway
-```
-
-### Configuration (environment variables)
-
-**Server / runtime**
-
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `3000` | TCP port to listen on |
-| `HOST` | `127.0.0.1` | Bind address |
-| `WORKER_THREADS` | derived from CPU cores | Tokio worker thread count |
-| `MAX_CONNECTIONS` | `10000` | Max idle HTTP connections kept per upstream host |
-| `RUST_LOG` | `info` | Log filter (e.g. `info`, `debug`, `noveum_ai_gateway=debug`) |
-
-**Telemetry (optional)**
-
-| Variable | Default | Description |
-|---|---|---|
-| `DEBUG_METRICS` | `false` | Register the console metrics exporter (prints each request's token/cost metrics) |
-| `DEPLOYMENT_ENVIRONMENT` | `development` | Value for the `deployment.environment` resource tag |
-
-**Nova Guard policy enforcement (optional)** — see [docs/NOVA_GUARD.md](docs/NOVA_GUARD.md):
-
-| Variable | Default | Description |
-|---|---|---|
-| `NOVEUM_GUARD_ENABLED` | `true` | Master switch for Nova Guard (accepts `false`/`0`/`no`/`off`/`disabled`) |
-| `NOVEUM_GUARD_POLICIES_FILE` | — | Path to a local `nova-guard.json` policy bundle |
-| `NOVEUM_GUARD_POLICIES` | — | Inline JSON policy bundle (alternative to the file) |
-| `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` or `provider_error` |
-| `NOVEUM_GUARD_TENANCY` | _(unset)_ | Deployment mode of the platform bridge: `dedicated` (one process-wide project) or `shared` (project + organization derived per request from the caller's credential). Unset keeps the historical inference — the `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` pair means dedicated. **Shared is never inferred**; it is only ever entered by asking for it |
-| `NOVEUM_API_KEY` | — | Noveum platform API key. **Dedicated mode only** — with `NOVEUM_GUARD_PROJECT_ID` it activates platform-managed Nova Guard (policies + live cost/rate state fetched from the platform, usage reported back). Setting it alongside `NOVEUM_GUARD_TENANCY=shared` is a startup error. Native gateway only — the Cloudflare Worker rejects the shared configuration |
-| `NOVEUM_GUARD_PROJECT_ID` | — | Noveum project whose Nova Guard policies to enforce. **Dedicated mode only**; mutually exclusive with `NOVEUM_GUARD_TENANCY=shared` |
-| `NOVEUM_API_URL` | `https://api.noveum.ai` | Platform API base URL (both modes) |
-| `NOVEUM_GUARD_TENANT_TTL_SECS` | `300` | Shared mode: how long one credential→tenant resolution is reused. Matches the platform's own API-key cache, so the gateway is never *more* stale than the control plane it mirrors |
-| `NOVEUM_GUARD_TENANT_CACHE_MAX` | `1024` | Shared mode: how many distinct tenants one process keeps warm (compiled policies, counters, reservations). A tenant idle for 10 minutes is dropped, which is also what makes a revoked credential self-heal |
-| `OPENAI_BASE_URL` | `https://api.openai.com` | Send `x-provider: openai` traffic to a compatible upstream. Honored by both the native gateway and the Cloudflare Worker |
-| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Override the Anthropic upstream for `x-provider: anthropic`. Honored by both the native gateway and the Cloudflare Worker; requests still route to `/v1/messages` |
-| `NOVEUM_GUARD_COST_ENFORCEMENT` | policy setting | Native gateway only: `strict` forces every cost cap through platform-atomic admission; `advisory` forces the per-process ledger. Unset lets each policy's `enforcementMode` decide. `strict` without the platform bridge is a startup error |
-| `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Fallback completion estimate for advisory cost caps and rate-only admission when a request has no explicit output limit. It is not used to admit an applicable enforcing/blocking strict cost cap: that request is rejected with HTTP 400 instead |
-| `NOVEUM_GUARD_WORKER_UPSTREAM_TIMEOUT_MS` | `600000` | Cloudflare Worker only: deadline for an admitted provider fetch/body/stream. It may be lowered to a positive value but not raised above 10 minutes, so an active request is abandoned before the platform can reap its 15-minute reservation lease |
-| `NOVEUM_GUARD_ALLOW_UNGUARDED_START` | `false` | **Emergency use only.** Lets the gateway start when the first platform policy fetch fails, serving traffic with *no* enforcement until a later poll succeeds. Without it, that failure aborts startup |
-
-### Platform-managed Nova Guard: the two deployment modes
-
-Platform-managed Nova Guard runs in one of **two mutually exclusive modes**,
-selected by `NOVEUM_GUARD_TENANCY`. Which one you need is decided by a single
-question: *does this deployment serve more than one tenant?*
-
-| | **Dedicated** | **Shared** |
-|---|---|---|
-| `NOVEUM_GUARD_TENANCY` | `dedicated`, or unset | `shared` |
-| Tenant identity | fixed by the environment | derived per request from the caller's credential |
-| `NOVEUM_API_KEY` | **required** (one process-wide service key) | **must be unset** |
-| `NOVEUM_GUARD_PROJECT_ID` | **required** | **must be unset** |
-| Caller must authenticate to the gateway | no | **yes**, `x-noveum-api-key` on every `/v1/*` request |
-| Local policy bundle alongside it | allowed | **refused at startup** |
-| Use it for | one team's own gateway | a gateway serving several tenants, e.g. `gateway.noveum.ai` |
-
-Setting both modes' variables at once is a startup error rather than a
-precedence rule — which mode wins is exactly the kind of question that must
-never be answered silently.
-
-#### Dedicated mode
-
-`NOVEUM_GUARD_PROJECT_ID` is process-wide, so **every request a replica handles
-is metered and capped against that one project, regardless of who sent it.**
-That is correct for a gateway fronting a single team, and wrong for anything
-else. Policies are fetched once at startup (a failed first fetch aborts
-startup) and refreshed by a background poller.
-
-#### Shared mode
-
-Every `/v1/*` caller authenticates to the gateway with its own Noveum API key,
-and the project + organization to enforce against are derived **server-side**
-from that credential. Each derived tenant gets its own isolated runtime:
-compiled policies, live counters, reservations, usage reporting and cache
-entries are all keyed by the derived tenant, never by anything the client sent.
-
-- **The credential goes in `x-noveum-api-key`**, not `Authorization` — on this
-  gateway `Authorization` already carries the caller's *provider* key and is
-  forwarded upstream. The tenancy layer **removes** `x-noveum-api-key` from the
-  request before proxying, so a tenant's Noveum credential never reaches
-  OpenAI, Anthropic or any other provider. A `Bearer ` prefix is tolerated.
-- **Routing headers are filters, never identity.** `x-project-id` may only
-  *select among* the projects the credential is already entitled to; naming any
-  other project is **rejected**, not silently overridden. `x-organization-id`
-  (either spelling) is checked against the derived organization and must match.
-  With no `x-project-id` and exactly one entitled project, that project is
-  used; with several, the request is refused rather than metered against a
-  guess.
-- **Every resolution failure fails closed.** An unusable, unverifiable or
-  unentitled credential never falls through to a default project, and a tenant
-  whose policies cannot be fetched is refused rather than served unguarded.
-  Refusals are `401` (no or rejected credential), `403` (authenticated but not
-  entitled — answered identically for "another organization's project" and "no
-  such project", so it discloses nothing), `400` (entitled to several projects
-  and the request named none) and `503` (no verdict reachable).
-- **Nothing is fetched at startup** — there is no tenant yet. A misconfiguration
-  still aborts at boot, but policy fetches happen on each tenant's first
-  request.
-- **`/health` needs no credential**, so liveness and readiness probes work
-  unchanged. Only `/v1/*` requires a tenant.
-- **A local policy bundle is refused.** `NOVEUM_GUARD_POLICIES` /
-  `NOVEUM_GUARD_POLICIES_FILE` alongside `NOVEUM_GUARD_TENANCY=shared` aborts
-  startup: a process-wide bundle would be loaded and never consulted, and a
-  process-wide `cost_cap` / `rate_limit` would be one counter shared by every
-  tenant.
-
-#### Key permissions
-
-Use a **scoped Noveum service key**, not a personal or full-access one:
-
-| Permission | Needed for | Mode |
-|---|---|---|
-| `guardrails:read` | fetching `/policies/effective` and live `/policies/state` | both |
-| `guardrails:ingest` | reporting usage to `/policies/usage` and settling reservations | both |
-| `projects:read` | deriving the caller's project + organization from the credential | shared only |
-
-In dedicated mode that key is the deployment's own, supplied once via
-`NOVEUM_API_KEY`. In shared mode there is **no process-wide key at all** —
-every platform call is made with the calling tenant's own credential, so each
-caller's key needs these permissions and no single secret is ever applied to
-another tenant's traffic.
-
-#### Shared mode is native-only
-
-The Cloudflare Worker supports **dedicated** platform-managed Nova Guard
-(policies, live state, atomic admission and settlement all work at the edge).
-It has no tenancy layer, so it cannot serve shared mode, and it answers
-`NOVEUM_GUARD_TENANCY=shared` with a 503 `gateway_configuration_error` rather
-than ignoring the variable and proxying every caller unguarded. It likewise
-refuses *any* inline `cost_cap` / `rate_limit` policy, which has no live-state
-backend — see
-[docs/CLOUDFLARE_WORKER.md](docs/CLOUDFLARE_WORKER.md#platform-managed-nova-guard-on-the-worker).
-
-#### Deployment order
-
-The platform's composite `/state` (the nested `org` block) must be deployed
-**before** a gateway that enforces organization-scoped policies. Reversed,
-org-scoped counters read as unavailable and expected fail-closed policies block
-during the rollout.
-
-> **Whether a cap holds across replicas depends on its enforcement mode.**
->
-> | Active policy for this model | Request has a positive explicit output limit | No explicit output limit |
-> |---|---|---|
-> | Enforcing, blocking **strict** `cost_cap` | Reserved against the platform's atomic admission API, then settled with actual usage | **HTTP 400 `missing_output_limit` before admission or provider dispatch** |
-> | **Advisory** `cost_cap` | Heuristic estimate (native: per-process ledger; Worker: stateful platform bridge without promotion to strict semantics) | Allowed using `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS`; this is an estimate, not a hard cap |
-> | `rate_limit` only | Normal rate admission | Allowed using the fallback estimate where token accounting needs one; rate-only policies do not acquire the strict cost-cap requirement |
-> | Strict cap in `shadow` mode, disabled, or outside `scopeToModels` | Does not impose the strict output-limit requirement | Does not impose the strict output-limit requirement |
->
-> The accepted limit fields are `max_tokens`, `max_completion_tokens`, and
-> `max_output_tokens`; every non-null field must be the same positive integer no
-> greater than 10,000,000 under strict admission. Compatible providers receive
-> one normalized native ceiling, so the amount reserved is the amount enforced
-> upstream. On the native gateway,
-> `NOVEUM_GUARD_COST_ENFORCEMENT=strict` promotes otherwise-advisory caps to the
-> strict row, while `...=advisory` demotes policy-declared strict caps. Unset lets
-> each policy decide. Native advisory enforcement can overshoot by the requests
-> admitted in the refresh window *per replica*. The Worker still sends stateful
-> traffic through its platform bridge, but that transport choice does not turn
-> an advisory policy into a hard cap; only atomic strict admission provides the
-> cross-replica hard-cap contract.
->
-> Strict admission deliberately supports only bounded JSON
-> `/v1/chat/completions`. It requires `model`, `messages`, and a positive output
-> limit, estimates the post-transform serialized body, and rejects unbounded
-> provider-side work before admission: Responses/conversation state, images,
-> files, audio, remote search (including xAI `search_parameters`), server/MCP
-> tools, conflicting output-limit aliases, multi-choice requests,
-> Perplexity, and OpenRouter. Client function tools remain supported on adapters
-> that translate or transparently pass them; the Bedrock adapter does not yet
-> translate tool use. Strict Bedrock admission currently accepts only
-> catalogued commercial Claude model/profile IDs whose global or geographic
-> price is derivable from the ID; region-priced Nova/Titan models remain
-> available to advisory/pass-through traffic. Direct OpenAI strict calls are
-> pinned to `service_tier: "default"`; advisory policies retain the gateway's broader
-> transparent-proxy surface.
-
-> **An unknown model is priced high, not rejected.** A model id the compiled
-> Rust pricing table does not know is estimated at that runtime table's maximum
-> input/output rates (today $15/$75 per 1M), tagged as an assumption, and logged
-> once per distinct id. It is reserved at that rate too, so it cannot consume
-> cap headroom it will later be
-> billed for. The gateway does not refuse unrecognized model ids — it is a
-> pass-through proxy, and doing so would break every provider model launch. To
-> refuse calls you cannot meter, set `failClosed: true` on a `cost_cap`: that
-> blocks an unpriceable model, per policy rather than globally.
-
-> **Costs are policy estimates, not billing.** The catalog models uncached
-> input/output, published cache-read and cache-write rates, long-context tiers,
-> known per-request tool fees, and supported Anthropic geo/fast multipliers. A
-> declared Anthropic cache breakpoint reserves the first-write premium; omitted
-> eligible geo reserves the possible 1.1x US premium; Opus 5/4.8 fast mode
-> reserves 2x, or 2.2x with US geo. A usage dimension the provider reports but
-> the catalog cannot price is charged at a conservative bound and marked
-> incomplete. Batch discounts, negotiated rates, taxes, and later provider
-> changes can still differ. OpenAI Fast/Priority and regional-processing
-> premiums are not modeled; strict direct-OpenAI admission pins the default
-> service tier, while advisory traffic can still differ. Bedrock Claude
-> direct/geographic inference uses the documented 1.1x
-> token/cache rate while an explicit `global.` profile uses the global rate.
-> Strict admission rejects other Bedrock model families until `x-aws-region`
-> is carried through reservation and settlement; AWS publishes materially
-> different Nova rates by source Region.
-> Do not treat these figures as an invoice; see the
-> [versioned pricing and accounting guide](docs/PRICING.md).
-
-> **A configured guard never degrades to a silent pass-through.** Half-applied
-> credentials (one of `NOVEUM_API_KEY` / `NOVEUM_GUARD_PROJECT_ID`), empty
-> values, a malformed policy bundle, or a failed first policy fetch all abort
-> startup with a non-zero exit rather than booting a gateway that looks healthy
-> while enforcing nothing. An *absent* configuration is still a normal
-> transparent proxy.
-
-## 📚 Usage Examples
-
-### Making Requests
-
-To make requests through the gateway, use the `/v1/*` endpoint and specify the provider using the `x-provider` header.
-
-#### Example: AWS Bedrock Request
-
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-provider: bedrock" \
-  -H "x-aws-access-key-id: YOUR_ACCESS_KEY" \
-  -H "x-aws-secret-access-key: YOUR_SECRET_KEY" \
-  -H "x-aws-region: us-east-1" \
-  -d '{
-    "model": "anthropic.claude-3-sonnet-20240229-v1:0",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
-#### Example: OpenAI Request
-
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
+curl --fail-with-body http://127.0.0.1:3000/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "Content-Type: application/json" \
   -H "x-provider: openai" \
-  -H "Authorization: Bearer your-openai-api-key" \
   -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "model": "gpt-4o-mini",
+    "messages": [{"role": "user", "content": "Reply with: gateway ready"}],
+    "max_tokens": 32
   }'
 ```
 
-#### Example: GROQ Request
+Change `x-provider`, the provider credential, and the model to switch
+upstreams. See the [provider examples](#provider-authentication-examples).
+
+### Build from source instead
 
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-provider: groq" \
-  -H "Authorization: Bearer your-groq-api-key" \
-  -d '{
-    "model": "openai/gpt-oss-20b",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true,
-    "max_tokens": 300
-  }'
+git clone https://github.com/Noveum/ai-gateway.git
+cd ai-gateway
+cargo run --locked --release
 ```
 
-#### Example: Anthropic Request
+Run `cargo test --locked --lib` before modifying the source. The full release
+matrix is in
+[Validation](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/VALIDATION.md).
+
+## HTTP surface
+
+| Route | Purpose |
+|---|---|
+| `GET /`, `HEAD /` | Beginning with v2.0.1, a static no-JavaScript information page showing runtime/version and links to health, docs.rs, GitHub, and Noveum. `HEAD` returns the same status and security/cache headers without a body. |
+| `GET /health` | Process/runtime health and exact package version. It does not test provider credentials. |
+| `/v1/*` | Provider proxy surface; `POST /v1/chat/completions` is the documented contract. |
+
+The landing page is not an admin console or hosted API explorer.
+`/docs` and `/openapi.json` remain 404; use
+[docs.rs](https://docs.rs/noveum-ai-gateway) and this documentation instead.
+
+## Authentication: three different credentials
+
+These credentials have different jobs and must not be substituted for one
+another:
+
+| Credential | Where it goes | Purpose |
+|---|---|---|
+| Provider API key | Usually `Authorization: Bearer …` on each request; Anthropic also accepts `x-api-key`; Bedrock uses `x-aws-*` headers | Authenticates the upstream model call and is forwarded only to that provider |
+| Dedicated Noveum service key | `NOVEUM_API_KEY` deployment secret | Lets one dedicated gateway fetch policies/state and admit/settle usage for the fixed `NOVEUM_GUARD_PROJECT_ID` |
+| Shared-mode caller key | `x-noveum-api-key` on each request to a **native** shared gateway | Authenticates the caller to Noveum and derives the caller's entitled project/organization; it is stripped before provider dispatch |
+
+`x-project-id` and `x-organization-id` are not credentials. In transparent or
+dedicated mode they are attribution headers. In shared mode they may only
+select or confirm an identity already derived from the caller's Noveum key.
+
+The transparent and dedicated gateway modes do **not** provide general-purpose
+client authentication. Put a production deployment behind an authenticated
+load balancer, API gateway, Cloudflare Access, or another access-control layer
+when the endpoint must not be public.
+
+### Noveum key scopes
+
+Use the least-privileged key that fits the tenancy mode:
+
+| Scope | Dedicated service key | Shared caller key |
+|---|:---:|:---:|
+| `guardrails:read` | required | required |
+| `guardrails:ingest` | required | required |
+| `projects:read` | not required | required |
+
+Never put `NOVEUM_API_KEY` in `wrangler.toml`, a Docker image, source control,
+or a request header. Store it in the runtime's secret manager.
+
+## Provider authentication examples
+
+All examples use the OpenAI Chat Completions request shape.
+
+### Anthropic
 
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
+curl --fail-with-body http://127.0.0.1:3000/v1/chat/completions \
+  -H "Authorization: Bearer $ANTHROPIC_API_KEY" \
   -H "Content-Type: application/json" \
   -H "x-provider: anthropic" \
-  -H "Authorization: Bearer your-anthropic-api-key" \
   -d '{
-    "model": "claude-sonnet-5",
-    "messages": [{"role": "user", "content": "Write a poem"}],
-    "stream": true,
-    "max_tokens": 1024
+    "model": "claude-haiku-4-5-20251001",
+    "messages": [{"role": "user", "content": "Reply with one sentence."}],
+    "max_tokens": 64
   }'
 ```
 
-#### Example: Fireworks Request
+The gateway converts the request to Anthropic Messages and converts successful
+buffered/SSE responses back to OpenAI shape. See the
+[Anthropic compatibility contract](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/providers/anthropic.md).
+
+### Groq, Fireworks, Together, and other compatible providers
 
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
+curl --fail-with-body http://127.0.0.1:3000/v1/chat/completions \
+  -H "Authorization: Bearer $GROQ_API_KEY" \
   -H "Content-Type: application/json" \
-  -H "x-provider: fireworks" \
-  -H "Authorization: Bearer your-fireworks-api-key" \
+  -H "x-provider: groq" \
   -d '{
-    "model": "accounts/fireworks/models/llama-v3p1-8b-instruct",
-    "messages": [{"role": "user", "content": "Write a poem"}],
+    "model": "openai/gpt-oss-20b",
+    "messages": [{"role": "user", "content": "Reply with one sentence."}],
+    "max_tokens": 64,
     "stream": true,
-    "max_tokens": 300,
-    "temperature": 0.6,
-    "top_p": 1,
-    "top_k": 40
+    "stream_options": {"include_usage": true}
   }'
 ```
 
-#### Example: Together AI Request
+Use the upstream provider's current model list; model availability is not
+frozen by the gateway. See
+[Groq](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/providers/groq.md),
+[Fireworks](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/providers/fireworks.md),
+[Together](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/providers/together.md),
+and
+[other OpenAI-compatible providers](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/providers/openai-compatible.md).
+
+### AWS Bedrock
 
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
+curl --fail-with-body http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "x-provider: together" \
-  -H "Authorization: Bearer your-together-api-key" \
+  -H "x-provider: bedrock" \
+  -H "x-aws-access-key-id: $AWS_ACCESS_KEY_ID" \
+  -H "x-aws-secret-access-key: $AWS_SECRET_ACCESS_KEY" \
+  -H "x-aws-region: ${AWS_REGION:-us-east-1}" \
   -d '{
-    "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-    "messages": [{"role": "user", "content": "Write a poem"}],
-    "stream": true,
-    "max_tokens": 512,
-    "temperature": 0.7,
-    "top_p": 0.7,
-    "top_k": 50,
-    "repetition_penalty": 1
+    "model": "amazon.nova-micro-v1:0",
+    "messages": [{"role": "user", "content": "Reply with one sentence."}],
+    "max_tokens": 64
   }'
 ```
 
-## SDK Compatibility
+Both native and Cloudflare runtimes accept `x-aws-session-token` for temporary
+STS credentials. Use least-privileged, short-lived AWS credentials and only
+send credential headers over TLS to a gateway you control. Do not send AWS
+credentials through the public/shared `gate.noveum.ai` endpoint. See the
+[Bedrock guide](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/providers/bedrock.md).
 
-The gateway exposes an OpenAI Chat Completions interface. You can use an official
-OpenAI SDK with supported providers by changing the base URL, provider header,
-and provider API key. Provider-specific translations are necessarily a subset of
-the OpenAI schema; for Anthropic's exact request, streaming, tool, and error
-contract, read the [Anthropic provider guide](docs/providers/anthropic.md).
-That adapter validates cost-affecting cache, geo, speed, fallback, and
-model-specific sampling fields before Nova Guard admission. It supports client
-function tools, not Anthropic-managed server/MCP tools.
+When the environment contains temporary credentials, add this header to the
+Bedrock request; omit it for a long-lived access-key pair:
 
-### Using with OpenAI's Official Node.js SDK
-
-```typescript
-import OpenAI from 'openai';
-
-// Configure the SDK to use Noveum Gateway
-const openai = new OpenAI({
-  apiKey: process.env.PROVIDER_API_KEY, // Use any provider's API key
-  baseURL: "http://localhost:3000/v1/", // Point to the gateway
-  defaultHeaders: {
-    "x-provider": "groq", // Specify the provider you want to use
-  },
-});
-
-// Make requests as usual
-const chatCompletion = await openai.chat.completions.create({
-  messages: [
-    { role: "system", content: "Write a poem" },
-    { role: "user", content: "" }
-  ],
-  model: "openai/gpt-oss-20b",
-  temperature: 1,
-  max_tokens: 100,
-  top_p: 1,
-  stream: false,
-});
+```bash
+-H "x-aws-session-token: $AWS_SESSION_TOKEN"
 ```
 
-You can easily switch between providers by changing the `x-provider` header and API key:
+## OpenAI SDK example
 
 ```typescript
-// For OpenAI
-const openaiClient = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  baseURL: "http://localhost:3000/v1/",
-  defaultHeaders: { "x-provider": "openai" },
-});
+import OpenAI from "openai";
 
-// For AWS Bedrock
-const bedrockClient = new OpenAI({
-  apiKey: process.env.AWS_ACCESS_KEY_ID, // Use AWS access key
-  baseURL: "http://localhost:3000/v1/",
-  defaultHeaders: {
-    "x-provider": "bedrock",
-    "x-aws-access-key-id": process.env.AWS_ACCESS_KEY_ID,
-    "x-aws-secret-access-key": process.env.AWS_SECRET_ACCESS_KEY,
-    "x-aws-region": process.env.AWS_REGION || "us-east-1"
-  },
-});
-
-// For Anthropic
-const anthropicClient = new OpenAI({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  baseURL: "http://localhost:3000/v1/",
-  defaultHeaders: { "x-provider": "anthropic" },
-});
-
-// For GROQ
-const groqClient = new OpenAI({
+const client = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
-  baseURL: "http://localhost:3000/v1/",
+  baseURL: "http://127.0.0.1:3000/v1",
   defaultHeaders: { "x-provider": "groq" },
 });
 
-// For Fireworks
-const fireworksClient = new OpenAI({
-  apiKey: process.env.FIREWORKS_API_KEY,
-  baseURL: "http://localhost:3000/v1/",
-  defaultHeaders: { "x-provider": "fireworks" },
+const completion = await client.chat.completions.create({
+  model: "openai/gpt-oss-20b",
+  messages: [{ role: "user", content: "Reply with one sentence." }],
+  max_tokens: 64,
 });
 
-// For Together AI
-const togetherClient = new OpenAI({
-  apiKey: process.env.TOGETHER_API_KEY,
-  baseURL: "http://localhost:3000/v1/",
-  defaultHeaders: { "x-provider": "together" },
-});
+console.log(completion.choices[0]?.message.content);
 ```
 
-The gateway automatically handles the necessary transformations to ensure compatibility with each provider's API format while maintaining the familiar OpenAI SDK interface.
-
-### Testing Gateway URL
-```
-https://gateway.noveum.ai
-```
-
-### Send Example Request to Testing Gateway
-```bash
-curl --location 'https://gateway.noveum.ai/v1/chat/completions' \
-  --header 'Authorization: Bearer YOUR_API_KEY' \
-  --header 'Content-Type: application/json' \
-  --header 'x-provider: groq' \
-  --data '{
-    "model": "openai/gpt-oss-20b",
-    "messages": [
-        {
-            "role": "user",
-            "content": "Write a poem"
-        }
-    ],
-    "stream": true,
-    "max_tokens": 300
-}'
-```
-
-> **Note**: This deployment is provided for testing and evaluation purposes only. For production workloads, please deploy your own instance of the gateway or contact us for information about production-ready managed solutions.
-
-## 🔧 Configuration
-
-The gateway can be configured using environment variables:
-
-```bash
-RUST_LOG=debug # Logging level (debug, info, warn, error)
-```
-
-## 🏗️ Architecture
-
-The gateway leverages the best-in-class Rust ecosystem:
-
-- **Axum** - High-performance web framework
-- **Tokio** - Industry-standard async runtime
-- **Tower-HTTP** - Robust HTTP middleware
-- **Reqwest** - Fast and reliable HTTP client
-- **Tracing** - Zero-overhead logging and diagnostics
-
-## 📈 Performance
-
-Noveum Developer AI Gateway is designed for maximum performance:
-
-- **Zero-cost abstractions** using Rust's ownership model
-- **Asynchronous I/O** with Tokio for optimal resource utilization
-- **Connection pooling** via Reqwest for efficient HTTP connections
-- **Memory-efficient** request/response proxying
-- **Minimal overhead** in the request path
-- **Optimized streaming** response handling
-
-## 🔒 Security Notes
-
-- Always run behind a reverse proxy in production
-- Configure CORS appropriately for your use case
-- Use environment variables for sensitive configuration
-- Consider adding rate limiting for production use
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
-
-### 🛠️ Development Setup
-
-```bash
-# Install development dependencies
-cargo install cargo-watch
-
-# Run tests
-cargo test
-
-# Run with hot reload
-cargo watch -x run
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Connection Refused**
-   - Check if port 3000 is available
-   - Verify the HOST and PORT settings
-
-2. **Streaming Not Working**
-   - Ensure `Accept: text/event-stream` header is set
-   - Check client supports streaming
-   - Verify provider supports streaming for the requested endpoint
-
-3. **Provider Errors**
-   - Verify provider API keys are correct
-   - Check provider-specific headers are properly set
-   - Ensure the provider endpoint exists and is correctly formatted
-
-## 💬 Community
-
-- [GitHub Discussions](https://github.com/noveum/ai-gateway/discussions)
-- [Twitter](https://twitter.com/noveum-ai)
-
-## 🙏 Acknowledgments
-
-Special thanks to all [contributors](https://github.com/noveum/ai-gateway/graphs/contributors) and the Rust community.
-
-## 📄 License
-
-This project is dual-licensed under both the MIT License and the Apache License (Version 2.0). You may choose either license at your option. See the [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE) files for details.
-
-## Docker Support
-
-### Building and Running with Docker
-
-1. Build the Docker image:
-```bash
-docker buildx build --platform linux/amd64 -t noveum/noveum-ai-gateway:latest . --load
-```
-
-2. Push the image to Docker Hub:
-```bash
-docker push noveum/noveum-ai-gateway:latest
-```
-
-3. Run the container:
-```bash
-docker run -p 3000:3000 \
-  -e RUST_LOG=info \
-  noveum/noveum-ai-gateway:latest
-```
-
-### Using Pre-built Docker Image
-
-```bash
-docker pull noveum/noveum-ai-gateway:latest
-docker run -p 3000:3000 \
-  -e RUST_LOG=info \
-  noveum/noveum-ai-gateway:latest
-```
-
-### Using Pre-built Docker Image with Nova Guard policies
-
-Mount a local policy bundle and point Nova Guard at it:
-
-```bash
-docker pull noveum/noveum-ai-gateway:latest  --platform linux/amd64
-docker run --platform linux/amd64 -p 3000:3000 \
-  -e RUST_LOG=info \
-  -e NOVEUM_GUARD_POLICIES_FILE=/etc/nova-guard.json \
-  -v "$(pwd)/nova-guard.json:/etc/nova-guard.json:ro" \
-  noveum/noveum-ai-gateway:latest
-```
-
-### Docker Compose
-
-For detailed deployment instructions, please refer to the [Deployment Guide](docs/deployment.md).
-
-#### Option 1: Build from Source
-
-Create a `docker-compose.yml` file:
-
-```yaml
-version: '3.8'
-services:
-  gateway:
-    build: .
-    platform: linux/amd64
-    ports:
-      - "3000:3000"
-    environment:
-      - RUST_LOG=info
-    restart: unless-stopped
-```
-
-#### Option 2: Use Prebuilt Image
-
-Create a `docker-compose.yml` file:
-
-```yaml
-version: '3.8'
-services:
-  gateway:
-    image: noveum/noveum-ai-gateway:latest
-    platform: linux/amd64
-    ports:
-      - "3000:3000"
-    environment:
-      - RUST_LOG=info
-    restart: unless-stopped
-```
-
-Then run either option with:
-```bash
-docker-compose up -d
-```
-
-#### Option 3: Use Prebuilt Image with Nova Guard policies
-
-Create a `docker-compose.yml` that mounts a local policy bundle:
-
-```yaml
-version: '3.8'
-services:
-  gateway:
-    image: noveum/noveum-ai-gateway:latest
-    platform: linux/amd64
-    ports:
-      - "3000:3000"
-    environment:
-      - RUST_LOG=info
-      - NOVEUM_GUARD_POLICIES_FILE=/etc/nova-guard.json
-    volumes:
-      - ./nova-guard.json:/etc/nova-guard.json:ro
-    restart: unless-stopped
-```
-
-Then run with:
-```bash
-docker-compose up -d
-```
-
-## Release Process for noveum-ai-gateway
-
-Publishing a crate is permanent: a version cannot be overwritten or deleted
-from crates.io. Perform releases only from a reviewed, deployed, and clean
-`main` commit. If a published version is unsafe, it can be yanked to prevent new
-dependency resolution, but existing lockfiles and direct downloads continue to
-work.
-
-### 1. Prepare and review the release
-
-- [ ] Merge the implementation PR and complete its production deployment gates.
-- [ ] Choose the version according to SemVer; public Rust API breaks require a
-      major version.
-- [ ] Update the version in both `Cargo.toml` and `Cargo.lock`.
-- [ ] Move the release notes out of `[Unreleased]` in `CHANGELOG.md` and update
-      its comparison links.
-- [ ] Ensure the release commit contains no credentials and the package list
-      contains only intentional files.
-
-```bash
-git switch main
-git pull --ff-only
-git status --short
-
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --lib
-cargo test --locked --test novaguard_platform
-cargo test --locked --test policy_integration
-cargo check --locked --target wasm32-unknown-unknown --no-default-features --lib
-cargo build --locked --release
-cargo package --locked --list
-cargo publish --locked --dry-run
-```
-
-Run the Cloudflare Worker/Workerd, Docker, supply-chain, and real-provider smoke
-gates documented above as well. The Cargo dry-run verifies the crate archive;
-it does not validate a production Cloudflare deployment or the Noveum control
-plane.
-
-### 2. Publish the exact reviewed commit
-
-Confirm `HEAD` is the reviewed release commit on `origin/main`, the tree is
-clean, and the version does not already exist on crates.io. Then publish once:
-
-```bash
-git fetch origin main
-test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
-test -z "$(git status --porcelain)"
-
-cargo publish --locked
-```
-
-Cargo uses a scoped crates.io token from the local credential provider or
-`CARGO_REGISTRY_TOKEN`. Never place the token in this repository, a shell
-history entry, or release output.
-
-### 3. Tag and verify
-
-After crates.io confirms the publish, tag that same commit and create the GitHub
-release from the matching changelog section:
-
-```bash
-NOVEUM_RELEASE_VERSION=2.0.0
-git tag -a "v${NOVEUM_RELEASE_VERSION}" -m "v${NOVEUM_RELEASE_VERSION}"
-git push origin "v${NOVEUM_RELEASE_VERSION}"
-gh release create "v${NOVEUM_RELEASE_VERSION}" --verify-tag \
-  --title "v${NOVEUM_RELEASE_VERSION}" --generate-notes
-```
-
-Verify the crate version and checksum on
-[crates.io](https://crates.io/crates/noveum-ai-gateway), wait for the matching
-[docs.rs](https://docs.rs/noveum-ai-gateway) build, and verify the GitHub tag and
-release resolve to the exact published source commit. For an emergency yank:
-
-```bash
-cargo yank --vers 2.0.0 noveum-ai-gateway
-```
-
-## Testing Deployment
-
-Noveum provides a testing deployment of the AI Gateway, hosted in our London data centre. This deployment is intended for testing and evaluation purposes only, and should not be used for production workloads.
-
-## 📊 OpenTelemetry Logging
-
-Noveum AI Gateway now supports OpenTelemetry compatible logs for enhanced observability. The Gateway can export detailed request logs with a rich structured format that includes complete request/response details and performance metrics.
-
-### Tracking Headers
-
-You can add custom tracking information to your requests that will be included in the logs:
-
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-provider: openai" \
-  -H "Authorization: Bearer your-openai-api-key" \
-  -H "x-project-id: your-project-id" \
-  -H "x-organization-id: your-org-id" \
-  -H "x-user-id: your-user-id" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
-These headers will be included in the telemetry logs, allowing you to:
-
-- Track usage by project
-- Monitor costs per organization
-- Analyze performance by user
-- Segment analytics by experiment
-
-For more details, see the [Telemetry Exporters Guide](docs/telemetry-plugins.md).
-
-## Testing
-
-Noveum Gateway includes comprehensive integration tests for all supported providers (OpenAI, Anthropic, GROQ, Fireworks, Together AI, and AWS Bedrock). These tests validate both non-streaming and streaming functionality.
-
-### Running Integration Tests
-
-1. Set up your test environment:
-   ```bash
-   # Copy the sample test environment file
-   cp tests/.env.test.example .env.test
-   
-   # Edit the file to add your API keys for the providers you want to test
-   nano .env.test
-   ```
-
-2. Start the gateway:
-   ```bash
-   cargo run
-   ```
-
-3. Run the integration tests:
-   ```bash
-   # Run all tests
-   cargo test --test run_integration_tests -- --nocapture
-   
-   # Run tests for specific providers
-   cargo test --test run_integration_tests openai -- --nocapture
-   cargo test --test run_integration_tests anthropic -- --nocapture
-   cargo test --test run_integration_tests groq -- --nocapture
-   cargo test --test run_integration_tests fireworks -- --nocapture
-   cargo test --test run_integration_tests together -- --nocapture
-   cargo test --test run_integration_tests bedrock -- --nocapture
-   ```
-
-### Test Environment Configuration
-
-Your `.env.test` file should include the following variables:
-
-```bash
-# Gateway URL (default: http://localhost:3000)
-GATEWAY_URL=http://localhost:3000
-
-# Provider API Keys - Add keys for the providers you want to test
-OPENAI_API_KEY=your_openai_api_key
-ANTHROPIC_API_KEY=your_anthropic_api_key
-GROQ_API_KEY=your_groq_api_key
-FIREWORKS_API_KEY=your_fireworks_api_key
-TOGETHER_API_KEY=your_together_api_key
-
-# AWS Bedrock Credentials
-AWS_ACCESS_KEY_ID=your_aws_access_key_id
-AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
-AWS_REGION=us-east-1
-```
-
-For detailed test documentation, please refer to the [Integration Tests README](tests/README.md).
+In native shared-tenancy mode, also add `x-noveum-api-key` and, if the key can
+access several projects, `x-project-id` to `defaultHeaders`.
+
+## Nova Guard deployment choices
+
+| Mode | Runtime | Tenant identity | Appropriate use |
+|---|---|---|---|
+| Transparent | Native or Worker | none | Routing only; no platform policy/state bridge |
+| Local stateless policies | Native or Worker | process-wide bundle | Regex, PII, secrets, allowlists, schema, and token policies without the Noveum control plane |
+| Platform-managed dedicated | Native or Worker | fixed deployment key + project | One team's gateway or one Worker/domain per project |
+| Platform-managed shared | **Native only** | derived from each caller's Noveum key | A hostname serving several projects or organizations |
+
+Do not enable a dedicated project binding on a shared public hostname: every
+call would be attributed and capped against that one project. A shared-hostname
+Cloudflare Worker must remain transparent, be split into dedicated Workers per
+project, or be replaced by the native shared-tenancy gateway.
+
+The production Cloudflare endpoint `https://gate.noveum.ai` runs in
+**transparent** mode for this reason. Check its public `/health` response for
+the exact deployed version; v2.0.0 was the verified 2026-08-24 release baseline.
+Provider requests still require the caller's provider credential. This status
+is operational information, not a guarantee that the public endpoint is an
+SLA-backed managed service.
+
+Read
+[Nova Guard](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/NOVA_GUARD.md)
+for policy semantics and
+[Cloudflare Worker operations](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/CLOUDFLARE_WORKER.md)
+before enabling the platform bridge.
+
+## Configuration
+
+The common native settings are:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HOST` | `127.0.0.1` | Listen address. Use `0.0.0.0` inside a container. |
+| `PORT` | `3000` | Listen port |
+| `RUST_LOG` | `info` | Tracing filter |
+| `DEBUG_METRICS` | `false` | Emit request metrics to the console; may include prompt/response content |
+| `DEPLOYMENT_ENVIRONMENT` | `development` | Telemetry resource label |
+| `NOVEUM_GUARD_ENABLED` | `true` | Nova Guard master switch; no source means transparent pass-through |
+
+The complete, mode-aware reference is in
+[Configuration](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/configuration.md).
+Invalid or half-applied guard
+configuration is rejected instead of silently disabling enforcement: at native
+startup, or on Worker proxy requests while its information/health routes remain
+available.
+
+## Deploy and operate
+
+- [Native, Docker, and Kubernetes](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/deployment.md)
+- [Cloudflare Worker runbook](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/CLOUDFLARE_WORKER.md)
+- [Cloudflare architecture and runtime differences](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/CLOUDFLARE_DEPLOYMENT.md)
+- [Validation checklist](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/VALIDATION.md)
+- [Telemetry and log handling](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/logs.md)
+- [Release process](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/RELEASING.md)
+
+Always pin an immutable version in production. Confirm `/health`, run at least
+one buffered and one streaming request with a low output limit, inspect errors
+and reservation settlement, and record the previous deployment identifier
+before promotion.
+
+Container automation publishes `2.0.1` and `latest` to both GHCR and Docker Hub
+only when the pushed Git tag is exactly `v2.0.1`, matching the Cargo package
+version, and that tag's commit is already contained in trusted `main`. Pull
+requests, `main` pushes, and manual workflow runs build and exercise the image
+but publish nothing, so they cannot overwrite a release image. The Docker build
+context is deny-by-default and contains only the Cargo manifest/lockfile, Rust
+source, policy schema, and pricing catalog. The release image records the exact
+version and source revision and runs as the fixed unprivileged identity
+`65532:65532`. Treat the version tag as immutable and pin the verified registry
+digest for deployment; do not use `latest` as a release identity.
+
+## Security boundaries
+
+- Provider and Noveum keys are secrets. Do not log them, commit them, embed them
+  in images, or pass them as command-line arguments.
+- The gateway accepts credentials in request headers. Terminate TLS before any
+  untrusted network and configure reverse proxies not to log sensitive headers.
+- `DEBUG_METRICS=true` emits request and response bodies. Use it for controlled
+  debugging, not general production logging of sensitive prompts.
+- Provider-specific `RUST_LOG=debug` targets can also emit request bodies,
+  responses, or streaming chunks. Keep production at `info`; enable debug only
+  briefly with non-sensitive traffic and protected log storage.
+- CORS is permissive. Browser exposure therefore requires an explicit
+  authentication and origin-control layer in front of the gateway.
+- Strict Nova Guard cost caps protect a policy budget; they are not a substitute
+  for provider quotas, AWS IAM, network access control, or billing alerts.
+
+## Contributing
+
+See
+[Contributing](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/CONTRIBUTING.md).
+Before opening a pull request, run the applicable checks in
+[Validation](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/VALIDATION.md)
+and update the changelog for user-visible behavior.
+
+## License
+
+Dual-licensed under
+[MIT](https://github.com/Noveum/ai-gateway/blob/v2.0.1/LICENSE-MIT) or
+[Apache License 2.0](https://github.com/Noveum/ai-gateway/blob/v2.0.1/LICENSE-APACHE),
+at your option.
