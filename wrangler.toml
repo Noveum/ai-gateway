@@ -35,7 +35,7 @@ head_sampling_rate = 1
 # no policies are loaded, so `wrangler dev`/`wrangler deploy` will not mutate or
 # reject any traffic. Opt in by setting `NOVEUM_GUARD_POLICIES` (inline JSON, the
 # same schema as the native `nova-guard.json`) — uncomment the example below or,
-# for production, use a `wrangler secret` / Workers KV (see
+# for production, use a `wrangler secret` (see
 # docs/CLOUDFLARE_DEPLOYMENT.md). Optional: `NOVEUM_GUARD_BLOCK_RESPONSE_MODE`
 # (`synthetic_success` | `provider_error`).
 #

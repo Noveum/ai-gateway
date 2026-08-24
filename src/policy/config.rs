@@ -254,6 +254,8 @@ impl From<PolicyType> for PolicyTypeTag {
 pub enum PolicyRejection {
     /// The `type` string is not in `schema/novaguard-policy.v1.json`.
     UnknownType { raw: String },
+    /// A present `source` is not one of the scope tags in the policy schema.
+    InvalidSource { raw: String },
     /// The type is in the contract but its `config` violates the schema.
     InvalidConfig { errors: Vec<String> },
     /// The type is in the contract but this build cannot enforce it (it needs an
@@ -268,6 +270,11 @@ impl std::fmt::Display for PolicyRejection {
                 f,
                 "unknown policy type '{raw}'; this gateway build understands: {}",
                 POLICY_TYPE_NAMES.join(", ")
+            ),
+            PolicyRejection::InvalidSource { raw } => write!(
+                f,
+                "invalid policy source '{raw}'; expected project, org, organization, or an \
+                 omitted source for a local bundle"
             ),
             PolicyRejection::InvalidConfig { errors } => {
                 write!(f, "invalid config: {}", errors.join("; "))
@@ -316,14 +323,22 @@ fn config_validators() -> &'static HashMap<&'static str, Validator> {
 
 /// Validate one policy against the checked-in schema.
 ///
-/// Returns `Ok(())` only for a type in the contract, with a config the schema
-/// accepts, that this build can actually enforce.
+/// Returns `Ok(())` only for a type and optional source in the contract, with a
+/// config the schema accepts, that this build can actually enforce.
 pub fn validate_policy(policy: &Policy) -> Result<(), PolicyRejection> {
     let kind = policy.kind();
     if kind == PolicyType::Unknown {
         return Err(PolicyRejection::UnknownType {
             raw: policy.type_name().to_string(),
         });
+    }
+
+    if let Some(source) = policy.source.as_deref() {
+        if !matches!(source, "project" | "org" | "organization") {
+            return Err(PolicyRejection::InvalidSource {
+                raw: source.to_string(),
+            });
+        }
     }
 
     if let Some(validator) = config_validators().get(kind.as_str()) {
@@ -740,6 +755,48 @@ mod tests {
         )
         .unwrap();
         assert!(bundle.validate().is_empty());
+    }
+
+    #[test]
+    fn unknown_or_whitespace_policy_sources_are_rejected() {
+        for source in ["org ", " project", "workspace", ""] {
+            let json = format!(
+                r#"{{"policies":[{{"name":"cap","type":"cost_cap","mode":"enforce",
+                    "source":{source:?},
+                    "config":{{"window":"30d_rolling","maxUsd":10.0,"action":"block"}}}}]}}"#
+            );
+            let bundle = PolicyBundle::from_json_str(&json).unwrap();
+
+            let rejections = bundle.validate();
+            assert_eq!(rejections.len(), 1, "source {source:?} must be rejected");
+            assert_eq!(
+                rejections[0].1,
+                PolicyRejection::InvalidSource {
+                    raw: source.to_string()
+                },
+                "rejection must preserve source {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_and_absent_policy_sources_remain_valid() {
+        for source in [None, Some("project"), Some("org"), Some("organization")] {
+            let source_field = source
+                .map(|value| format!(r#""source":{value:?},"#))
+                .unwrap_or_default();
+            let json = format!(
+                r#"{{"policies":[{{"name":"cap","type":"cost_cap","mode":"enforce",
+                    {source_field}
+                    "config":{{"window":"30d_rolling","maxUsd":10.0,"action":"block"}}}}]}}"#
+            );
+            let bundle = PolicyBundle::from_json_str(&json).unwrap();
+
+            assert!(
+                bundle.validate().is_empty(),
+                "source {source:?} must remain valid"
+            );
+        }
     }
 
     #[test]

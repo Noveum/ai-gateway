@@ -1889,6 +1889,26 @@ mod tests {
     }
 
     #[test]
+    fn invalid_org_source_is_rejected_before_it_can_fall_back_to_project_scope() {
+        let e = engine(
+            r#"{"policies":[{"name":"org-cap","type":"cost_cap","mode":"enforce",
+            "failClosed":true,"source":"org ",
+            "config":{"window":"30d_rolling","maxUsd":10.0,"action":"block"}}]}"#,
+        );
+
+        assert_eq!(e.active_policy_count(), 1);
+        assert_eq!(e.rejected_policy_count(), 1);
+        let messages = e.rejected_policies();
+        assert!(messages[0].contains("invalid policy source 'org '"));
+
+        let result = e.evaluate(Phase::Input, "gpt-4o", "hello", None, None, None);
+        assert!(
+            result.is_blocked(),
+            "a fail-closed invalid org source must never compile as project scope"
+        );
+    }
+
+    #[test]
     fn fail_closed_rejection_counts_as_active_so_the_guard_still_runs() {
         // `middleware.rs` and `worker_rt.rs` skip the whole guard path when
         // `active_policy_count() == 0`. A rejection that blocks every request has
