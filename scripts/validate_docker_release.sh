@@ -11,6 +11,7 @@ repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
 docker_context_validation_tmp=""
 docker_runtime_validation_container=""
 release_provenance_validation_tmp=""
+release_image_validation_tmp=""
 
 package_version() {
   local version
@@ -144,6 +145,7 @@ self_test_release_provenance() {
 
 validate_workflow_wiring() {
   local docker_workflow provider_workflow classifier_line fetch_line provenance_line runtime_line first_publish_line
+  local last_publish_line release_images_line metadata_version_priority metadata_latest_priority
   local build_action_count revision_arg_count smoke_if_line steps_line checkout_line first_secret_line
   docker_workflow="${repository_root}/.github/workflows/docker-build.yml"
   provider_workflow="${repository_root}/.github/workflows/provider-smoke.yml"
@@ -162,6 +164,44 @@ validate_workflow_wiring() {
     (( fetch_line >= provenance_line || provenance_line >= first_publish_line || runtime_line >= first_publish_line ))
   then
     echo "Docker publication must follow runtime validation and an explicit trusted-main provenance check" >&2
+    return 1
+  fi
+
+  metadata_version_priority="$(awk '
+    /id: meta-ghcr/ { in_metadata = 1; next }
+    in_metadata && /^      - name:/ { exit }
+    in_metadata && /type=raw,value=\$\{\{ env\.CARGO_VERSION \}\},priority=[0-9]+/ {
+      line = $0
+      sub(/^.*priority=/, "", line)
+      sub(/,.*/, "", line)
+      print line
+      exit
+    }
+  ' "${docker_workflow}")"
+  metadata_latest_priority="$(awk '
+    /id: meta-ghcr/ { in_metadata = 1; next }
+    in_metadata && /^      - name:/ { exit }
+    in_metadata && /type=raw,value=latest,priority=[0-9]+/ {
+      line = $0
+      sub(/^.*priority=/, "", line)
+      sub(/,.*/, "", line)
+      print line
+      exit
+    }
+  ' "${docker_workflow}")"
+  if [[ -z "${metadata_version_priority}" || -z "${metadata_latest_priority}" ]] ||
+    (( metadata_version_priority <= metadata_latest_priority ))
+  then
+    echo "The immutable Cargo-version tag must outrank latest in GHCR metadata" >&2
+    return 1
+  fi
+
+  last_publish_line="$(grep -En 'push:[[:space:]]*true' "${docker_workflow}" | tail -n 1 | cut -d: -f1 || true)"
+  release_images_line="$(grep -n -m1 'validate_docker_release.sh release-images' "${docker_workflow}" | cut -d: -f1 || true)"
+  if [[ -z "${last_publish_line}" || -z "${release_images_line}" ]] ||
+    (( release_images_line <= last_publish_line ))
+  then
+    echo "Published release images must be anonymously pulled and validated after both registry pushes" >&2
     return 1
   fi
 
@@ -188,7 +228,8 @@ validate_workflow_wiring() {
       finish_step()
       step = $0
     }
-    /push:[[:space:]]*true/ || /\$\{\{[[:space:]]*secrets\./ { sensitive = 1 }
+    /push:[[:space:]]*true/ || /\$\{\{[[:space:]]*secrets\./ ||
+      /validate_docker_release\.sh release-images/ { sensitive = 1 }
     /if:[[:space:]]*steps\.release\.outputs\.publish[[:space:]]*==[[:space:]]*'"'"'true'"'"'/ {
       guarded = 1
     }
@@ -405,6 +446,56 @@ validate_runtime_image() {
   echo "Runtime image is healthy as UID:GID ${runtime_uid}:${runtime_gid} with revision ${revision_label} and a read-only root filesystem"
 }
 
+validate_release_images() {
+  local ghcr_image="$1"
+  local dockerhub_image="$2"
+  local expected_revision="$3"
+  local expected_version anonymous_config image
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker is required for release-image validation" >&2
+    return 1
+  fi
+  expected_version="$(package_version)"
+  for image in "${ghcr_image}" "${dockerhub_image}"; do
+    if [[ "${image}" != *":${expected_version}" ]]; then
+      echo "Release-image validation requires the immutable ${expected_version} tag, got: ${image}" >&2
+      return 1
+    fi
+  done
+
+  anonymous_config="$(mktemp -d "${TMPDIR:-/tmp}/noveum-anonymous-docker.XXXXXX")"
+  release_image_validation_tmp="${anonymous_config}"
+  cleanup_release_image_validation() {
+    case "${release_image_validation_tmp}" in
+      "${TMPDIR:-/tmp}"/noveum-anonymous-docker.*)
+        rm -rf -- "${release_image_validation_tmp}"
+        release_image_validation_tmp=""
+        ;;
+      "") ;;
+      *)
+        echo "Refusing to remove unexpected Docker config path: ${release_image_validation_tmp}" >&2
+        ;;
+    esac
+  }
+  trap cleanup_release_image_validation EXIT HUP INT TERM
+
+  for image in "${ghcr_image}" "${dockerhub_image}"; do
+    if ! docker --config "${anonymous_config}" pull --platform linux/amd64 "${image}"; then
+      echo "Release image is not anonymously pullable: ${image}" >&2
+      return 1
+    fi
+    if ! (validate_runtime_image "${image}" "${expected_revision}"); then
+      echo "Published release image failed runtime or OCI metadata validation: ${image}" >&2
+      return 1
+    fi
+  done
+
+  cleanup_release_image_validation
+  trap - EXIT HUP INT TERM
+  echo "Both versioned release images are anonymously pullable and match Cargo ${expected_version} at ${expected_revision}"
+}
+
 usage() {
   cat >&2 <<'EOF'
 Usage: scripts/validate_docker_release.sh package-version
@@ -415,6 +506,7 @@ Usage: scripts/validate_docker_release.sh package-version
        scripts/validate_docker_release.sh workflows
        scripts/validate_docker_release.sh context
        scripts/validate_docker_release.sh runtime-image IMAGE [EXPECTED_REVISION]
+       scripts/validate_docker_release.sh release-images GHCR_IMAGE DOCKERHUB_IMAGE EXPECTED_REVISION
 EOF
   return 2
 }
@@ -452,6 +544,10 @@ case "${command_name}" in
   runtime-image)
     [[ "$#" -ge 2 && "$#" -le 3 ]] || usage
     validate_runtime_image "$2" "${3:-}"
+    ;;
+  release-images)
+    [[ "$#" -eq 4 ]] || usage
+    validate_release_images "$2" "$3" "$4"
     ;;
   *)
     usage

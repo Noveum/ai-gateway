@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- GHCR release metadata now gives the immutable Cargo-version tag higher
+  priority than `latest`, so `org.opencontainers.image.version` identifies the
+  release instead of the moving alias. After both registry pushes, automation
+  uses an empty temporary Docker configuration to prove that the exact GHCR and
+  Docker Hub tags are anonymously pullable, then reruns OCI, identity,
+  hardening, and health validation on the pulled images.
+
+### Documentation
+
+- Recorded the immutable v2.0.1 GHCR caveat: its OCI version label is `latest`,
+  and anonymous access failed at the 2026-08-24 release check. The Docker Hub
+  v2.0.1 image has the correct version/revision labels. Existing v2.0.1 tags and
+  images must not be overwritten; corrected GHCR metadata requires a later
+  patch release.
+
 ## [2.0.1] - 2026-08-24
 
 ### Added

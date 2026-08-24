@@ -102,6 +102,23 @@ docker image inspect noveum-ai-gateway:candidate \
   --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }} {{ .Config.User }}'
 ```
 
+For a tag publication, CI additionally validates the actual registry artifacts
+after both pushes:
+
+```bash
+bash scripts/validate_docker_release.sh release-images \
+  "ghcr.io/noveum/ai-gateway:${NOVEUM_RELEASE_VERSION}" \
+  "noveum/noveum-ai-gateway:${NOVEUM_RELEASE_VERSION}" \
+  "${NOVEUM_RELEASE_REVISION}"
+```
+
+This command uses an empty temporary Docker configuration, so both pulls must
+work anonymously. It then checks the exact Cargo version/revision labels,
+fixed `65532:65532` identity, read-only root filesystem, and versioned health
+response. The immutable GHCR v2.0.1 artifact is a known exception: it reports
+the OCI version as `latest`, and anonymous access failed on 2026-08-24. Do not
+repush it; use Docker Hub v2.0.1 or a corrected later patch release.
+
 ## 5. Live provider matrix
 
 Use a dedicated low-budget test account, low output limits, and non-sensitive

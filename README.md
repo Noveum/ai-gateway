@@ -335,6 +335,15 @@ version and source revision and runs as the fixed unprivileged identity
 `65532:65532`. Treat the version tag as immutable and pin the verified registry
 digest for deployment; do not use `latest` as a release identity.
 
+**v2.0.1 GHCR caveat:** the image published to GHCR on 2026-08-24 has
+`org.opencontainers.image.version=latest`, and its package did not allow an
+anonymous pull during the release check. The Docker Hub `2.0.1` image has the
+correct version and revision labels. Do not overwrite or recreate either
+v2.0.1 tag; use the verified Docker Hub digest when exact container metadata is
+required, and correct GHCR through a later patch release. Making the existing
+GHCR package public can restore anonymous access without changing its digest,
+but it cannot repair the immutable v2.0.1 label.
+
 ## Security boundaries
 
 - Provider and Noveum keys are secrets. Do not log them, commit them, embed them

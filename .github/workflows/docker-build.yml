@@ -10,7 +10,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  GHCR_IMAGE: ghcr.io/noveum/ai-gateway
+  DOCKERHUB_IMAGE: noveum/noveum-ai-gateway
 
 jobs:
   docker:
@@ -108,10 +109,10 @@ jobs:
         id: meta-ghcr
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.GHCR_IMAGE }}
           tags: |
-            type=raw,value=latest
-            type=raw,value=${{ env.CARGO_VERSION }}
+            type=raw,value=${{ env.CARGO_VERSION }},priority=900
+            type=raw,value=latest,priority=200
 
       - name: Build and push to GitHub Container Registry
         if: steps.release.outputs.publish == 'true'
@@ -143,11 +144,20 @@ jobs:
           context: .
           push: true
           tags: |
-            noveum/noveum-ai-gateway:latest
-            noveum/noveum-ai-gateway:${{ env.CARGO_VERSION }}
+            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ env.DOCKERHUB_IMAGE }}:${{ env.CARGO_VERSION }}
           build-args: |
             VERSION=${{ env.CARGO_VERSION }}
             REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+
+      - name: Verify public release images from both registries
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          bash scripts/validate_docker_release.sh release-images \
+            "${GHCR_IMAGE}:${CARGO_VERSION}" \
+            "${DOCKERHUB_IMAGE}:${CARGO_VERSION}" \
+            "${GITHUB_SHA}"
