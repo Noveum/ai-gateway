@@ -442,38 +442,54 @@ name every admission block, fail-closed decision, and abandoned settlement.
 | OpenAI streaming spend remains near the reservation ceiling | `stream_options.include_usage` was stripped by something between the Worker and OpenAI, so the stream kept its estimate | Check `wrangler tail` for `abandon` settlement; Together and Fireworks use their provider-emitted terminal chunks instead of this option. |
 | `reservation … gave up after 3 attempts` in the logs | Settlement could not reach the platform | The hold expires server-side at `expiresAt` — conservatively, i.e. still counted until then. No action beyond fixing connectivity. |
 
-**Remove the bridge atomically**
+**Remove the bridge with an atomic traffic cutover**
 
-For the version-secret layout above, have the secret manager create a protected
-JSON file whose explicit `null` values delete both bindings. Omitted secrets are
-retained, so both names must be present:
+Make the change atomic **to production traffic** by creating only undeployed
+versions until the final transparent version has been inspected. Wrangler
+4.120.0 preserves secrets during `versions upload`, while each
+`versions secret delete` command creates another undeployed version from the
+latest version, as described in Cloudflare's
+[secret-management reference](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
+Serialize these commands under an operator lock—do not allow a concurrent
+upload to change what “latest” means.
 
-```json
-{
-  "NOVEUM_API_KEY": null,
-  "NOVEUM_GUARD_PROJECT_ID": null
-}
-```
-
-Wrangler 4.120.0 supports JSON `null` deletion. Create one undeployed removal
-version, record its ID, and use the same zero-percent override and promotion
-flow. The targeted smoke must show transparent provider routing and no Noveum
-control-plane calls before promotion:
+First, in the exact reviewed release checkout, remove any legacy
+`NOVEUM_GUARD_PROJECT_ID` entry from `[vars]`. Upload that configuration without
+`--keep-vars`; this removes the plain-text variable but deliberately inherits
+the secrets. Do not assign traffic to this intermediate version. Then delete
+each secret from the latest undeployed version:
 
 ```bash
-: "${NOVEUM_BRIDGE_REMOVAL_FILE:?export the protected JSON file path}"
-npx --yes wrangler@4.120.0 versions secret bulk \
-  "$NOVEUM_BRIDGE_REMOVAL_FILE" \
-  --tag novaguard-dedicated-remove \
-  --message "Stage dedicated Nova Guard bridge removal"
+npx --yes wrangler@4.120.0 versions upload \
+  --strict \
+  --tag novaguard-remove-config \
+  --message "Stage Nova Guard bridge variable removal"
 npx --yes wrangler@4.120.0 versions list --json
+: "${CONFIG_VERSION_ID:?export the just-uploaded configuration version ID}"
+npx --yes wrangler@4.120.0 versions view "$CONFIG_VERSION_ID"
+
+# Run each delete only when `versions view` identifies that name as a secret.
+npx --yes wrangler@4.120.0 versions secret delete NOVEUM_API_KEY \
+  --tag novaguard-remove-api-key \
+  --message "Stage Nova Guard API-key removal"
+npx --yes wrangler@4.120.0 versions secret delete NOVEUM_GUARD_PROJECT_ID \
+  --tag novaguard-remove-project \
+  --message "Stage Nova Guard project-secret removal"
+
+npx --yes wrangler@4.120.0 versions list --json
+: "${FINAL_VERSION_ID:?export the final removal version ID from the list}"
+npx --yes wrangler@4.120.0 versions view "$FINAL_VERSION_ID"
 ```
 
-If a legacy deployment stores `NOVEUM_GUARD_PROJECT_ID` in `[vars]`, remove that
-entry in the same reviewed version that deletes the API-key secret; do not use
-sequential `wrangler secret delete` plus `wrangler deploy` commands. Verify the
-candidate contains neither binding before assigning traffic. At no point should
-a half-applied bridge version receive production traffic.
+If a binding is not a secret in the inspected intermediate version, skip its
+`versions secret delete` command; it was removed with `[vars]`. The
+`--secrets-file` option is additive and cannot delete a secret, and
+`versions secret bulk` cannot remove a legacy `[vars]` entry, so neither is a
+one-command removal mechanism. Do not use the non-versioned `wrangler secret
+delete` command because it deploys immediately. Inspect the final version and
+verify that it contains neither binding before assigning traffic with the
+zero-percent override and promotion flow. Preview URLs must remain disabled,
+and no half-applied intermediate version may receive production traffic.
 
 ## Implemented edge behavior and verification scope
 

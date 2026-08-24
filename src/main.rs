@@ -25,7 +25,7 @@ use noveum_ai_gateway::{
 fn main() {
     // Load `.env` before tracing so `RUST_LOG` and the runtime settings are
     // available before Tokio creates any worker threads.
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),

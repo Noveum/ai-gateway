@@ -33,7 +33,7 @@ cargo test --locked --test run_integration_tests model_override_uses_
 ```
 
 These checks require no paid provider credentials. The three provider-harness
-filters select seven network-free regressions: five streaming helpers, one
+filters select eight network-free regressions: six streaming helpers, one
 request-body helper, and one model-override helper. Together they cover the
 policy engine, platform wire contract, routing helpers, and provider-aware
 terminal-usage behavior without making a live call.
@@ -130,8 +130,10 @@ failed smoke, not a pass with incomplete accounting.
 
 ### Dated post-release evidence
 
-On 2026-08-24, `https://gate.noveum.ai` passed buffered and streaming probes with
-OpenAI `gpt-4o-mini`, Anthropic `claude-haiku-4-5-20251001`, Groq
+On 2026-08-24, the transparent production Cloudflare Worker deployment v57
+(`456f0723-dfc7-4236-bdf0-cfa83daad3c3`) at `https://gate.noveum.ai` was running
+gateway v2.0.0 and passed buffered and streaming probes with OpenAI
+`gpt-4o-mini`, Anthropic `claude-haiku-4-5-20251001`, Groq
 `openai/gpt-oss-20b`, Together
 `meta-llama/Llama-3.3-70B-Instruct-Turbo`, Fireworks
 `accounts/fireworks/models/deepseek-v4-flash-0731`, Gemini
@@ -139,8 +141,10 @@ OpenAI `gpt-4o-mini`, Anthropic `claude-haiku-4-5-20251001`, Groq
 `amazon.nova-micro-v1:0` passed buffered and streaming calls, but AWS credential
 security prevented forwarding those credentials through the gateway; gateway
 Bedrock remained unverified in that live audit. Azure OpenAI is not a routable
-provider in v2.0.1. These results belong to that date, route, credential set,
-and deployment—not to future provider availability.
+provider in v2.0.1. The AWS result was a direct-provider check, not a Worker or
+v2.0.1 gateway check. None of this dated v2.0.0 evidence substitutes for the
+v2.0.1 deployment checklist below. These results belong to that date, route,
+credential set, and deployment—not to future provider availability.
 
 ## 6. Platform-managed Nova Guard
 

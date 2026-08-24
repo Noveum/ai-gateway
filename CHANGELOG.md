@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Cloudflare Worker Bedrock requests with `stream: true` now fail with a
   deterministic OpenAI-shaped HTTP 400 with
-  `error.code = "unsupported_feature"` before Nova Guard admission or AWS dispatch. Native
+  `error.code = "unsupported_feature"` before Nova Guard admission or AWS
+  dispatch. A present non-Boolean `stream` value is likewise rejected with a
+  deterministic HTTP 400 instead of being treated as buffered mode. Native
   Bedrock ConverseStream remains supported; Worker Bedrock streaming is not
   implemented and is no longer allowed to enter an invalid signing/response
   path.
@@ -63,14 +65,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   require authoritative terminal streaming usage. OpenAI and Groq request that
   usage explicitly; Together and Fireworks rely on their provider-emitted final
   chunks rather than an undocumented OpenAI option.
+- Native Bedrock event-stream decoding now uses AWS's maintained Smithy parser,
+  validates both frame checksums before translating a message to SSE, and
+  propagates corrupt-frame failures to the downstream body. This removes the
+  legacy parser chain that pulled in the unsound `lexical-core 0.7.6`.
+- Native and integration-test environment loading now uses the maintained
+  `dotenvy` fork instead of the unmaintained `dotenv 0.15.0`. Together with the
+  Bedrock parser migration, the Rust security gates now carry no explicit
+  advisory waivers.
 - The integration harness no longer falls back to the repository's production
-  `.env` when `.env.test` is absent. Hermetic CI now runs all seven network-free
+  `.env` when `.env.test` is absent. Hermetic CI now runs all eight network-free
   provider-helper regressions, including model override and provider-aware
   terminal-usage selection.
 - The Workerd suite now verifies `HEAD /` parity, cross-provider credential
-  stripping, and the complete OpenAI-shaped Worker Bedrock
-  `unsupported_feature` error envelope rather than checking only its status or
-  one field.
+  stripping, the complete OpenAI-shaped Worker Bedrock `unsupported_feature`
+  error envelope, and rejection of a non-Boolean Bedrock `stream` field rather
+  than checking only a status or one field.
 
 ### Documentation
 

@@ -12,7 +12,8 @@ use crate::error::AppError;
 use crate::routing::{validate_aws_region, BEDROCK_DEFAULT_REGION};
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
-use aws_event_stream_parser::{parse_message, Message};
+use aws_smithy_eventstream::frame::read_message_from;
+use aws_smithy_types::event_stream::Message;
 use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, Response, StatusCode},
@@ -21,7 +22,7 @@ use futures_util::StreamExt;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use uuid;
 
 /// Constants for default values
@@ -96,28 +97,17 @@ impl BedrockProvider {
 
     fn transform_bedrock_chunk(&self, chunk: Bytes) -> Result<Bytes, AppError> {
         debug!("Processing chunk of size: {}", chunk.len());
-        let mut remaining = chunk.as_ref();
-        let mut response_events = Vec::new();
-
-        while !remaining.is_empty() {
-            match self.process_message(remaining) {
-                Ok((rest, events)) => {
-                    remaining = rest;
-                    response_events.extend(events);
-                }
-                Err(e) => {
-                    debug!("Failed to parse message: {:?}", e);
-                    break;
-                }
-            }
-        }
-
+        let response_events = self.process_message(chunk.as_ref())?;
         Ok(Bytes::from(response_events.join("")))
     }
 
-    fn process_message<'a>(&self, data: &'a [u8]) -> Result<(&'a [u8], Vec<String>), AppError> {
-        let (rest, message) =
-            parse_message(data).map_err(|e| AppError::EventStreamError(e.to_string()))?;
+    fn process_message(&self, data: &[u8]) -> Result<Vec<String>, AppError> {
+        // `process_response` splits the buffered transport stream at the
+        // prelude's total-length boundary, so this slice contains exactly one
+        // complete AWS EventStream frame. The Smithy reader validates both the
+        // prelude CRC and the message CRC before exposing headers or payload.
+        let message =
+            read_message_from(data).map_err(|e| AppError::EventStreamError(e.to_string()))?;
 
         let event_type = self.get_event_type(&message);
         let events = match event_type.as_deref() {
@@ -129,23 +119,16 @@ impl BedrockProvider {
             }
         };
 
-        if !message.valid() {
-            warn!("Invalid message checksum detected");
-        }
-
-        Ok((rest, events))
+        Ok(events)
     }
 
     fn get_event_type(&self, message: &Message) -> Option<String> {
         message
-            .headers
-            .headers
+            .headers()
             .iter()
-            .find(|h| h.key == ":event-type")
-            .and_then(|h| match &h.value {
-                aws_event_stream_parser::HeaderValue::String(s) => Some(s.to_string()),
-                _ => None,
-            })
+            .find(|header| header.name().as_str() == ":event-type")
+            .and_then(|header| header.value().as_string().ok())
+            .map(|value| value.as_str().to_string())
     }
 
     /// Handles content block chunks from Bedrock and transforms them to the OpenAI streaming format.
@@ -154,7 +137,7 @@ impl BedrockProvider {
     /// For all chunks, this includes the same system_fingerprint and required OpenAI fields
     /// for compatibility with OpenAI SDKs.
     fn handle_content_block(&self, message: &Message) -> Result<Vec<String>, AppError> {
-        let body_str = String::from_utf8(message.body.to_vec())?;
+        let body_str = String::from_utf8(message.payload().to_vec())?;
         let json: Value = serde_json::from_str(&body_str)?;
 
         if let Some(delta) = json
@@ -175,7 +158,7 @@ impl BedrockProvider {
     /// The final chunk includes usage information and a finish_reason of "stop".
     /// This also includes the [DONE] marker required by OpenAI's streaming protocol.
     fn handle_metadata(&self, message: &Message) -> Result<Vec<String>, AppError> {
-        let body_str = String::from_utf8(message.body.to_vec())?;
+        let body_str = String::from_utf8(message.payload().to_vec())?;
         let json: Value = serde_json::from_str(&body_str)?;
 
         if let Some(usage) = json.get("usage") {
@@ -812,17 +795,17 @@ mod tests {
 
     #[tokio::test]
     async fn native_event_stream_reassembles_transport_fragmented_messages() {
-        use aws_event_stream_parser::{Header, HeaderBlock};
+        use aws_smithy_eventstream::frame::write_message_to;
+        use aws_smithy_types::event_stream::{Header, HeaderValue};
 
         fn event(kind: &str, body: Value) -> Vec<u8> {
-            Message::build(
-                HeaderBlock {
-                    headers: vec![Header::from_pair(":event-type", kind)],
-                },
-                serde_json::to_vec(&body).unwrap(),
-            )
-            .as_buffer()
-            .to_vec()
+            let message = Message::new(serde_json::to_vec(&body).unwrap()).add_header(Header::new(
+                ":event-type",
+                HeaderValue::String(kind.to_string().into()),
+            ));
+            let mut buffer = Vec::new();
+            write_message_to(&message, &mut buffer).unwrap();
+            buffer
         }
 
         let provider = BedrockProvider::new();
@@ -861,6 +844,68 @@ mod tests {
             .expect("the terminal metadata frame must settle the reservation");
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn native_event_stream_rejects_a_corrupt_message_checksum() {
+        use aws_smithy_eventstream::frame::write_message_to;
+        use aws_smithy_types::event_stream::{Header, HeaderValue};
+
+        let message =
+            Message::new(serde_json::to_vec(&json!({"delta": {"text": "must-not-pass"}})).unwrap())
+                .add_header(Header::new(
+                    ":event-type",
+                    HeaderValue::String("contentBlockDelta".into()),
+                ));
+        let mut wire = Vec::new();
+        write_message_to(&message, &mut wire).unwrap();
+        *wire.last_mut().expect("message checksum") ^= 0x01;
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/vnd.amazon.eventstream")
+            .body(Body::from(wire))
+            .unwrap();
+
+        let transformed = BedrockProvider::new()
+            .process_response(response)
+            .await
+            .unwrap();
+        axum::body::to_bytes(transformed.into_body(), usize::MAX)
+            .await
+            .expect_err("a corrupt AWS EventStream checksum must fail the downstream body");
+    }
+
+    #[tokio::test]
+    async fn native_event_stream_rejects_a_corrupt_prelude_checksum() {
+        use aws_smithy_eventstream::frame::write_message_to;
+        use aws_smithy_types::event_stream::{Header, HeaderValue};
+
+        let message =
+            Message::new(serde_json::to_vec(&json!({"delta": {"text": "must-not-pass"}})).unwrap())
+                .add_header(Header::new(
+                    ":event-type",
+                    HeaderValue::String("contentBlockDelta".into()),
+                ));
+        let mut wire = Vec::new();
+        write_message_to(&message, &mut wire).unwrap();
+        // Bytes 8..12 are the prelude CRC. Keep total_len intact so the outer
+        // frame splitter reaches the Smithy checksum validation path.
+        wire[11] ^= 0x01;
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/vnd.amazon.eventstream")
+            .body(Body::from(wire))
+            .unwrap();
+
+        let transformed = BedrockProvider::new()
+            .process_response(response)
+            .await
+            .unwrap();
+        axum::body::to_bytes(transformed.into_body(), usize::MAX)
+            .await
+            .expect_err("a corrupt AWS EventStream prelude checksum must fail the downstream body");
     }
 
     #[test]

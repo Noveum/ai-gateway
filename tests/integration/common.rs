@@ -1,4 +1,4 @@
-use dotenv::from_filename;
+use dotenvy::from_filename;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::{
@@ -74,6 +74,32 @@ impl ProviderTestConfig {
 #[cfg(test)]
 mod config_tests {
     use super::ProviderTestConfig;
+    use std::{env, fs};
+
+    #[test]
+    fn dotenvy_from_filename_loads_values_without_overriding_the_process() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+        let file_key = format!("NOVEUM_DOTENVY_FILE_{suffix}");
+        let process_key = format!("NOVEUM_DOTENVY_PROCESS_{suffix}");
+        let path = env::temp_dir().join(format!("noveum-dotenvy-{suffix}.env"));
+
+        env::remove_var(&file_key);
+        env::set_var(&process_key, "from-process");
+        fs::write(
+            &path,
+            format!("{file_key}=from-file\n{process_key}=from-file\n"),
+        )
+        .unwrap();
+
+        dotenvy::from_filename(&path).unwrap();
+
+        assert_eq!(env::var(&file_key).unwrap(), "from-file");
+        assert_eq!(env::var(&process_key).unwrap(), "from-process");
+
+        env::remove_var(file_key);
+        env::remove_var(process_key);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn model_override_uses_only_a_non_empty_environment_value() {
@@ -331,7 +357,7 @@ pub async fn run_non_streaming_test(config: &ProviderTestConfig) {
 struct StreamingSmokeState {
     data_chunks: Vec<Value>,
     saw_done: bool,
-    saw_usage: bool,
+    latest_data_has_usage: bool,
 }
 
 impl StreamingSmokeState {
@@ -346,7 +372,7 @@ impl StreamingSmokeState {
         }
         if let Some(json_str) = line.strip_prefix("data: ") {
             if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                self.saw_usage |= json.get("usage").is_some_and(|usage| {
+                self.latest_data_has_usage = json.get("usage").is_some_and(|usage| {
                     usage.get("prompt_tokens").and_then(Value::as_u64).is_some()
                         && usage
                             .get("completion_tokens")
@@ -365,7 +391,7 @@ impl StreamingSmokeState {
         if !self.saw_done {
             return Err("Streaming response ended without the required data: [DONE] marker");
         }
-        if !self.saw_usage {
+        if !self.latest_data_has_usage {
             return Err("Streaming response ended without terminal token usage");
         }
         Ok(())
@@ -472,6 +498,21 @@ mod tests {
         let message = state
             .validate_complete()
             .expect_err("a stream without terminal usage must fail the smoke test");
+        assert!(message.contains("usage"), "unexpected failure: {message}");
+    }
+
+    #[test]
+    fn streaming_smoke_requires_usage_on_the_final_data_event() {
+        let mut state = StreamingSmokeState::default();
+        state.process_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
+        );
+        state.process_line(r#"data: {"choices":[{"delta":{"content":"late"}}]}"#);
+        state.process_line("data: [DONE]");
+
+        let message = state
+            .validate_complete()
+            .expect_err("usage on an earlier event must not satisfy terminal usage");
         assert!(message.contains("usage"), "unexpected failure: {message}");
     }
 

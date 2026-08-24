@@ -117,12 +117,13 @@ hyper = { version = "0.14", features = ["client", "runtime"] }
 tower-http = { version = "0.6.2", features = ["cors", "compression-full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 reqwest = { version = "0.12.9", features = ["stream", "json", "rustls-tls", "http2", "gzip", "brotli"], default-features = false }
-dotenv = "0.15"
+dotenvy = "0.15.7"
 async-trait = "0.1"
 num_cpus = "1.15"
 aws-sigv4 = "1.2.5"
 aws-credential-types = "1.2.1"
-aws_event_stream_parser = "0.1.2"
+aws-smithy-eventstream = "0.61.2"
+aws-smithy-types = "1.6.2"
 parking_lot = "0.12"
 colored = "2.1.0"
 tiktoken-rs = "0.12"           # token counting (native); wasm uses a char heuristic
@@ -143,7 +144,7 @@ uuid = { version = "1.15.1", features = ["js"] }   # v4 randomness on wasm
 [dev-dependencies]
 noveum-ai-gateway = { path = "." }
 uuid = { version = "1.15.1", features = ["serde", "v4"] }
-dotenv = "0.15"
+dotenvy = "0.15.7"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 reqwest = { version = "0.12.9", features = ["stream", "json", "rustls-tls", "http2", "gzip", "brotli"], default-features = false }
 serde_json = "1.0"

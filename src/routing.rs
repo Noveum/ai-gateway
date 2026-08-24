@@ -1974,11 +1974,16 @@ pub fn openai_to_anthropic_messages_with_assumed_output_tokens(
 /// `stream: true` there would silently violate the caller's transport contract.
 /// Keep this check shared and target-independent so its behavior is unit tested.
 pub fn validate_worker_bedrock_request(body: &Value) -> Result<(), String> {
-    if body.get("stream").and_then(Value::as_bool) == Some(true) {
-        return Err(
-            "Bedrock streaming is not supported by the Cloudflare Worker; use the native gateway for ConverseStream or omit stream for buffered Converse"
-                .to_string(),
-        );
+    if let Some(stream) = body.get("stream") {
+        let stream = stream
+            .as_bool()
+            .ok_or_else(|| "Bedrock stream must be a Boolean when present".to_string())?;
+        if stream {
+            return Err(
+                "Bedrock streaming is not supported by the Cloudflare Worker; use the native gateway for ConverseStream or omit stream for buffered Converse"
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -4102,6 +4107,12 @@ mod tests {
         });
         assert!(validate_worker_bedrock_request(&buffered).is_ok());
 
+        let omitted = json!({
+            "model": "amazon.nova-micro-v1:0",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        assert!(validate_worker_bedrock_request(&omitted).is_ok());
+
         let streaming = json!({
             "model": "amazon.nova-micro-v1:0",
             "stream": true,
@@ -4110,6 +4121,17 @@ mod tests {
         let error = validate_worker_bedrock_request(&streaming).unwrap_err();
         assert!(error.contains("Cloudflare Worker"), "{error}");
         assert!(error.contains("stream"), "{error}");
+
+        for invalid_stream in [json!("true"), json!(1), json!(null), json!({})] {
+            let invalid = json!({
+                "model": "amazon.nova-micro-v1:0",
+                "stream": invalid_stream,
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let error = validate_worker_bedrock_request(&invalid)
+                .expect_err("a present non-Boolean stream field must be rejected");
+            assert!(error.contains("Boolean"), "{error}");
+        }
     }
 
     #[test]

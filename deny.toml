@@ -26,20 +26,17 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # `unmaintained` and `unsound` both default to "workspace", which only looks at
 # our own direct dependencies. Both are widened to "all" so a problem that
 # arrives deep in the transitive tree still fails the build: that is exactly
-# where this kind of rot goes unnoticed. (Without this, RUSTSEC-2023-0086 below
-# is silently skipped.)
+# where this kind of rot goes unnoticed. Without this, a transitive soundness
+# advisory can be silently skipped.
 unmaintained = "all"
 unsound = "all"
 # A yanked dependency means the lockfile pins something the publisher pulled.
 yanked = "deny"
 
-# Waivers. Every entry needs a reason and a way out — an unexplained ID here
-# turns the gate into decoration. Neither of the two below has a fix that is
-# available today; both are tracked as follow-up work (NOV-102 follow-ups).
-ignore = [
-    { id = "RUSTSEC-2021-0141", reason = "dotenv 0.15.0 is unmaintained. It is a direct dependency (Cargo.toml, cfg(not(wasm32))) used only to load a .env file at startup; it parses a local, operator-supplied file, not untrusted input, and the advisory reports no vulnerability. The fix is to migrate to the maintained `dotenvy` fork, which is a near drop-in rename and touches src/ — deliberately out of scope for the lockfile/supply-chain change. FOLLOW-UP: migrate to dotenvy and delete this waiver." },
-    { id = "RUSTSEC-2023-0086", reason = "lexical-core 0.7.6 has multiple soundness issues, patched in >= 1.0.0. We do not depend on it directly: it arrives transitively via aws_event_stream_parser 0.1.2 -> nom 5.1.3, and nom only moved off lexical-core in 7.x. No upgrade of our own dependencies resolves it, so the real fix is replacing or forking aws_event_stream_parser (it is used for AWS Bedrock event-stream decoding). FOLLOW-UP: re-check when aws_event_stream_parser publishes a nom 7+ release, then delete this waiver." },
-]
+# No advisory waivers. Any future entry needs a documented reason, bounded
+# runtime scope, owner, and removal condition; an unexplained ID here turns the
+# gate into decoration.
+ignore = []
 
 [licenses]
 # Explicit allow-list derived from the actual dependency tree, not a template.

@@ -929,6 +929,21 @@ BEDROCK_STREAM_STATUS="$(curl -sS --max-time 30 -D "$BEDROCK_STREAM_HEADERS" \
   && grep -q 'Cloudflare Worker' "$BEDROCK_STREAM_BODY" \
   && pass "Worker Bedrock streaming is rejected explicitly before admission" \
   || { fail "Worker Bedrock streaming should return HTTP 400 unsupported_feature"; sed 's/^/      /' "$BEDROCK_STREAM_BODY"; }
+BEDROCK_STREAM_TYPE_BODY="$TMP/p9-strict-bedrock-stream-type.body"
+BEDROCK_STREAM_TYPE_STATUS="$(curl -sS --max-time 30 -o "$BEDROCK_STREAM_TYPE_BODY" -w '%{http_code}' \
+  "http://127.0.0.1:$GATEWAY_PORT/v1/chat/completions" \
+  -H 'x-provider: bedrock' \
+  -H 'x-aws-access-key-id: AKIATEST' \
+  -H 'x-aws-secret-access-key: worker-test-secret' \
+  -H 'x-aws-region: us-east-1' \
+  -H 'content-type: application/json' \
+  --data-binary '{"model":"global.anthropic.claude-sonnet-4-5-20250929-v1:0","stream":"false","max_tokens":64,"messages":[{"role":"user","content":"bounded"}]}'
+)" || BEDROCK_STREAM_TYPE_STATUS="transport_error"
+[ "$BEDROCK_STREAM_TYPE_STATUS" = "400" ] \
+  && grep -q '"type":"invalid_request_error"' "$BEDROCK_STREAM_TYPE_BODY" \
+  && grep -q 'Boolean' "$BEDROCK_STREAM_TYPE_BODY" \
+  && pass "Worker rejects a non-Boolean Bedrock stream field before admission" \
+  || { fail "Worker non-Boolean Bedrock stream should return HTTP 400"; sed 's/^/      /' "$BEDROCK_STREAM_TYPE_BODY"; }
 BEDROCK_REGION_BODY="$TMP/p9-strict-bedrock-region.body"
 BEDROCK_REGION_HEADERS="$TMP/p9-strict-bedrock-region.headers"
 BEDROCK_REGION_STATUS="$(curl -sS --max-time 30 -D "$BEDROCK_REGION_HEADERS" \

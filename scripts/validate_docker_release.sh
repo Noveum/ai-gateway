@@ -2,7 +2,11 @@
 
 set -euo pipefail
 
+# CDPATH= is an intentional one-command prefix.
+# shellcheck disable=SC1007
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# CDPATH= is an intentional one-command prefix.
+# shellcheck disable=SC1007
 repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
 docker_context_validation_tmp=""
 docker_runtime_validation_container=""
@@ -379,7 +383,8 @@ validate_runtime_image() {
 
   body=""
   for _attempt in {1..60}; do
-    if body="$(curl --fail --silent --show-error "http://127.0.0.1:${host_port}/health" 2>/dev/null)"; then
+    if body="$(curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+      "http://127.0.0.1:${host_port}/health" 2>/dev/null)"; then
       break
     fi
     if [[ "$(docker inspect --format '{{.State.Running}}' "${container_name}" 2>/dev/null || true)" != "true" ]]; then

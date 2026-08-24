@@ -30,7 +30,7 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn new() -> Self {
         info!("Loading environment configuration");
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
 
         // Optimize thread count based on CPU cores
         let cpu_count = num_cpus::get();

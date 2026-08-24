@@ -64,11 +64,19 @@ for changes to
 
 ### 1. Install and start
 
-Rust 1.94.1 or newer is required.
+Rust 1.94.1 or newer is required. Choose the registry package after the release
+is published, or build a reviewed source checkout directly.
 
 ```bash
+# Registry installation (available after v2.0.1 is published)
 cargo install noveum-ai-gateway --version 2.0.1 --locked
 RUST_LOG=info noveum-ai-gateway
+```
+
+```bash
+# Reviewed source checkout (also works before registry publication)
+cargo build --release --locked
+RUST_LOG=info ./target/release/noveum-ai-gateway
 ```
 
 The native server listens on `http://127.0.0.1:3000` by default and honors
