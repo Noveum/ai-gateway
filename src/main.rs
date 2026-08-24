@@ -393,8 +393,7 @@ async fn print_banner() {
     }
     println!("\r    Starting Noveum AI Gateway ✓  \n");
 
-    println!(
-        "{}",
+    let banner = format!(
         r#"
 
      _   _
@@ -403,11 +402,12 @@ async fn print_banner() {
     | |\  | (_) \ V /  __/ |_| | | | | | |
     |_| \_|\___/ \_/ \___|\__,_|_| |_| |_|
 
-             AI Gateway v1.0.0
+             AI Gateway v{}
     ========================================
-    "#
-        .bright_cyan()
+    "#,
+        env!("CARGO_PKG_VERSION")
     );
+    println!("{}", banner.bright_cyan());
 
     println!("{}", "🚀 Starting Noveum AI Gateway...".bright_green());
     println!(
