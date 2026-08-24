@@ -18,10 +18,17 @@ mod signing;
 pub async fn proxy_request_to_provider(
     config: Arc<AppConfig>,
     provider_name: &str,
-    mut original_request: Request<Body>,
+    original_request: Request<Body>,
 ) -> Result<Response<Body>, AppError> {
     let provider = create_provider(provider_name)?;
+    proxy_request_with_provider(config, provider, original_request).await
+}
 
+async fn proxy_request_with_provider(
+    config: Arc<AppConfig>,
+    provider: Box<dyn Provider>,
+    mut original_request: Request<Body>,
+) -> Result<Response<Body>, AppError> {
     // Extract body bytes
     let body = std::mem::replace(original_request.body_mut(), Body::empty());
     let body_bytes = to_bytes(body, usize::MAX)
@@ -52,20 +59,23 @@ pub async fn proxy_request_to_provider(
 
     // Handle AWS signing if required
     let final_headers = if provider.requires_signing() {
-        if let Some((access_key, secret_key, region)) = provider.get_signing_credentials(&headers) {
-            signing::sign_aws_request(
-                original_request.method().as_str(),
-                &url,
-                &prepared_body,
-                &access_key,
-                &secret_key,
-                &region,
-                "bedrock",
-            )
-            .await?
-        } else {
-            headers
-        }
+        let (access_key, secret_key, region) = provider
+            .get_signing_credentials(&headers)
+            .ok_or(AppError::MissingApiKey)?;
+        let session_token = headers
+            .get("x-aws-session-token")
+            .and_then(|value| value.to_str().ok());
+        signing::sign_aws_request(
+            original_request.method().as_str(),
+            &url,
+            &prepared_body,
+            &access_key,
+            &secret_key,
+            session_token,
+            &region,
+            "bedrock",
+        )
+        .await?
     } else {
         headers
     };
@@ -184,6 +194,204 @@ async fn process_response(
     }
 
     Ok(response_builder.body(Body::from_stream(stream)).unwrap())
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::proxy_request_with_provider;
+    use crate::{
+        config::AppConfig,
+        error::AppError,
+        providers::{BedrockProvider, Provider},
+    };
+    use async_trait::async_trait;
+    use axum::{
+        body::Body,
+        http::{HeaderMap, HeaderValue, Request, Response},
+    };
+    use std::{sync::Arc, time::Duration};
+    use tokio::{net::TcpListener, time::timeout};
+
+    struct LoopbackSigningProvider {
+        base_url: String,
+        credential_parser: BedrockProvider,
+    }
+
+    #[async_trait]
+    impl Provider for LoopbackSigningProvider {
+        fn base_url(&self) -> String {
+            self.base_url.clone()
+        }
+
+        fn name(&self) -> &str {
+            "loopback-signing-test"
+        }
+
+        fn process_headers(&self, headers: &HeaderMap) -> Result<HeaderMap, AppError> {
+            Ok(headers.clone())
+        }
+
+        fn requires_signing(&self) -> bool {
+            true
+        }
+
+        fn get_signing_credentials(&self, headers: &HeaderMap) -> Option<(String, String, String)> {
+            self.credential_parser.get_signing_credentials(headers)
+        }
+
+        async fn process_response(
+            &self,
+            response: Response<Body>,
+        ) -> Result<Response<Body>, AppError> {
+            Ok(response)
+        }
+    }
+
+    async fn assert_bedrock_credentials_fail_without_dispatch(
+        access_key: Option<HeaderValue>,
+        secret_key: Option<HeaderValue>,
+    ) {
+        // Route any erroneous fallback into a controlled loopback listener. A
+        // correct credential failure returns before the HTTP client can connect.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dispatch_probe = tokio::spawn(async move {
+            timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-aws-region", "us-east-1")
+            .body(Body::from(
+                r#"{"model":"amazon.nova-micro-v1:0","messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#,
+            ))
+            .unwrap();
+        if let Some(value) = access_key {
+            request.headers_mut().insert("x-aws-access-key-id", value);
+        }
+        if let Some(value) = secret_key {
+            request
+                .headers_mut()
+                .insert("x-aws-secret-access-key", value);
+        }
+
+        let result = timeout(
+            Duration::from_secs(2),
+            proxy_request_with_provider(
+                Arc::new(AppConfig {
+                    port: 0,
+                    host: "127.0.0.1".to_string(),
+                    worker_threads: 1,
+                    max_connections: 1,
+                }),
+                Box::new(LoopbackSigningProvider {
+                    base_url: format!("https://127.0.0.1:{port}"),
+                    credential_parser: BedrockProvider::new(),
+                }),
+                request,
+            ),
+        )
+        .await
+        .expect("credential validation must finish locally");
+        let dispatched = dispatch_probe.await.unwrap();
+
+        match result {
+            Err(AppError::MissingApiKey) => {}
+            Err(error) => panic!("expected a credential error, got {error}"),
+            Ok(_) => panic!("missing Bedrock credentials were accepted"),
+        }
+        assert!(!dispatched, "credential failure reached the network client");
+    }
+
+    #[tokio::test]
+    async fn missing_bedrock_access_or_secret_fails_before_network_dispatch() {
+        let valid_access = HeaderValue::from_static("AKIDEXAMPLE");
+        let valid_secret = HeaderValue::from_static("secret-example");
+
+        assert_bedrock_credentials_fail_without_dispatch(None, Some(valid_secret.clone())).await;
+        assert_bedrock_credentials_fail_without_dispatch(Some(valid_access), None).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_bedrock_access_or_secret_fails_before_network_dispatch() {
+        let valid_access = HeaderValue::from_static("AKIDEXAMPLE");
+        let valid_secret = HeaderValue::from_static("secret-example");
+        let malformed = [
+            HeaderValue::from_static(""),
+            HeaderValue::from_static("   "),
+            HeaderValue::from_bytes(&[0x80]).unwrap(),
+        ];
+
+        for value in malformed.iter().cloned() {
+            assert_bedrock_credentials_fail_without_dispatch(
+                Some(value),
+                Some(valid_secret.clone()),
+            )
+            .await;
+        }
+        for value in malformed {
+            assert_bedrock_credentials_fail_without_dispatch(
+                Some(valid_access.clone()),
+                Some(value),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_shaped_bedrock_region_fails_before_network_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dispatch_probe = tokio::spawn(async move {
+            timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("x-aws-access-key-id", "AKIDEXAMPLE")
+            .header("x-aws-secret-access-key", "secret-example")
+            .header(
+                "x-aws-region",
+                format!("us-east-1.amazonaws.com@127.0.0.1:{port}"),
+            )
+            .body(Body::from(
+                r#"{"model":"amazon.nova-micro-v1:0","messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#,
+            ))
+            .unwrap();
+
+        let result = timeout(
+            Duration::from_secs(2),
+            proxy_request_with_provider(
+                Arc::new(AppConfig {
+                    port: 0,
+                    host: "127.0.0.1".to_string(),
+                    worker_threads: 1,
+                    max_connections: 1,
+                }),
+                Box::new(BedrockProvider::new()),
+                request,
+            ),
+        )
+        .await
+        .expect("region validation must finish locally");
+        let dispatched = dispatch_probe.await.unwrap();
+
+        match result {
+            Err(AppError::RequestError(message)) => {
+                assert!(message.contains("x-aws-region"), "{message}");
+            }
+            Err(error) => panic!("expected a region validation error, got {error}"),
+            Ok(_) => panic!("authority-shaped Bedrock region was accepted"),
+        }
+        assert!(!dispatched, "invalid region reached the network client");
+    }
 }
 
 #[cfg(test)]

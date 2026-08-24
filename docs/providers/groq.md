@@ -9,17 +9,15 @@ capability the upstream model lacks.
 
 ## Model availability
 
-The runnable examples and integration tests use `openai/gpt-oss-20b`, a Groq
-production model with a 131,072-token context window and 65,536 maximum output
-tokens. Groq changes production and preview availability independently of this
-gateway. Do not copy a frozen list from this repository; use Groq's
+The runnable examples and integration tests use `openai/gpt-oss-20b`, which
+passed buffered and streaming production probes on **2026-08-24**. Groq changes
+production and preview availability independently of this gateway. Do not copy
+a frozen list from this repository; use Groq's
 [current model table](https://console.groq.com/docs/models) and
 [deprecation history](https://console.groq.com/docs/deprecations), or query
 Groq's authenticated `/openai/v1/models` endpoint.
 
-Groq retired `llama-3.1-8b-instant` for affected plans on August 16, 2026 and
-names `openai/gpt-oss-20b` as its replacement. The examples below therefore do
-not use the older Llama, Mixtral, or preview slugs.
+The dated probe is not a guarantee of future model availability or limits.
 
 ## Configuration
 
@@ -130,13 +128,19 @@ async function main() {
 const stream = await client.chat.completions.create({
   model: "openai/gpt-oss-20b",
   messages: [{ role: "user", content: "Hello!" }],
-  stream: true
+  max_tokens: 64,
+  stream: true,
+  stream_options: { include_usage: true }
 });
 
 for await (const chunk of stream) {
   process.stdout.write(chunk.choices[0]?.delta?.content || '');
 }
 ```
+
+The terminal usage chunk can have an empty `choices` array. Requesting it is
+required for authoritative streaming settlement; the dated provider smoke
+requires both that usage and the final `[DONE]` marker.
 
 ## Response Format
 ```json

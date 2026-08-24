@@ -8,7 +8,7 @@
 //! Crypto `SubtleCrypto` API. The module is compiled on both targets so the
 //! algorithm is unit-tested in native CI.
 //!
-//! Unlike the native path, this supports **temporary credentials**: an
+//! Like the native path, this supports **temporary credentials**: an
 //! `x-amz-security-token` is signed + sent when a session token is present.
 
 use hmac::{Hmac, Mac};

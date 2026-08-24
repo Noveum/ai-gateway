@@ -1,74 +1,78 @@
 # Contributing to Noveum AI Gateway
 
-Thank you for considering contributing to the Noveum AI Gateway! We welcome contributions from the community to help improve and expand the project. This document outlines the process for contributing and provides some guidelines to ensure a smooth collaboration.
+Contributions are welcome. Start with a GitHub issue or discussion when a
+change affects the public API, provider compatibility, policy behavior,
+pricing, tenancy, or deployment security; those contracts need agreement before
+implementation.
 
-## Getting Started
+## Set up
 
-1. **Familiarize Yourself with the Project**: 
-   - Read the [README.md](../README.md) to understand the project's purpose, features, and setup instructions.
-   - Explore the codebase to get a sense of the project's structure and coding style.
+The minimum supported Rust version is 1.94.1. Worker changes also require Node
+22+, the `wasm32-unknown-unknown` target, pinned `worker-build 0.8.5`, and
+Wrangler 4.120.0.
 
-2. **Check Open Issues**:
-   - Visit the [GitHub Issues](https://github.com/Noveum/ai-gateway/issues) page to see if there are any existing issues you can help with.
-   - Feel free to comment on issues if you need more information or want to express interest in working on them.
+```bash
+git clone https://github.com/Noveum/ai-gateway.git
+cd ai-gateway
+git switch -c feature/short-description
+cargo metadata --locked --format-version 1 >/dev/null
+cargo test --locked --lib
+```
 
-3. **Fork the Repository**:
-   - Create a fork of the repository to work on your changes.
+Read the [documentation index](README.md), the relevant provider/architecture
+guide, and [the v2 migration notes](MIGRATING_TO_V2.md) before changing a public
+type or behavior.
 
-4. **Clone Your Fork**:
-   - Clone your fork to your local machine using `git clone`.
+## Make the change
 
-## Making Changes
+- Keep provider behavior explicit. Do not claim upstream capabilities the
+  adapter does not translate or a live account has not verified.
+- Preserve transparent proxy compatibility unless a documented strict policy
+  contract requires a narrower request shape.
+- Fail visibly on guard configuration that would otherwise look enabled while
+  enforcing nothing.
+- Never add real credentials, `.env` files, production payloads, or secret
+  values to fixtures/logs.
+- Update `CHANGELOG.md` for user-visible behavior and link rather than
+  duplicating an existing authoritative guide.
+- Pricing changes start in `pricing/catalog.json`, must cite a primary provider
+  source, bump the catalog version, update every runtime mirror, and add exact
+  parity/boundary tests. See [Pricing](PRICING.md#updating-prices).
 
-1. **Create a Branch**:
-   - Create a new branch for your changes using `git checkout -b feature/your-feature-name`.
+## Validate
 
-2. **Write Clear, Concise, and Idiomatic Code**:
-   - Follow Rust's naming conventions and best practices.
-   - Ensure your code is modular and well-organized.
+Run the checks relevant to the change. The complete commands and live-test
+rules are in [Validation](VALIDATION.md). The minimum Rust gate is:
 
-3. **Test Your Code**:
-   - Write unit tests for new features or bug fixes.
-   - Run `cargo test` to ensure all tests pass.
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --lib
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+git diff --check
+```
 
-4. **Document Your Changes**:
-   - Update documentation if your changes affect usage or setup.
-   - Add comments to your code where necessary for clarity.
+Worker changes also need the wasm check, pinned release bundle, Wrangler
+dry-run, and 13-phase workerd suite. A mocked test is not a claim that a paid
+provider or production deployment passed; record live coverage and omissions
+separately.
 
-## Future Work and Improvement Areas
+## Open the pull request
 
-Here are some areas where contributions would be particularly valuable:
+Include:
 
-1. **Implementing Prometheus Metrics Exporter**:
-   - Develop a well-tested Prometheus exporter for the telemetry system
-   - Implement appropriate metrics collection for AI request tracking
-   - Ensure compatibility with standard Prometheus monitoring setups
-   - Add documentation for Prometheus integration
+- the problem and intended user-visible outcome;
+- security, tenancy, pricing, and compatibility implications;
+- exact commands/results and the tested commit SHA;
+- live providers/runtimes tested, with explicit “not tested” entries;
+- rollout and rollback plan for deployment-affecting changes; and
+- documentation/changelog updates.
 
-2. **Additional Improvement Areas**:
-   - Performance optimizations for high-traffic deployments
-   - Support for additional AI providers
-   - Enhanced error handling and retry mechanisms
-   - Improved documentation and examples
+Keep the branch focused, address review feedback with tests where practical,
+and rerun exact-head checks after the final change.
 
-## Submitting a Pull Request
+## Releases and roadmap
 
-1. **Push Your Changes**:
-   - Push your branch to your fork using `git push origin feature/your-feature-name`.
-
-2. **Create a Pull Request**:
-   - Go to the original repository and click on "New Pull Request".
-   - Select your branch and provide a detailed description of your changes.
-
-3. **Be Detailed in Your PR Description**:
-   - Clearly explain the purpose of your changes.
-   - Reference any related issues or discussions.
-   - Include any relevant screenshots or logs if applicable.
-
-4. **Address Feedback**:
-   - Be responsive to feedback and make necessary changes.
-   - Engage in discussions to clarify any questions or concerns.
-
-## Thank You!
-
-Your contributions are greatly appreciated and help make Noveum AI Gateway better for everyone. We look forward to your input and collaboration! 
+Maintainers publish only reviewed, clean `main` commits using the immutable
+[release procedure](RELEASING.md). Candidate ideas belong in an issue; the
+[roadmap](TODO.md) lists known gaps but is not a release promise.

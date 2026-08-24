@@ -23,10 +23,15 @@ API key>`. Token usage and per-request cost are extracted from the standard
 | `openrouter` | `https://openrouter.ai/api/v1` | `Bearer $OPENROUTER_API_KEY` | https://openrouter.ai/models |
 | `perplexity` | `https://api.perplexity.ai` | `Bearer $PERPLEXITY_API_KEY` | https://docs.perplexity.ai/guides/model-cards |
 
-> Pricing note: OpenRouter is a meta-router; the gateway prices a request only
-> when the upstream model id it returns is present in the pricing table.
-> Perplexity's per-request search fees are billed by Perplexity and are not
-> represented in the token cost.
+> Pricing note: OpenRouter is a meta-router. A returned model that matches the
+> catalog is priced normally; an unmatched model receives the conservative
+> assumed-model rate rather than $0. Perplexity's reported search count/context
+> tier is represented as a separate tool fee when it maps to a catalogued row.
+> These remain policy estimates, not provider invoices.
+
+Azure OpenAI is not a configured route in v2.0.1 on either the native gateway
+or Cloudflare Worker. Do not use `x-provider: azure`/`azure_openai` and assume
+that pricing-parser recognition creates a routable provider.
 
 ## Example (cURL)
 
@@ -37,13 +42,21 @@ curl http://localhost:3000/v1/chat/completions \
   -H "x-provider: google" \
   -H "Authorization: Bearer $GEMINI_API_KEY" \
   -d '{
-    "model": "gemini-2.5-flash",
+    "model": "gemini-2.5-flash-lite",
     "messages": [{"role": "user", "content": "Hello!"}],
     "max_tokens": 200
   }'
 ```
 
+`gemini-2.5-flash-lite` passed buffered and streaming production probes on
+**2026-08-24**. `openrouter/free` passed the same transparent routing matrix.
+These are dated proofs, not evergreen model inventories.
+
 Switch provider by changing `x-provider`, the API key, and the `model`:
+
+The DeepSeek request below illustrates that mechanical switch; DeepSeek was
+not part of the dated production matrix above. Verify the model ID and account
+access against DeepSeek before running it.
 
 ```bash
 # DeepSeek
@@ -51,7 +64,7 @@ curl http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "x-provider: deepseek" \
   -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-  -d '{"model": "deepseek-chat", "messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{"model": "deepseek-chat", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 64}'
 ```
 
 ## Example (OpenAI SDK)
@@ -60,14 +73,15 @@ curl http://localhost:3000/v1/chat/completions \
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  apiKey: process.env.XAI_API_KEY,
+  apiKey: process.env.GEMINI_API_KEY,
   baseURL: "http://localhost:3000/v1",
-  defaultHeaders: { "x-provider": "xai" },
+  defaultHeaders: { "x-provider": "gemini" },
 });
 
 const completion = await client.chat.completions.create({
-  model: "grok-4.3",
+  model: "gemini-2.5-flash-lite",
   messages: [{ role: "user", content: "Hello!" }],
+  max_tokens: 64,
 });
 console.log(completion.choices[0].message);
 ```
@@ -79,7 +93,8 @@ Add the tracking headers to tag the per-request metrics: `x-project-id`,
 
 ## Implementation
 
-All of these are constructed by `openai_compatible(name)` in
-`src/providers/mod.rs` and served by `OpenAICompatibleProvider`. Adding another
-OpenAI-compatible vendor is a one-line addition there (name, base URL, and
-whether to strip the leading `/v1`).
+The native factory is `openai_compatible(name)` in `src/providers/mod.rs`; the
+shared/Worker route table is `routing::resolve_provider`. Adding a provider must
+update both tables, authentication/path behavior, metrics/pricing coverage,
+Worker and native tests, and this guide. A pricing-parser name alone does not
+make a provider routable.

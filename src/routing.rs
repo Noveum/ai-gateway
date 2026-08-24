@@ -14,6 +14,47 @@ pub const OPENAI_BASE_URL_VAR: &str = "OPENAI_BASE_URL";
 /// Base-URL override for Anthropic's native Messages API. Used by both runtimes
 /// for hermetic transport tests and private compatible endpoints.
 pub const ANTHROPIC_BASE_URL_VAR: &str = "ANTHROPIC_BASE_URL";
+/// Default AWS region used by the Bedrock adapters when the caller omits
+/// `x-aws-region`.
+pub const BEDROCK_DEFAULT_REGION: &str = "us-east-1";
+
+const MAX_AWS_REGION_LEN: usize = 32;
+
+/// Validate an AWS region before it is interpolated into a Bedrock authority.
+///
+/// A region is caller-controlled on this gateway. Restricting it to the
+/// conservative AWS region grammar keeps the resulting host below
+/// `amazonaws.com` and rejects URL delimiters such as `.`, `/`, `@`, `:`, `?`,
+/// and `#` before either runtime constructs or dispatches a request.
+pub fn validate_aws_region(region: &str) -> Result<(), String> {
+    let invalid = || {
+        "x-aws-region must be a valid AWS region such as us-east-1 (ASCII lowercase letters, digits, and hyphens; maximum 32 characters)"
+            .to_string()
+    };
+
+    if region.is_empty()
+        || region.len() > MAX_AWS_REGION_LEN
+        || !region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(invalid());
+    }
+
+    let mut segments = region.split('-').collect::<Vec<_>>();
+    let Some(ordinal) = segments.pop() else {
+        return Err(invalid());
+    };
+    if segments.len() < 2
+        || segments.iter().any(|segment| segment.is_empty())
+        || ordinal.is_empty()
+        || !ordinal.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+
+    Ok(())
+}
 
 /// Where an OpenAI-compatible request should be forwarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +169,18 @@ pub fn authorization_bearer_token(value: &str) -> Option<&str> {
         return None;
     }
     Some(token)
+}
+
+/// Whether a header carries credentials for a provider other than the generic
+/// Bearer-auth path.
+///
+/// These headers must never ride generic header pass-through: the selected
+/// Anthropic or Bedrock adapter re-adds only the credentials it actually uses.
+pub fn is_cross_provider_credential_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-api-key")
+        || name
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-aws-"))
 }
 
 /// [`upstream_url`], with an optional base that replaces the route's own.
@@ -1914,6 +1967,22 @@ pub fn openai_to_anthropic_messages_with_assumed_output_tokens(
     Ok(body)
 }
 
+/// Validate the Bedrock surface currently implemented by the Cloudflare Worker.
+///
+/// Native uses an incremental AWS EventStream decoder for `ConverseStream`.
+/// The Worker currently implements buffered `Converse` only, so accepting
+/// `stream: true` there would silently violate the caller's transport contract.
+/// Keep this check shared and target-independent so its behavior is unit tested.
+pub fn validate_worker_bedrock_request(body: &Value) -> Result<(), String> {
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        return Err(
+            "Bedrock streaming is not supported by the Cloudflare Worker; use the native gateway for ConverseStream or omit stream for buffered Converse"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Convert an OpenAI chat-completions body into the AWS Bedrock **Converse** API
 /// request shape. Mirrors the native `BedrockProvider::transform_request_body`
 /// (defaults: maxTokens 1000, temperature 0.7, topP 1.0).
@@ -2059,6 +2128,53 @@ mod tests {
             ("", None),
         ] {
             assert_eq!(authorization_bearer_token(raw), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn aws_region_validation_accepts_commercial_and_partition_regions() {
+        for region in [
+            "us-east-1",
+            "us-west-2",
+            "eu-west-1",
+            "ap-south-1",
+            "ap-southeast-2",
+            "ca-central-1",
+            "me-south-1",
+            "af-south-1",
+            "il-central-1",
+            "mx-central-1",
+            "cn-north-1",
+            "us-gov-west-1",
+        ] {
+            assert!(validate_aws_region(region).is_ok(), "{region}");
+        }
+    }
+
+    #[test]
+    fn aws_region_validation_rejects_empty_delimited_or_overlong_values() {
+        for region in [
+            "",
+            " ",
+            " us-east-1",
+            "us-east-1 ",
+            "US-EAST-1",
+            "us-east",
+            "us-east-one",
+            "us--east-1",
+            "-us-east-1",
+            "us-east-1-",
+            "us_east_1",
+            "us-east-1.evil.invalid",
+            "us-east-1/evil",
+            "us-east-1@evil.invalid",
+            "us-east-1:443",
+            "us-east-1?query",
+            "us-east-1#fragment",
+            "commercial-super-long-region-name-1",
+        ] {
+            let error = validate_aws_region(region).expect_err(region);
+            assert!(error.contains("x-aws-region"), "{region:?}: {error}");
         }
     }
 
@@ -3978,6 +4094,25 @@ mod tests {
     }
 
     #[test]
+    fn worker_bedrock_preflight_rejects_streaming_until_eventstream_is_supported() {
+        let buffered = json!({
+            "model": "amazon.nova-micro-v1:0",
+            "stream": false,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        assert!(validate_worker_bedrock_request(&buffered).is_ok());
+
+        let streaming = json!({
+            "model": "amazon.nova-micro-v1:0",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let error = validate_worker_bedrock_request(&streaming).unwrap_err();
+        assert!(error.contains("Cloudflare Worker"), "{error}");
+        assert!(error.contains("stream"), "{error}");
+    }
+
+    #[test]
     fn bedrock_converse_to_openai_maps_content_usage_and_finish() {
         let resp = json!({
             "output": {"message": {"content": [{"text": "hi there"}]}},
@@ -4072,5 +4207,22 @@ mod tests {
         assert_eq!(out["choices"][0]["message"]["content"], "abc");
         // safety stop surfaced distinctly.
         assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn cross_provider_credentials_are_never_copied_as_generic_headers() {
+        for name in [
+            "x-api-key",
+            "X-API-Key",
+            "x-aws-access-key-id",
+            "x-aws-secret-access-key",
+            "x-aws-session-token",
+            "x-aws-region",
+        ] {
+            assert!(is_cross_provider_credential_header(name), "{name}");
+        }
+        for name in ["authorization", "anthropic-beta", "x-request-id"] {
+            assert!(!is_cross_provider_credential_header(name), "{name}");
+        }
     }
 }

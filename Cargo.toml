@@ -1,6 +1,6 @@
 [package]
 name = "noveum-ai-gateway"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 rust-version = "1.94.1"
 description = "A high-performance AI Gateway proxy for routing requests to various AI providers, offering seamless integration and management of multiple AI providers."
@@ -13,7 +13,12 @@ readme = "README.md"
 keywords = ["ai", "gateway", "proxy", "openai", "llm"]
 categories = ["web-programming", "api-bindings", "asynchronous"]
 exclude = [
-    ".env",
+    ".env*",
+    "**/.env*",
+    ".dev.vars*",
+    "**/.dev.vars*",
+    ".wrangler/**/*",
+    "**/.wrangler/**/*",
     ".claude/**/*",
     ".cursorrules",
     ".github/**/*",

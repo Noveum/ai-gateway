@@ -53,14 +53,17 @@ jobs:
       # Run the hermetic suites by name rather than `cargo test`, which would
       # also run the live-provider cases in `run_integration_tests`; those need
       # real keys and belong in the scheduled smoke workflow. The filtered step
-      # below runs only that target's three network-free helper regressions.
+      # below runs only that target's seven network-free helper regressions.
       - name: Unit tests
-        run: cargo test --lib
+        run: |
+          cargo test --lib
+          cargo test --bin noveum-ai-gateway runtime_uses_the_configured_worker_thread_count
 
       - name: Provider harness helper tests (no live calls)
         run: |
           cargo test --test run_integration_tests streaming_smoke_
           cargo test --test run_integration_tests request_body_can_select_
+          cargo test --test run_integration_tests model_override_
 
       - name: Nova Guard platform integration tests
         run: cargo test --test novaguard_platform

@@ -22,6 +22,7 @@
 // Shared core: compiles to BOTH the native server and the wasm32 Cloudflare
 // Worker, so guardrails + request routing behave identically on every deployment
 // shape.
+pub mod landing;
 pub mod policy;
 pub mod routing;
 pub mod sigv4;
@@ -156,6 +157,7 @@ pub fn build_router(state: AppState) -> Router {
         .max_age(std::time::Duration::from_secs(3600));
 
     let mut router = Router::new()
+        .route("/", get(handlers::landing_page))
         .route("/health", get(handlers::health_check))
         .route("/v1/*path", any(handlers::proxy_request))
         // Nova Guard policy enforcement runs closest to the handler so it sees the
@@ -189,4 +191,98 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .with_state(state.config.clone())
         .layer(cors)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::{build_router, AppState};
+    use crate::{
+        config::AppConfig,
+        landing::LANDING_CONTENT_SECURITY_POLICY,
+        policy::{engine::EngineOptions, PolicyBundle, PolicyEngine},
+        telemetry::MetricsRegistry,
+    };
+    use axum::{
+        body::Body,
+        http::{header, Method, Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn root_route_serves_the_secure_landing_page() {
+        let policy = PolicyEngine::from_bundle(&PolicyBundle::default(), EngineOptions::default());
+        let state = AppState::new(
+            Arc::new(AppConfig::default()),
+            Arc::new(MetricsRegistry::new(false)),
+            Arc::new(policy),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let app = build_router(state);
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            LANDING_CONTENT_SECURITY_POLICY
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=300"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("native-server"));
+        assert!(html.contains(env!("CARGO_PKG_VERSION")));
+
+        let head = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        for name in [
+            header::CONTENT_TYPE.as_str(),
+            "content-security-policy",
+            "x-content-type-options",
+            "referrer-policy",
+            header::CACHE_CONTROL.as_str(),
+        ] {
+            assert!(head.headers().contains_key(name), "missing {name}");
+        }
+        assert!(head
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+    }
 }

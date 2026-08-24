@@ -7,6 +7,7 @@ async fn test_together_non_streaming() {
         "TOGETHER_API_KEY",
         "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     )
+    .with_model_from_env("TOGETHER_TEST_MODEL")
     .with_max_tokens(512);
     run_non_streaming_test(&config).await;
 }
@@ -18,6 +19,7 @@ async fn test_together_streaming() {
         "TOGETHER_API_KEY",
         "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     )
+    .with_model_from_env("TOGETHER_TEST_MODEL")
     .with_max_tokens(512);
     run_streaming_test(&config).await;
 }

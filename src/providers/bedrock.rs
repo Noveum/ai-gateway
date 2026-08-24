@@ -9,6 +9,7 @@
 use super::utils::log_tracking_headers;
 use super::Provider;
 use crate::error::AppError;
+use crate::routing::{validate_aws_region, BEDROCK_DEFAULT_REGION};
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
 use aws_event_stream_parser::{parse_message, Message};
@@ -24,7 +25,6 @@ use tracing::{debug, error, warn};
 use uuid;
 
 /// Constants for default values
-const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
 const MAX_EVENT_STREAM_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -47,7 +47,7 @@ impl Default for BedrockProvider {
 
 impl BedrockProvider {
     pub fn new() -> Self {
-        let region = DEFAULT_REGION.to_string();
+        let region = BEDROCK_DEFAULT_REGION.to_string();
         debug!("Initializing BedrockProvider with region: {}", region);
 
         // Create a random system fingerprint that will be reused across chunks
@@ -329,7 +329,13 @@ impl Provider for BedrockProvider {
         }
 
         // Extract and set the region from the request headers
-        if let Some(region) = headers.get("x-aws-region").and_then(|h| h.to_str().ok()) {
+        if let Some(region) = headers.get("x-aws-region") {
+            let region = region.to_str().map_err(|_| {
+                AppError::RequestError(
+                    "x-aws-region must be a valid UTF-8 AWS region such as us-east-1".to_string(),
+                )
+            })?;
+            validate_aws_region(region).map_err(AppError::RequestError)?;
             debug!("Setting region from before_request: {}", region);
             *self.region.write() = region.to_string();
             *self.base_url.write() = format!("https://bedrock-runtime.{}.amazonaws.com", region);
@@ -396,13 +402,21 @@ impl Provider for BedrockProvider {
     }
 
     fn get_signing_credentials(&self, headers: &HeaderMap) -> Option<(String, String, String)> {
-        let access_key = headers.get("x-aws-access-key-id")?.to_str().ok()?;
-        let secret_key = headers.get("x-aws-secret-access-key")?.to_str().ok()?;
+        let access_key = headers.get("x-aws-access-key-id")?.to_str().ok()?.trim();
+        let secret_key = headers
+            .get("x-aws-secret-access-key")?
+            .to_str()
+            .ok()?
+            .trim();
+        if access_key.is_empty() || secret_key.is_empty() {
+            return None;
+        }
         let region = headers
             .get("x-aws-region")
             .and_then(|h| h.to_str().ok())
             .map(String::from)
             .unwrap_or_else(|| self.region.read().clone());
+        validate_aws_region(&region).ok()?;
 
         Some((access_key.to_string(), secret_key.to_string(), region))
     }

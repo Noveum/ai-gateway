@@ -1870,6 +1870,36 @@ async fn deterministic_provider_errors_are_rejected_before_admission_or_provider
         .as_str()
         .is_some_and(|message| message.contains("source-region-aware pricing")));
 
+    let malformed_bedrock_region = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-provider", "bedrock")
+        .header("x-aws-access-key-id", "AKIATEST")
+        .header("x-aws-secret-access-key", "secret")
+        .header(
+            "x-aws-region",
+            "us-east-1.amazonaws.com@attacker.invalid/path?x=",
+        )
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "max_tokens": 32,
+                "messages": [{"role":"user","content":"hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(malformed_bedrock_region).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("x-aws-region")));
+
     let native_bedrock = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")

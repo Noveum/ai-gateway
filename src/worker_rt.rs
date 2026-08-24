@@ -63,6 +63,7 @@ use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use worker::*;
 
+use crate::landing::{landing_page_html, LANDING_CACHE_CONTROL, LANDING_CONTENT_SECURITY_POLICY};
 use crate::policy::decision::{Phase, PolicyDecision};
 use crate::policy::engine::EngineOptions;
 use crate::policy::metering::{extract_actual_usage_priced, ActualUsage, StreamUsageScanner};
@@ -78,17 +79,17 @@ use crate::policy::PolicyEngine;
 use crate::routing::{
     apply_input_transforms, apply_output_transforms, authorization_bearer_token,
     bedrock_converse_to_openai, estimate_admission_input_tokens, flatten_input_text,
-    flatten_output_text, normalize_base_url,
+    flatten_output_text, is_cross_provider_credential_header, normalize_base_url,
     openai_to_anthropic_messages_with_assumed_output_tokens, openai_to_bedrock_converse,
     prepare_strict_admission_body, resolve_provider, transform_anthropic_to_openai_format,
-    upstream_url_with_base, validate_strict_anthropic_base_url, validate_strict_openai_base_url,
-    ANTHROPIC_BASE_URL_VAR, OPENAI_BASE_URL_VAR,
+    upstream_url_with_base, validate_aws_region, validate_strict_anthropic_base_url,
+    validate_strict_openai_base_url, validate_worker_bedrock_request, ANTHROPIC_BASE_URL_VAR,
+    BEDROCK_DEFAULT_REGION, OPENAI_BASE_URL_VAR,
 };
 use crate::sigv4;
 
 /// Default Bedrock model + region (mirrors the native `BedrockProvider`).
 const BEDROCK_DEFAULT_MODEL: &str = "amazon.titan-text-premier-v1:0";
-const BEDROCK_DEFAULT_REGION: &str = "us-east-1";
 /// The platform reaps a pending reservation after 15 minutes. End an edge
 /// provider call well before that lease can be released under a still-live SSE
 /// stream; Cloudflare otherwise permits incoming Worker requests indefinitely.
@@ -104,7 +105,7 @@ struct BedrockCreds {
 }
 
 /// Extract Bedrock credentials from request headers (supports temporary creds
-/// via `x-aws-session-token`, which the native path does not).
+/// via `x-aws-session-token`, matching the native path).
 fn bedrock_credentials(req: &Request) -> Option<BedrockCreds> {
     let h = req.headers();
     let access_key = h
@@ -315,7 +316,7 @@ fn copy_headers_excluding(src: &Headers, skip: &[&str]) -> Result<Headers> {
         let lower = k.to_ascii_lowercase();
         if skip.contains(&lower.as_str())
             || lower.starts_with("x-noveum-")
-            || lower.starts_with("x-aws-")
+            || is_cross_provider_credential_header(&lower)
             || connection_tokens.iter().any(|token| token == &lower)
         {
             continue;
@@ -429,6 +430,22 @@ fn invalid_stateful_input(message: &str) -> Result<Response> {
             "type": "invalid_request_error",
             "param": Value::Null,
             "code": "unsupported_stateful_input",
+        }
+    }))?
+    .with_headers(headers)
+    .with_status(400))
+}
+
+/// Provider-shaped 400 for a feature that this runtime cannot implement.
+fn unsupported_feature(message: &str) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("content-type", "application/json")?;
+    Ok(Response::from_json(&json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": Value::Null,
+            "code": "unsupported_feature",
         }
     }))?
     .with_headers(headers)
@@ -840,6 +857,16 @@ async fn proxy(
 ) -> Result<Response> {
     let path = req.path();
 
+    if matches!(req.method(), Method::Get | Method::Head) && path == "/" {
+        let mut response = Response::from_html(landing_page_html("cloudflare-worker"))?;
+        let headers = response.headers_mut();
+        headers.set("content-security-policy", LANDING_CONTENT_SECURITY_POLICY)?;
+        headers.set("x-content-type-options", "nosniff")?;
+        headers.set("referrer-policy", "no-referrer")?;
+        headers.set("cache-control", LANDING_CACHE_CONTROL)?;
+        return Ok(response);
+    }
+
     if path == "/health" {
         return Response::from_json(&json!({
             "status": "healthy",
@@ -1072,10 +1099,25 @@ async fn proxy(
                 "Bedrock requires x-aws-access-key-id and x-aws-secret-access-key headers",
             );
         };
+        if let Err(message) = validate_aws_region(&credentials.region) {
+            return error_response(400, "invalid_request_error", &message);
+        }
         Some(credentials)
     } else {
         None
     };
+    if is_bedrock {
+        let Some(body) = body_json.as_ref() else {
+            return error_response(
+                400,
+                "invalid_request_error",
+                "Bedrock requires a valid JSON chat-completions body",
+            );
+        };
+        if let Err(message) = validate_worker_bedrock_request(body) {
+            return unsupported_feature(&message);
+        }
+    }
     if !is_anthropic && !is_bedrock {
         let authorization = req.headers().get("authorization").ok().flatten();
         let bearer = authorization

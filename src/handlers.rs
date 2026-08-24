@@ -2,12 +2,16 @@
 //! resolves the target provider from the `x-provider` header and forwards the
 //! request through [`crate::proxy`].
 
-use crate::{config::AppConfig, proxy::proxy_request_to_provider};
+use crate::{
+    config::AppConfig,
+    landing::{landing_page_html, LANDING_CACHE_CONTROL, LANDING_CONTENT_SECURITY_POLICY},
+    proxy::proxy_request_to_provider,
+};
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
-    http::{HeaderMap, Request},
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request},
+    response::{Html, IntoResponse, Response},
     Json,
 };
 use serde_json::json;
@@ -18,6 +22,29 @@ use uuid;
 pub async fn health_check() -> impl IntoResponse {
     info!("Health check endpoint called");
     Json(json!({ "status": "healthy", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// Serve the dependency-free gateway landing page.
+pub async fn landing_page() -> Response {
+    let mut response = Html(landing_page_html("native-server")).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(LANDING_CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(LANDING_CACHE_CONTROL),
+    );
+    response
 }
 
 pub async fn proxy_request(

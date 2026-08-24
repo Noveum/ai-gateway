@@ -162,6 +162,7 @@ stream_request() {
   local agent_id="${1:-phase-stream}"
   curl -sN --max-time 30 "http://127.0.0.1:$GATEWAY_PORT/v1/chat/completions" \
     -H 'Authorization: Bearer sk-test' -H 'x-provider: openai' \
+    -H 'x-api-key: should-not-reach-openai' \
     -H "x-user-id: $agent_id" \
     -H 'Content-Type: application/json' \
     -d '{"model":"gpt-4o","stream":true,"max_tokens":4096,
@@ -484,6 +485,36 @@ say "Phase 1 -- allowed: admit, tee a real stream, settle at the TRUE usage"
 start_mock "$TMP/p1.log" MOCK_MAX_USD=1.0 MOCK_ENFORCEMENT_MODE=STRICT \
   MOCK_STREAM_PROMPT_TOKENS=11 MOCK_STREAM_COMPLETION_TOKENS=4
 start_wrangler
+LANDING_STATUS="$(curl -sS --max-time 30 -D "$TMP/p1-landing.headers" \
+  -o "$TMP/p1-landing.html" -w '%{http_code}' \
+  "http://127.0.0.1:$GATEWAY_PORT/")" || LANDING_STATUS="transport_error"
+LANDING_VERSION="$(awk -F '"' '/^version = / { print $2; exit }' "$ROOT/Cargo.toml")"
+[ "$LANDING_STATUS" = "200" ] \
+  && grep -qF 'Noveum AI Gateway' "$TMP/p1-landing.html" \
+  && grep -qF "Version <code>$LANDING_VERSION</code>" "$TMP/p1-landing.html" \
+  && grep -qF 'Runtime <code>cloudflare-worker</code>' "$TMP/p1-landing.html" \
+  && grep -qF '/v1/chat/completions' "$TMP/p1-landing.html" \
+  && pass "the public landing page identifies the Worker release and API route" \
+  || fail "the public landing page was missing or incomplete (HTTP $LANDING_STATUS)"
+grep -qi '^content-security-policy:.*default-src '\''none'\''' "$TMP/p1-landing.headers" \
+  && grep -qi '^x-content-type-options: *nosniff' "$TMP/p1-landing.headers" \
+  && grep -qi '^referrer-policy: *no-referrer' "$TMP/p1-landing.headers" \
+  && grep -qi '^content-type: *text/html; *charset=utf-8' "$TMP/p1-landing.headers" \
+  && grep -qi '^cache-control: *public, *max-age=300' "$TMP/p1-landing.headers" \
+  && pass "the Worker landing page carries the restrictive browser headers" \
+  || { fail "the Worker landing page security headers were incomplete"; sed 's/^/      /' "$TMP/p1-landing.headers"; }
+LANDING_HEAD_STATUS="$(curl -sS --max-time 30 --head -o "$TMP/p1-landing-head.headers" \
+  -w '%{http_code}' "http://127.0.0.1:$GATEWAY_PORT/")" || LANDING_HEAD_STATUS="transport_error"
+[ "$LANDING_HEAD_STATUS" = "200" ] \
+  && grep -qi '^content-type: *text/html; *charset=utf-8' "$TMP/p1-landing-head.headers" \
+  && grep -qi '^cache-control: *public, *max-age=300' "$TMP/p1-landing-head.headers" \
+  && grep -qi '^content-security-policy:.*default-src '\''none'\''' "$TMP/p1-landing-head.headers" \
+  && grep -qi '^x-content-type-options: *nosniff' "$TMP/p1-landing-head.headers" \
+  && grep -qi '^referrer-policy: *no-referrer' "$TMP/p1-landing-head.headers" \
+  && pass "HEAD / matches the native landing route and cache contract" \
+  || { fail "HEAD / did not match the landing contract (HTTP $LANDING_HEAD_STATUS)"; sed 's/^/      /' "$TMP/p1-landing-head.headers"; }
+refute_log "$TMP/p1.log" "GET /effective" \
+  "GET/HEAD landing requests bypassed the Noveum control plane"
 BODY="$(stream_request)"
 sleep 3   # settlement rides ctx.wait_until, so it lands after the body is done
 
@@ -496,6 +527,8 @@ expect_log "$TMP/p1.log" "POST /admit -> 200 ALLOWED" "POST /policies/admit rese
 # token counts and every streamed request settles at input + max_tokens.
 expect_log "$TMP/p1.log" "stream_options.include_usage=True" \
   "the Worker forced stream_options.include_usage on the upstream request"
+expect_log "$TMP/p1.log" "x_api_key_present=False" \
+  "a credential for another provider was stripped before OpenAI"
 # The payoff: settlement carries the REAL counts recovered by the tee, not the
 # 2 + 4096 estimate, and it arrives after the response body completed --
 # i.e. ctx.wait_until ran.
@@ -876,6 +909,44 @@ expect_strict_pre_admit_rejection "bedrock-region-priced-nova" bedrock "/v1/chat
   "application/json" \
   '{"model":"amazon.nova-pro-v1:0","max_tokens":64,"messages":[{"role":"user","content":"bounded"}]}' \
   "source-region-priced Bedrock Nova under a strict cap"
+BEDROCK_STREAM_BODY="$TMP/p9-strict-bedrock-stream.body"
+BEDROCK_STREAM_HEADERS="$TMP/p9-strict-bedrock-stream.headers"
+BEDROCK_STREAM_STATUS="$(curl -sS --max-time 30 -D "$BEDROCK_STREAM_HEADERS" \
+  -o "$BEDROCK_STREAM_BODY" -w '%{http_code}' \
+  "http://127.0.0.1:$GATEWAY_PORT/v1/chat/completions" \
+  -H 'x-provider: bedrock' \
+  -H 'x-aws-access-key-id: AKIATEST' \
+  -H 'x-aws-secret-access-key: worker-test-secret' \
+  -H 'x-aws-region: us-east-1' \
+  -H 'content-type: application/json' \
+  --data-binary '{"model":"global.anthropic.claude-sonnet-4-5-20250929-v1:0","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"bounded"}]}'
+)" || BEDROCK_STREAM_STATUS="transport_error"
+[ "$BEDROCK_STREAM_STATUS" = "400" ] \
+  && grep -qi '^content-type: *application/json' "$BEDROCK_STREAM_HEADERS" \
+  && grep -q '"type":"invalid_request_error"' "$BEDROCK_STREAM_BODY" \
+  && grep -q '"param":null' "$BEDROCK_STREAM_BODY" \
+  && grep -q '"code":"unsupported_feature"' "$BEDROCK_STREAM_BODY" \
+  && grep -q 'Cloudflare Worker' "$BEDROCK_STREAM_BODY" \
+  && pass "Worker Bedrock streaming is rejected explicitly before admission" \
+  || { fail "Worker Bedrock streaming should return HTTP 400 unsupported_feature"; sed 's/^/      /' "$BEDROCK_STREAM_BODY"; }
+BEDROCK_REGION_BODY="$TMP/p9-strict-bedrock-region.body"
+BEDROCK_REGION_HEADERS="$TMP/p9-strict-bedrock-region.headers"
+BEDROCK_REGION_STATUS="$(curl -sS --max-time 30 -D "$BEDROCK_REGION_HEADERS" \
+  -o "$BEDROCK_REGION_BODY" -w '%{http_code}' \
+  "http://127.0.0.1:$GATEWAY_PORT/v1/chat/completions" \
+  -H 'x-provider: bedrock' \
+  -H 'x-aws-access-key-id: AKIATEST' \
+  -H 'x-aws-secret-access-key: worker-test-secret' \
+  -H 'x-aws-region: us-east-1.amazonaws.com@attacker.invalid' \
+  -H 'content-type: application/json' \
+  --data-binary '{"model":"global.anthropic.claude-sonnet-4-5-20250929-v1:0","max_tokens":64,"messages":[{"role":"user","content":"bounded"}]}'
+)" || BEDROCK_REGION_STATUS="transport_error"
+[ "$BEDROCK_REGION_STATUS" = "400" ] \
+  && grep -qi '^content-type: *application/json' "$BEDROCK_REGION_HEADERS" \
+  && grep -q '"type":"invalid_request_error"' "$BEDROCK_REGION_BODY" \
+  && grep -q 'x-aws-region' "$BEDROCK_REGION_BODY" \
+  && pass "Worker rejects malformed Bedrock regions before admission" \
+  || { fail "Worker malformed Bedrock region should return HTTP 400 invalid_request_error"; sed 's/^/      /' "$BEDROCK_REGION_BODY"; }
 expect_strict_pre_admit_rejection "divergent-output-limits" groq "/v1/chat/completions" \
   "application/json" \
   '{"model":"openai/gpt-oss-20b","max_tokens":64,"max_output_tokens":65,"messages":[{"role":"user","content":"bounded"}]}' \

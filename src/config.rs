@@ -70,6 +70,31 @@ impl AppConfig {
 
         config
     }
+
+    /// Host and port passed to the native TCP listener.
+    ///
+    /// Keeping this in the configuration type prevents the startup path from
+    /// silently replacing the operator's `HOST` value with a wildcard bind.
+    pub fn bind_target(&self) -> (&str, u16) {
+        (&self.host, self.port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn bind_target_uses_the_configured_host_and_port() {
+        let config = AppConfig {
+            port: 43_210,
+            host: "127.0.0.2".to_string(),
+            worker_threads: 1,
+            max_connections: 1,
+        };
+
+        assert_eq!(config.bind_target(), ("127.0.0.2", 43_210));
+    }
 }
 
 /// Gates the optional telemetry exporters.

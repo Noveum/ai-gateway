@@ -22,12 +22,10 @@ use noveum_ai_gateway::{
     AppState,
 };
 
-#[tokio::main]
-async fn main() {
-    print_banner().await;
-
-    // Initialize tracing
-    info!("Initializing tracing system");
+fn main() {
+    // Load `.env` before tracing so `RUST_LOG` and the runtime settings are
+    // available before Tokio creates any worker threads.
+    dotenv::dotenv().ok();
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -35,7 +33,6 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer().compact())
         .init();
 
-    // Load configuration
     info!("Loading application configuration");
     let config = Arc::new(AppConfig::new());
     debug!(
@@ -43,13 +40,34 @@ async fn main() {
         config.port, config.host, config.worker_threads
     );
 
-    // Optimize tokio runtime
+    let runtime = build_runtime(config.worker_threads).unwrap_or_else(|error| {
+        eprintln!("Failed to build Tokio runtime: {error}");
+        std::process::exit(1);
+    });
+    runtime.block_on(run(config));
+}
+
+fn build_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    if worker_threads == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "WORKER_THREADS must be greater than zero",
+        ));
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_stack_size(2 * 1024 * 1024)
+        .enable_all()
+        .build()
+}
+
+async fn run(config: Arc<AppConfig>) {
+    print_banner().await;
     info!(
-        "Configuring tokio runtime with {} worker threads",
+        "Tokio runtime started with {} worker threads",
         config.worker_threads
     );
-    std::env::set_var("TOKIO_WORKER_THREADS", config.worker_threads.to_string());
-    std::env::set_var("TOKIO_THREAD_STACK_SIZE", (2 * 1024 * 1024).to_string());
 
     // Telemetry registry + exporters
     let telemetry_config = TelemetryConfig::default();
@@ -292,9 +310,9 @@ async fn main() {
     let app = build_router(state);
 
     // Start server with optimized TCP settings
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.port));
     info!("Setting up TCP listener with non-blocking mode");
-    let tcp_listener = std::net::TcpListener::bind(addr).expect("Failed to bind address");
+    let tcp_listener = std::net::TcpListener::bind(config.bind_target())
+        .expect("Failed to bind configured HOST and PORT");
     tcp_listener
         .set_nonblocking(true)
         .expect("Failed to set non-blocking");
@@ -448,5 +466,14 @@ async fn shutdown_signal() {
             println!("{}", "    🛑 Noveum AI Gateway shutting down...".bright_yellow());
             info!("SIGTERM received, starting graceful shutdown");
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runtime_uses_the_configured_worker_thread_count() {
+        let runtime = super::build_runtime(3).expect("test runtime should build");
+        assert_eq!(runtime.metrics().num_workers(), 3);
     }
 }
