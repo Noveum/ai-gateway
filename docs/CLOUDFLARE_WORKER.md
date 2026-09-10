@@ -254,9 +254,13 @@ describes retention and export options.
   disabled even though the production `workers.dev` route is enabled. Candidate
   smoke tests use a zero-percent deployment plus the version-override header.
 - `NOVEUM_GUARD_POLICIES` — inline `nova-guard.json` (same schema as the native
-  `NOVEUM_GUARD_POLICIES`/file). Setting it activates stateless Nova Guard.
-  Workers KV policy loading is not implemented in this release; use a Worker
-  secret if the bundle must not be committed.
+  `NOVEUM_GUARD_POLICIES`/file). Fallback when KV is bound but the
+  `nova-guard-policies` key is absent or empty. Prefer a Worker secret when the
+  bundle must not be committed.
+- `NOVEUM_GUARD_POLICIES_KV` — optional Workers KV namespace binding. Store the
+  bundle at the fixed key `nova-guard-policies` for global updates without a
+  Worker redeploy (short in-isolate cache, ~60 s). See
+  [Workers KV policy bundles](#workers-kv-policy-bundles).
 - `NOVEUM_GUARD_ENABLED` — `true`/`false` (default `true`; with no policies it's
   still a no-op).
 - `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` — `synthetic_success` (default: HTTP 200 with
@@ -297,10 +301,12 @@ Request bodies over **8 MiB** are rejected with `413`.
 
 The Worker runs Nova Guard in **both** shapes:
 
-* **Inline / stateless** — a `NOVEUM_GUARD_POLICIES` bundle of text policies
-  (`regex_match`, `pii_detection`, secrets, banned terms, model allowlist, JSON
-  schema, token limits), decided entirely from the payload in front of the
-  gateway using the shared deterministic policy engine.
+* **Local / stateless** — a policy bundle from optional Workers KV
+  (`NOVEUM_GUARD_POLICIES_KV`, key `nova-guard-policies`) and/or inline
+  `NOVEUM_GUARD_POLICIES` text policies (`regex_match`, `pii_detection`,
+  secrets, banned terms, model allowlist, JSON schema, token limits), decided
+  entirely from the payload in front of the gateway using the shared
+  deterministic policy engine.
 * **Platform-managed** — set `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` and
   the Worker fetches the project's *effective* policy set, reads the live
   cost/rate counters, and reserves every request against the platform's
@@ -348,7 +354,11 @@ conservative reservation estimate.
 
 | Configuration | Worker behavior |
 |---|---|
-| `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` set | **Platform-managed Nova Guard**, in dedicated mode. Policies, live state and admission come from the control plane; any inline `NOVEUM_GUARD_POLICIES` is ignored (with a warning) — the platform is the source of truth. |
+| `NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID` set | **Platform-managed Nova Guard**, in dedicated mode. Policies, live state and admission come from the control plane; any Workers KV binding or inline `NOVEUM_GUARD_POLICIES` is ignored (with a warning) — the platform is the source of truth. |
+| `NOVEUM_GUARD_POLICIES_KV` bound, key `nova-guard-policies` holds valid JSON, no bridge | **KV-backed stateless Nova Guard.** Cached ~60 s per isolate; updates propagate globally without redeploying the Worker. |
+| `NOVEUM_GUARD_POLICIES_KV` bound, key absent/empty, inline set, no bridge | **Inline bundle** — KV miss falls through to `NOVEUM_GUARD_POLICIES`. |
+| `NOVEUM_GUARD_POLICIES_KV` bound, KV value malformed | **503**, same as malformed inline — never a silent pass-through. |
+| `NOVEUM_GUARD_POLICIES_KV` bound, KV read fails | **503** — the binding opts into KV as a policy source; transport errors are not ignored. |
 | `x-provider: bedrock` with `stream: true` | **400 `unsupported_feature` before admission or AWS dispatch.** The v2.0.1 Worker supports buffered Converse only; use the native gateway for ConverseStream. |
 | Applicable `mode: enforce`, `action: block`, `enforcementMode: strict` cost cap, but no positive explicit output limit | **400 `missing_output_limit`.** The Worker does not call `/admit` or the provider. Add `max_tokens`, `max_completion_tokens`, or `max_output_tokens`. |
 | Strict request supplies conflicting non-null output-limit aliases | **400 `unsupported_strict_input`.** The Worker does not reserve or forward a request whose admitted and upstream ceilings could differ. |
@@ -358,10 +368,10 @@ conservative reservation estimate.
 | Only *one* of the pair set, or either set to `""` | **503 `gateway_configuration_error`.** A half-applied bridge is still an attempt to enable enforcement; falling through to an unguarded proxy would reward the mistake with a 200. Same matrix as the native `RemoteConfig::from_values`. |
 | Bridge set, but the **first** policy fetch fails | **503.** No policy set is known, so every request would be forwarded unguarded. Override with `NOVEUM_GUARD_ALLOW_UNGUARDED_START=true` (emergency only). |
 | Bridge set, admission returns **503**/times out | `failClosed` decides: a fail-closed strict cap **blocks**; otherwise the request proceeds and the outage is logged. Never an implicit allow. |
-| `NOVEUM_GUARD_POLICIES` containing `cost_cap` or `rate_limit`, **no** bridge | **503.** An inline bundle has no live spend/rate backend, so those policies could only evaluate to "allow" and their `failClosed` flag would be neutralized. Configure the bridge instead. |
-| `NOVEUM_GUARD_POLICIES` set but not valid JSON / not a valid bundle | **503**, plus a structured `console_error`. Parsing the error away would silently drop every policy the operator deployed. |
-| `NOVEUM_GUARD_POLICIES` unset (or empty), no bridge | Transparent proxy — the checked-in default. |
-| `NOVEUM_GUARD_POLICIES` with text policies only | Enforced, identical to native. |
+| Local bundle (KV or inline) containing `cost_cap` or `rate_limit`, **no** bridge | **503.** A KV/inline bundle has no live spend/rate backend, so those policies could only evaluate to "allow" and their `failClosed` flag would be neutralized. Configure the bridge instead. |
+| KV or inline bundle set but not valid JSON / not a valid bundle | **503**, plus a structured `console_error`. Parsing the error away would silently drop every policy the operator deployed. |
+| No KV value, `NOVEUM_GUARD_POLICIES` unset (or empty), no bridge | Transparent proxy — the checked-in default. |
+| KV or inline bundle with text policies only | Enforced, identical to native. |
 
 “Model-scoped-away” in this table assumes a valid JSON body carrying a model.
 When any enforcing/blocking strict cap exists, a non-JSON or multipart request
@@ -371,6 +381,43 @@ Request bodies are capped at **8 MiB**, the same bound as response inspection.
 The declared `Content-Length` is checked before a byte is read, and the cap is
 re-enforced while reading so a chunked body with no (or a lying) length cannot
 allocate the isolate to death. Over the cap → **413**.
+
+### Workers KV policy bundles
+
+Use Workers KV when stateless text policies should change globally without
+redeploying the Worker. Implementation: `src/policy/worker_kv.rs`.
+
+1. Create a KV namespace and add it to `wrangler.toml`:
+
+   ```toml
+   [[kv_namespaces]]
+   binding = "NOVEUM_GUARD_POLICIES_KV"
+   id = "<namespace-id>"
+   ```
+
+2. Write the bundle JSON to the fixed key `nova-guard-policies` (same schema as
+   `nova-guard.json` / `NOVEUM_GUARD_POLICIES`):
+
+   ```bash
+   npx wrangler kv key put --binding=NOVEUM_GUARD_POLICIES_KV \
+     nova-guard-policies --path=./nova-guard.json
+   ```
+
+3. Deploy. Each isolate caches the KV value for ~60 s before re-reading.
+
+**Precedence without the platform bridge:** non-empty KV value → inline
+`NOVEUM_GUARD_POLICIES` → transparent empty bundle. A missing or whitespace-only
+KV key falls through to inline.
+
+**With the platform bridge:** the control plane wins; KV and inline are ignored
+(with a warning if either is configured).
+
+**Limits:** `cost_cap` / `rate_limit` in a KV bundle still require the platform
+bridge — same 503 as inline. Malformed KV JSON or KV transport errors return 503.
+
+The checked-in `wrangler.toml` omits the binding so `wrangler deploy --dry-run`
+still reports "No bindings found." — that remains the default transparent-proxy
+shape.
 
 ### Operational runbook
 

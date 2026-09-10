@@ -9,7 +9,7 @@ paths and native-only settings do not apply there.
 | Mode | Required settings | Forbidden settings | Runtime |
 |---|---|---|---|
 | Transparent | none | none | native or Worker |
-| Local policies | `NOVEUM_GUARD_POLICIES_FILE` or `NOVEUM_GUARD_POLICIES` | `NOVEUM_GUARD_TENANCY=shared`; do not also configure the dedicated platform pair | file: native only; inline: native or Worker |
+| Local policies | `NOVEUM_GUARD_POLICIES_FILE` or `NOVEUM_GUARD_POLICIES`; Worker may also use KV (`NOVEUM_GUARD_POLICIES_KV`, key `nova-guard-policies`) | `NOVEUM_GUARD_TENANCY=shared`; do not also configure the dedicated platform pair | file: native only; inline/KV: Worker |
 | Platform dedicated | `NOVEUM_API_KEY`, `NOVEUM_GUARD_PROJECT_ID`; optionally `NOVEUM_GUARD_TENANCY=dedicated` | `NOVEUM_GUARD_TENANCY=shared` | native or Worker |
 | Platform shared | `NOVEUM_GUARD_TENANCY=shared`; caller sends `x-noveum-api-key` | process-wide `NOVEUM_API_KEY`, `NOVEUM_GUARD_PROJECT_ID`, and local bundle | native only |
 
@@ -56,7 +56,8 @@ Configuration is read once. Restart or redeploy after changing it.
 |---|---|---|
 | `NOVEUM_GUARD_ENABLED` | `true` | Master switch. `false`, `0`, `no`, `off`, `disabled`, or an empty value disables the engine. |
 | `NOVEUM_GUARD_POLICIES_FILE` | unset | Native-only path to a JSON policy bundle. |
-| `NOVEUM_GUARD_POLICIES` | unset | Inline JSON policy bundle; on Workers, store sensitive bundles as a secret. |
+| `NOVEUM_GUARD_POLICIES` | unset | Inline JSON policy bundle; on Workers, store sensitive bundles as a secret. Fallback when KV is bound but the key is absent. |
+| `NOVEUM_GUARD_POLICIES_KV` | unset | Worker-only KV namespace binding. Fixed key `nova-guard-policies`. Optional; default deploy has no bindings. |
 | `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` returns a refusal-shaped HTTP 200; `provider_error` returns an HTTP 403 error envelope. |
 | `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Fallback estimate for advisory cost caps and rate-only accounting; never satisfies an applicable strict cost cap's explicit-bound requirement. |
 
