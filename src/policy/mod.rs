@@ -83,6 +83,9 @@ pub mod middleware;
 /// repository cannot execute.
 pub mod worker_remote;
 
+/// Optional Workers KV policy bundle for the edge runtime (no platform bridge).
+pub mod worker_kv;
+
 pub use config::{Policy, PolicyBundle, PolicyType};
 pub use decision::{Phase, PolicyAction, PolicyDecision, PolicyMode, Severity};
 pub use engine::{EngineOptions, EvaluationResult, PolicyEngine};

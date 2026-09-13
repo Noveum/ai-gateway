@@ -55,9 +55,22 @@ head_sampling_rate = 1
 # ---------------------------------------------------------------------------
 # Bindings and secrets
 # ---------------------------------------------------------------------------
-# This Worker needs NO Cloudflare resource bindings — no KV, no D1, no R2, no
-# Durable Objects, no queues. `wrangler deploy --dry-run` printing "No bindings
-# found." is the expected, correct output, not a misconfiguration.
+# The checked-in default needs NO Cloudflare resource bindings — no KV, no D1,
+# no R2, no Durable Objects, no queues. `wrangler deploy --dry-run` printing
+# "No bindings found." is the expected, correct output, not a misconfiguration.
+#
+# Optional: Workers KV for globally updatable stateless Nova Guard policies (no
+# redeploy to change the bundle). Create a namespace, then uncomment and set id:
+#
+# [[kv_namespaces]]
+# binding = "NOVEUM_GUARD_POLICIES_KV"
+# id = "<your-kv-namespace-id>"
+#
+# Store the bundle JSON at the fixed key `nova-guard-policies` (same schema as
+# native `nova-guard.json` / `NOVEUM_GUARD_POLICIES`). Precedence without the
+# platform bridge: KV (non-empty key) → inline `NOVEUM_GUARD_POLICIES` →
+# transparent empty bundle. A missing/empty KV key falls through to inline.
+# With the platform bridge configured, KV and inline are ignored (warning logged).
 #
 # Provider credentials are NOT stored here. The gateway is a pass-through proxy:
 # the caller's own provider key rides in on the request (`Authorization` /
@@ -73,9 +86,13 @@ head_sampling_rate = 1
 #                                   native `nova-guard.json`). Prefer
 #                                   `wrangler secret put NOVEUM_GUARD_POLICIES`
 #                                   when the patterns themselves are sensitive.
-#                                   IGNORED when the platform bridge below is
-#                                   configured (the platform is then the source
-#                                   of truth); the Worker logs a warning.
+#                                   Fallback after Workers KV when the optional
+#                                   `NOVEUM_GUARD_POLICIES_KV` binding is set
+#                                   but the `nova-guard-policies` key is absent
+#                                   or empty. IGNORED when the platform bridge
+#                                   below is configured; the Worker logs a warning.
+#   NOVEUM_GUARD_POLICIES_KV        Optional KV namespace binding (see above).
+#                                   Fixed key: `nova-guard-policies`.
 #   NOVEUM_GUARD_BLOCK_RESPONSE_MODE  `synthetic_success` | `provider_error`.
 #
 # Platform-managed Nova Guard (the "bridge"). BOTH are required, or neither —

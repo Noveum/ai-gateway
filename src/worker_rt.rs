@@ -19,10 +19,11 @@
 //!
 //! Both shapes are supported:
 //!
-//! * **Inline, stateless** — a `NOVEUM_GUARD_POLICIES` bundle of text rules
-//!   (`regex_match`, `pii_detection`, …), decided entirely from the payload in
-//!   front of us. An absent bundle is a transparent proxy; a *malformed* one is
-//!   a configuration error, never a silent pass-through.
+//! * **Local, stateless** — a policy bundle from optional Workers KV
+//!   ([`crate::policy::worker_kv`]) and/or inline `NOVEUM_GUARD_POLICIES`
+//!   text rules (`regex_match`, `pii_detection`, …), decided entirely from the
+//!   payload in front of us. An absent bundle is a transparent proxy; a
+//!   *malformed* one is a configuration error, never a silent pass-through.
 //! * **Platform-managed** (`NOVEUM_API_KEY` + `NOVEUM_GUARD_PROJECT_ID`) — the
 //!   effective policy set, live cost/rate counters and atomic admission come
 //!   from the Noveum control plane over `worker::Fetch`
@@ -69,6 +70,7 @@ use crate::policy::engine::EngineOptions;
 use crate::policy::metering::{extract_actual_usage_priced, ActualUsage, StreamUsageScanner};
 use crate::policy::rules::LiveState;
 use crate::policy::synthetic::{block_body, block_status, policy_header_token, BlockResponseMode};
+use crate::policy::worker_kv::{self, LocalPolicySources, INLINE_POLICIES_VAR};
 use crate::policy::worker_remote::{
     self, admit_request_body, assumed_output_tokens_from_value, force_include_usage,
     resolve_max_output_tokens, Admission, AdmitRequest, BodyAdmission, Settlement, StreamOutcome,
@@ -276,28 +278,29 @@ fn engine_options(env: &Env, live_state_backed: bool) -> EngineOptions {
     }
 }
 
-/// Build the Nova Guard engine from the in‑memory `NOVEUM_GUARD_POLICIES`
-/// bundle.
-///
-/// On the edge there is no filesystem. An *absent* bundle is a transparent
-/// pass‑through, exactly like the native `from_env`; a *present but malformed*
-/// one is a configuration error (`Err`) that the caller turns into a 503 —
-/// parsing it away would leave the operator believing the policies they deployed
-/// are in force.
-fn build_inline_engine(
-    env: &Env,
-    opts: EngineOptions,
-) -> core::result::Result<PolicyEngine, String> {
-    use crate::policy::config::PolicyBundle;
+fn local_policy_sources(env: &Env) -> LocalPolicySources {
+    LocalPolicySources {
+        kv_binding: worker_kv::kv_binding_present(env),
+        inline: env_value(env, INLINE_POLICIES_VAR).is_some_and(|s| !s.trim().is_empty()),
+    }
+}
 
-    let configured = env_value(env, "NOVEUM_GUARD_POLICIES").filter(|s| !s.trim().is_empty());
-    let bundle = match configured {
-        None => PolicyBundle::default(),
-        Some(s) => PolicyBundle::from_json_str(&s).map_err(|e| {
-            format!("NOVEUM_GUARD_POLICIES is set but is not a valid nova-guard bundle: {e}")
-        })?,
-    };
-    Ok(PolicyEngine::from_bundle(&bundle, opts))
+fn warn_ignored_local_policy_sources(sources: LocalPolicySources) {
+    if !sources.any() {
+        return;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if sources.kv_binding {
+        parts.push("Workers KV policy binding");
+    }
+    if sources.inline {
+        parts.push(INLINE_POLICIES_VAR);
+    }
+    console_warn!(
+        "Nova Guard: both the platform bridge and {} are set; the platform's effective policy \
+         set wins and the local bundle is ignored",
+        parts.join(" and ")
+    );
 }
 
 /// Copy `src` headers into a fresh `Headers`, skipping any whose (lowercased)
@@ -946,13 +949,8 @@ async fn proxy(
         Some(cfg) => {
             // The platform is the source of truth once the bridge is configured:
             // an operator who pointed the Worker at a project did not ask for
-            // whatever happens to be inlined in `[vars]`.
-            if env_value(&env, "NOVEUM_GUARD_POLICIES").is_some_and(|s| !s.trim().is_empty()) {
-                console_warn!(
-                    "Nova Guard: both the platform bridge and NOVEUM_GUARD_POLICIES are set; the \
-                     platform's effective policy set wins and the inline bundle is ignored"
-                );
-            }
+            // whatever happens to be in KV or inlined in `[vars]`.
+            warn_ignored_local_policy_sources(local_policy_sources(&env));
             match worker_remote::effective_engine(cfg, opts.clone()).await {
                 Ok(engine) => engine,
                 Err(e) if env_flag(&env, ALLOW_UNGUARDED_START_VAR, false) => {
@@ -986,15 +984,18 @@ async fn proxy(
                 }
             }
         }
-        None => match build_inline_engine(&env, opts) {
-            Ok(engine) => Rc::new(engine),
-            // A malformed inline bundle is a configuration error, not a
-            // pass-through: proxying would silently drop every policy written.
-            Err(e) => {
-                console_error!("Nova Guard configuration error: {e}");
-                return unsupported_guard_config(&e);
+        None => {
+            let inline = env_value(&env, INLINE_POLICIES_VAR);
+            match worker_kv::local_policy_engine(&env, opts, inline).await {
+                Ok(engine) => engine,
+                // A malformed KV/inline bundle is a configuration error, not a
+                // pass-through: proxying would silently drop every policy written.
+                Err(e) => {
+                    console_error!("Nova Guard configuration error: {e}");
+                    return unsupported_guard_config(&e);
+                }
             }
-        },
+        }
     };
 
     let guard_active = engine.is_enabled() && engine.active_policy_count() > 0;
@@ -1005,13 +1006,13 @@ async fn proxy(
     let stateful = engine.is_enabled() && engine.stateful_policy_count() > 0;
     if stateful && bridge.is_none() {
         return unsupported_guard_config(
-            "NOVEUM_GUARD_POLICIES contains cost_cap/rate_limit policies, which cannot be enforced \
-             from an inline bundle on the Cloudflare Worker: they require a live cross-request \
-             state backend (spend/rate counters and an admission ledger) that an inline bundle \
-             does not have, so they would evaluate to `allow` on every request and `failClosed` \
-             could not be honored. Configure the platform bridge (NOVEUM_API_KEY + \
-             NOVEUM_GUARD_PROJECT_ID), which enforces them atomically across every PoP, or remove \
-             them from the inline bundle.",
+            "The local policy bundle (Workers KV or NOVEUM_GUARD_POLICIES) contains cost_cap/rate_limit \
+             policies, which cannot be enforced without the platform bridge on the Cloudflare Worker: \
+             they require a live cross-request state backend (spend/rate counters and an admission \
+             ledger) that a KV or inline bundle does not have, so they would evaluate to `allow` on \
+             every request and `failClosed` could not be honored. Configure the platform bridge \
+             (NOVEUM_API_KEY + NOVEUM_GUARD_PROJECT_ID), which enforces them atomically across every \
+             PoP, or remove them from the local bundle.",
         );
     }
 
