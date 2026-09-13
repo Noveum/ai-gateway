@@ -9,7 +9,7 @@ paths and native-only settings do not apply there.
 | Mode | Required settings | Forbidden settings | Runtime |
 |---|---|---|---|
 | Transparent | none | none | native or Worker |
-| Local policies | `NOVEUM_GUARD_POLICIES_FILE` or `NOVEUM_GUARD_POLICIES`; Worker may also use KV (`NOVEUM_GUARD_POLICIES_KV`, key `nova-guard-policies`) | `NOVEUM_GUARD_TENANCY=shared`; do not also configure the dedicated platform pair | file: native only; inline/KV: Worker |
+| Local policies | `NOVEUM_GUARD_POLICIES_FILE` or `NOVEUM_GUARD_POLICIES`; Worker may also use KV (`NOVEUM_GUARD_POLICIES_KV`, key `nova-guard-policies`) | `NOVEUM_GUARD_TENANCY=shared`; do not also configure the dedicated platform pair | file: native only; inline: native or Worker; KV: Worker only |
 | Platform dedicated | `NOVEUM_API_KEY`, `NOVEUM_GUARD_PROJECT_ID`; optionally `NOVEUM_GUARD_TENANCY=dedicated` | `NOVEUM_GUARD_TENANCY=shared` | native or Worker |
 | Platform shared | `NOVEUM_GUARD_TENANCY=shared`; caller sends `x-noveum-api-key` | process-wide `NOVEUM_API_KEY`, `NOVEUM_GUARD_PROJECT_ID`, and local bundle | native only |
 

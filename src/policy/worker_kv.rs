@@ -270,6 +270,19 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_schema_major_parses_at_resolve_like_inline_worker_path() {
+        // Native `PolicyEngine::from_env` rejects unsupported majors at startup;
+        // the Worker inline path (and KV) only parse JSON here and defer schema
+        // checks to runtime/engine behavior — do not fail closed in this helper.
+        let bundle = resolve_policy_bundle(
+            KvPolicyLookup::Absent,
+            Some(r#"{"schemaVersion":"2.0.0","policies":[]}"#.to_string()),
+        )
+        .unwrap();
+        assert!(bundle.schema_version_supported().is_err());
+    }
+
+    #[test]
     fn bridge_ignores_local_sources_when_platform_wins() {
         // Documented contract: when bridge is on, local resolution is skipped.
         // This test guards the pure helper used when bridge is off; platform

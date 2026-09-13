@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bundles via the `NOVEUM_GUARD_POLICIES_KV` binding and fixed key
   `nova-guard-policies`. Precedence without the platform bridge is KV → inline
   `NOVEUM_GUARD_POLICIES` → transparent proxy; the platform bridge still wins
-  when configured. Malformed KV or inline JSON returns 503.
+  when configured. Malformed KV or inline JSON returns 503 only when the
+  platform bridge is not configured (with the bridge on, local KV/inline sources
+  are ignored).
 
 ### Fixed
 
