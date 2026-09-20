@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Perplexity requests now send `X-Pplx-Integration: noveum-ai-gateway` from
+  both native and Cloudflare runtimes unless the caller supplies attribution.
+
 ### Fixed
 
 - GHCR release metadata now gives the immutable Cargo-version tag higher

@@ -84,7 +84,8 @@ use crate::routing::{
     prepare_strict_admission_body, resolve_provider, transform_anthropic_to_openai_format,
     upstream_url_with_base, validate_aws_region, validate_strict_anthropic_base_url,
     validate_strict_openai_base_url, validate_worker_bedrock_request, ANTHROPIC_BASE_URL_VAR,
-    BEDROCK_DEFAULT_REGION, OPENAI_BASE_URL_VAR,
+    BEDROCK_DEFAULT_REGION, OPENAI_BASE_URL_VAR, PERPLEXITY_INTEGRATION_HEADER,
+    PERPLEXITY_INTEGRATION_VALUE,
 };
 use crate::sigv4;
 
@@ -1467,6 +1468,11 @@ async fn proxy(
     } else {
         let route = route.expect("checked above");
         out_headers = copy_headers_excluding(req.headers(), REQUEST_SKIP_HEADERS)?;
+        if provider.eq_ignore_ascii_case("perplexity")
+            && out_headers.get(PERPLEXITY_INTEGRATION_HEADER)?.is_none()
+        {
+            out_headers.set(PERPLEXITY_INTEGRATION_HEADER, PERPLEXITY_INTEGRATION_VALUE)?;
+        }
         // `OPENAI_BASE_URL` targets a compatible upstream, the same override the
         // native gateway honors. Scoped to `x-provider: openai` for the same
         // reason it is there: it is the OpenAI SDK convention, not a general

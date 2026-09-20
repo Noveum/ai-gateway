@@ -12,6 +12,7 @@
 use super::utils::{log_tracking_headers, normalized_bearer_header};
 use super::Provider;
 use crate::error::AppError;
+use crate::routing::{PERPLEXITY_INTEGRATION_HEADER, PERPLEXITY_INTEGRATION_VALUE};
 use crate::telemetry::provider_metrics::{MetricsExtractor, ProviderMetrics};
 use async_trait::async_trait;
 use axum::http::HeaderMap;
@@ -67,6 +68,18 @@ impl Provider for OpenAICompatibleProvider {
             http::header::CONTENT_TYPE,
             http::header::HeaderValue::from_static("application/json"),
         );
+
+        if self.name.eq_ignore_ascii_case("perplexity") {
+            headers.insert(
+                PERPLEXITY_INTEGRATION_HEADER,
+                original_headers
+                    .get(PERPLEXITY_INTEGRATION_HEADER)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        http::header::HeaderValue::from_static(PERPLEXITY_INTEGRATION_VALUE)
+                    }),
+            );
+        }
 
         if let Some(auth) = original_headers
             .get(http::header::AUTHORIZATION)
@@ -252,11 +265,35 @@ mod tests {
             out.get(http::header::CONTENT_TYPE).unwrap(),
             "application/json"
         );
+        assert!(out.get(PERPLEXITY_INTEGRATION_HEADER).is_none());
         h.insert("authorization", "bearer sk-x".parse().unwrap());
         let normalized = p.process_headers(&h).unwrap();
         assert_eq!(
             normalized.get(http::header::AUTHORIZATION).unwrap(),
             "Bearer sk-x"
+        );
+    }
+
+    #[test]
+    fn attributes_perplexity_requests_without_overriding_callers() {
+        let provider =
+            OpenAICompatibleProvider::new("perplexity", "https://api.perplexity.ai", true);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sk-x".parse().unwrap());
+        let attributed = provider.process_headers(&headers).unwrap();
+        assert_eq!(
+            attributed.get(PERPLEXITY_INTEGRATION_HEADER).unwrap(),
+            PERPLEXITY_INTEGRATION_VALUE
+        );
+
+        headers.insert(
+            PERPLEXITY_INTEGRATION_HEADER,
+            "caller-integration".parse().unwrap(),
+        );
+        let attributed = provider.process_headers(&headers).unwrap();
+        assert_eq!(
+            attributed.get(PERPLEXITY_INTEGRATION_HEADER).unwrap(),
+            "caller-integration"
         );
     }
 
