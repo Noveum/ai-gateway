@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Perplexity requests now send `X-Pplx-Integration: noveum-ai-gateway` from
   both native and Cloudflare runtimes unless the caller supplies attribution.
 
+### Changed
+
+- Cloudflare Worker release builds now run `wasm-opt -Oz` (binaryen is fetched
+  by worker-build 0.8.5, nothing extra on PATH), shrinking the uncompressed
+  bundle by about 12%.
+
 ### Fixed
 
 - GHCR release metadata now gives the immutable Cargo-version tag higher

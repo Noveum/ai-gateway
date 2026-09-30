@@ -17,8 +17,6 @@ transport and tenancy differences are called out below.
 rustup target add wasm32-unknown-unknown
 cargo install worker-build --version 0.8.5 --locked --force
 node --version                       # Wrangler 4.120.0 requires Node >= 22
-# (optional, for smaller bundles) install binaryen so `wasm-opt` is on PATH,
-# then set `wasm-opt = true` in [package.metadata.wasm-pack.profile.release].
 ```
 
 CI pins `worker-build` to `0.8.5` and invokes Wrangler as
