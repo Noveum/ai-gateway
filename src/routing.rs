@@ -14,6 +14,8 @@ pub const OPENAI_BASE_URL_VAR: &str = "OPENAI_BASE_URL";
 /// Base-URL override for Anthropic's native Messages API. Used by both runtimes
 /// for hermetic transport tests and private compatible endpoints.
 pub const ANTHROPIC_BASE_URL_VAR: &str = "ANTHROPIC_BASE_URL";
+pub const PERPLEXITY_INTEGRATION_HEADER: &str = "x-pplx-integration";
+pub const PERPLEXITY_INTEGRATION_VALUE: &str = "noveum-ai-gateway";
 /// Default AWS region used by the Bedrock adapters when the caller omits
 /// `x-aws-region`.
 pub const BEDROCK_DEFAULT_REGION: &str = "us-east-1";
