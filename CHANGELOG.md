@@ -13,9 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bundles via the `NOVEUM_GUARD_POLICIES_KV` binding and fixed key
   `nova-guard-policies`. Precedence without the platform bridge is KV → inline
   `NOVEUM_GUARD_POLICIES` → transparent proxy; the platform bridge still wins
-  when configured. Malformed KV or inline JSON returns 503 only when the
-  platform bridge is not configured (with the bridge on, local KV/inline sources
-  are ignored).
+  when configured. Without a platform bridge, malformed KV or inline JSON,
+  an unsupported schema major, or a policy this build cannot compile returns
+  503. A failed KV refresh keeps the last bundle that loaded.
+  `NOVEUM_GUARD_ENABLED=false` skips the KV and inline load. A present KV value
+  that replaces a non-empty inline bundle logs a warning.
+- Perplexity requests now send `X-Pplx-Integration: noveum-ai-gateway` from
+  both native and Cloudflare runtimes unless the caller supplies attribution.
 
 ### Fixed
 

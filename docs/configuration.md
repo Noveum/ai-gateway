@@ -57,15 +57,16 @@ Configuration is read once. Restart or redeploy after changing it.
 | `NOVEUM_GUARD_ENABLED` | `true` | Master switch. `false`, `0`, `no`, `off`, `disabled`, or an empty value disables the engine. |
 | `NOVEUM_GUARD_POLICIES_FILE` | unset | Native-only path to a JSON policy bundle. |
 | `NOVEUM_GUARD_POLICIES` | unset | Inline JSON policy bundle; on Workers, store sensitive bundles as a secret. Fallback when KV is bound but the key is absent. |
-| `NOVEUM_GUARD_POLICIES_KV` | unset | Worker-only KV namespace binding. Fixed key `nova-guard-policies`. Optional; default deploy has no bindings. |
+| `NOVEUM_GUARD_POLICIES_KV` | unset | Worker-only KV namespace binding. Fixed key `nova-guard-policies`. Optional; default deploy has no bindings. A write changes enforcement without a redeploy (isolate cache ~60 s, plus KV edge cache, so allow up to about two minutes). |
 | `NOVEUM_GUARD_BLOCK_RESPONSE_MODE` | `synthetic_success` | `synthetic_success` returns a refusal-shaped HTTP 200; `provider_error` returns an HTTP 403 error envelope. |
 | `NOVEUM_GUARD_ASSUMED_OUTPUT_TOKENS` | `1024` | Fallback estimate for advisory cost caps and rate-only accounting; never satisfies an applicable strict cost cap's explicit-bound requirement. |
 
 A configured but unreadable, malformed, future-major, or unenforceable local
-bundle prevents native startup. The Worker evaluates its inline binding per
-proxy request, so its information and health routes can remain available while
-`/v1/*` returns a configuration error. With no policy source and no platform
-bridge, the gateway is a transparent proxy.
+bundle prevents native startup. The Worker applies the same refusal to inline
+JSON and Workers KV: `/v1/*` returns 503, while information and health routes
+stay available. `NOVEUM_GUARD_ENABLED=false` skips the KV and inline read. A
+failed KV refresh keeps the last bundle that loaded. With no policy source and
+no platform bridge, the gateway is a transparent proxy.
 
 ## Platform bridge
 
