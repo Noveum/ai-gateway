@@ -367,6 +367,8 @@ but it cannot repair the immutable v2.0.1 label.
 
 ## Contributing
 
+[Shashank Agarwal](https://www.linkedin.com/in/shashankagarwal2/) contributed the [public container release metadata check](https://github.com/Noveum/ai-gateway/pull/33).
+
 See
 [Contributing](https://github.com/Noveum/ai-gateway/blob/v2.0.1/docs/CONTRIBUTING.md).
 Before opening a pull request, run the applicable checks in
