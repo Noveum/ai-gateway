@@ -25,6 +25,9 @@ exclude = [
     ".cargo_vcs_info.json",
     "Cargo.toml.orig",
     "docs/PR30_NOVAGUARD_REVIEW.md",
+    "package.json",
+    "package-lock.json",
+    "node_modules/**/*",
 ]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

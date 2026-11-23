@@ -1,8 +1,12 @@
 # Cloudflare Worker config for the Noveum AI Gateway (edge/WASM deployment).
 #
-# Build:   worker-build --release        (compiles the crate to wasm32 + JS shim)
+# Build:   npm run build                  (scripts/cf_worker_build.sh → worker-build --release)
 # Dev:     npx wrangler dev               (runs locally in workerd at :8787)
 # Deploy:  npx wrangler deploy            (publishes to the global edge)
+#
+# Production deploys run from Workers Builds on every push to `main`: the trigger
+# runs `npm run build` then `npx wrangler deploy` (wrangler pinned in
+# package.json/package-lock.json). See docs/CLOUDFLARE_WORKER.md.
 #
 # The native binary / Docker image (the published `noveum-ai-gateway` crate) is
 # unaffected by this file — it is a separate deployment shape of the same package.
@@ -17,7 +21,7 @@ preview_urls = false
 # worker-build keeps for backwards compatibility, so point at the real thing.
 main = "build/index.js"
 # Bumped from "2024-11-01". Pinned to the compatibility date of the workerd
-# bundled with the wrangler version CI pins (wrangler 4.120.0 → workerd
+# bundled with the wrangler version package.json pins (wrangler 4.120.0 → workerd
 # 1.20260801.1); a later date would out-run the local runtime and make
 # `wrangler dev` disagree with production. Raise this and the pinned wrangler
 # version together, never one alone.
@@ -27,7 +31,10 @@ compatibility_date = "2026-08-01"
 # Requires `strip = "debuginfo"` (NOT `true`) in [profile.release] — see the
 # comment there. With `strip = true` this command fails in wasm-bindgen with
 # "externref table required for catch wrappers".
-command = "worker-build --release"
+# The script runs `worker-build --release`; under CI (including Workers Builds,
+# whose image has no Rust) it first installs rustup, the wasm32 target and the
+# pinned worker-build.
+command = "bash scripts/cf_worker_build.sh"
 
 # Workers Logs. Without this, a panic or a 5xx at the edge leaves no trace you
 # can query after the fact. head_sampling_rate = 1 keeps every request; lower it
