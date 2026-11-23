@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Supply-chain gate is green again: lockfile upgrades clear every RUSTSEC
+  advisory that has a patched release (rustls, rustls-webpki, webpki-roots,
+  tokio, zstd, url, quinn, ctutils, chacha20, aws-smithy). The unmaintained
+  `chrono` advisory is waived with a written reason because `worker` and the
+  published pricing API still depend on it (#38).
+- Pushes to `main` now deploy the Cloudflare Worker through Workers Builds:
+  `npm run build` installs Rust and worker-build 0.8.5 in the build image, and
+  Wrangler is pinned to 4.120.0 in `package.json` (#38).
 - GHCR release metadata now gives the immutable Cargo-version tag higher
   priority than `latest`, so `org.opencontainers.image.version` identifies the
   release instead of the moving alias. Unprivileged build validation now runs
