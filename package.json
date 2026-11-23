@@ -1,0 +1,16 @@
+{
+  "name": "noveum-ai-gateway-worker",
+  "private": true,
+  "description": "Build and deploy tooling for the Cloudflare Worker shape of noveum-ai-gateway. The gateway itself is the Rust crate in this repository.",
+  "scripts": {
+    "build": "bash scripts/cf_worker_build.sh",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.120.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

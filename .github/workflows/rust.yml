@@ -16,8 +16,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Pinned so a new upstream release can't change what the gate builds.
+  # scripts/cf_worker_build.sh defaults to the same worker-build version, which
+  # is what Workers Builds uses for production; wrangler is pinned in
+  # package.json/package-lock.json.
   WORKER_BUILD_VERSION: "0.8.5"
-  WRANGLER_VERSION: "4.120.0"
   CARGO_AUDIT_VERSION: "0.22.2"
   CARGO_DENY_VERSION: "0.20.2"
 
@@ -147,15 +149,22 @@ jobs:
         with:
           key: worker
 
+      # Node 24 is the Workers Builds image default, so the deploy path and
+      # this gate run the same major.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version: "24"
+          cache: npm
 
       - name: Workerd mock restart lifecycle regression
         run: bash scripts/novaguard_worker_process_test.sh
 
-      - name: Install worker-build
-        run: cargo install worker-build --version "${WORKER_BUILD_VERSION}" --locked
+      # The same two commands the Workers Builds trigger runs on `main`
+      # (`npm run build`, then `npx wrangler deploy`), with the deploy swapped
+      # for a dry run below. Workers Builds installs dependencies with
+      # `npm clean-install` because package-lock.json exists.
+      - name: npm ci (pinned wrangler)
+        run: npm ci
 
       # Compiles the crate for wasm32 and generates the JS shim. This is what
       # catches a change that builds natively but breaks the edge target (a
@@ -169,8 +178,10 @@ jobs:
       # `strip` being set back to `true`, which drops the `target_features`
       # custom section that wasm-bindgen needs to enable externref. See the
       # comment on `strip` in Cargo.toml.
-      - name: worker-build --release
-        run: worker-build --release
+      # scripts/cf_worker_build.sh installs the pinned worker-build (CI is set)
+      # and runs `worker-build --release`.
+      - name: npm run build (worker-build --release)
+        run: npm run build
 
       # The failure above is loud, but the *regression* this guards against is
       # silent: if panic recovery is ever quietly disabled, the Worker still
@@ -198,5 +209,6 @@ jobs:
           exit "$fail"
 
       # Validates wrangler.toml and the generated bundle without publishing.
+      # Like the real deploy it re-runs the [build] command first.
       - name: wrangler deploy --dry-run
-        run: npx --yes "wrangler@${WRANGLER_VERSION}" deploy --dry-run
+        run: npx wrangler deploy --dry-run

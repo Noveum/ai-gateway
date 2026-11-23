@@ -21,17 +21,17 @@ node --version                       # Wrangler 4.120.0 requires Node >= 22
 # then set `wasm-opt = true` in [package.metadata.wasm-pack.profile.release].
 ```
 
-CI pins `worker-build` to `0.8.5` and invokes Wrangler as
-`npx --yes wrangler@4.120.0`; use the same versions locally. An older global
-`worker-build` can emit a different directory layout even when the Rust code is
-valid. Cloudflare also recommends a project-local Wrangler installation; this
-repository uses the exact `npx` version until it gains an npm lockfile. See
+CI and Workers Builds pin `worker-build` to `0.8.5` (`scripts/cf_worker_build.sh`)
+and Wrangler to `4.120.0` (`package.json` + `package-lock.json`); use the same
+versions locally. `npm ci` installs that Wrangler, and `npx wrangler` then uses
+it. An older global `worker-build` can emit a different directory layout even
+when the Rust code is valid, so the build script refuses any other version. See
 [Cloudflare's Wrangler installation guidance](https://developers.cloudflare.com/workers/wrangler/install-and-update/).
 
 ## Build the Worker bundle
 
 ```bash
-worker-build --release
+npm run build        # scripts/cf_worker_build.sh → worker-build --release
 # → build/index_bg.wasm      (compiled gateway)
 #   build/index.js            (canonical JS entry used by wrangler.toml)
 #   build/worker/shim.mjs     (backward-compatible re-export alias)
@@ -108,6 +108,31 @@ the edge would bill at its ceiling.
 
 ## Production deployment runbook
 
+### Automatic deploys from `main` (Workers Builds)
+
+Every push to `main` builds and deploys the Worker to production at 100% of
+traffic. The Workers Builds trigger "Deploy default branch" on
+`noveum-ai-gateway` runs:
+
+| Step         | Command               |
+|--------------|-----------------------|
+| Install      | `npm clean-install` (automatic, from `package-lock.json`) |
+| Build        | `npm run build`       |
+| Deploy       | `npx wrangler deploy` |
+
+The Workers Builds image has no Rust toolchain. With `WORKERS_CI` set,
+`scripts/cf_worker_build.sh` installs rustup (stable, minimal), the
+`wasm32-unknown-unknown` target and `worker-build` 0.8.5, then runs
+`worker-build --release`. `wrangler deploy` re-runs the same script through
+`[build] command`; it sources `~/.cargo/env` because the deploy step is a new
+shell. Only `main` builds; other branches have no trigger. Secrets set with
+`wrangler secret put` are kept across these deploys.
+
+A merge to `main` therefore skips the staged upload, zero-percent override and
+canary below. When a change needs that, follow the manual runbook from a
+checkout and land it on `main` only once the candidate is promoted, or the
+next build will redeploy `main` over it.
+
 Cloudflare separates a Worker **version** (code, bindings, and compatibility
 settings) from a **deployment** (the version or traffic split serving routes).
 Upload and test an immutable candidate before assigning production traffic.
@@ -120,10 +145,11 @@ that release, not permission to skip the following checks for a new version.
 ### 1. Authenticate, build, and validate
 
 ```bash
-npx --yes wrangler@4.120.0 login
-npx --yes wrangler@4.120.0 whoami
-worker-build --release
-npx --yes wrangler@4.120.0 deploy --dry-run
+npm ci
+npx wrangler login
+npx wrangler whoami
+npm run build
+npx wrangler deploy --dry-run
 scripts/novaguard_worker_e2e.sh
 ```
 
