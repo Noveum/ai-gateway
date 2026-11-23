@@ -33,10 +33,25 @@ unsound = "all"
 # A yanked dependency means the lockfile pins something the publisher pulled.
 yanked = "deny"
 
-# No advisory waivers. Any future entry needs a documented reason, bounded
-# runtime scope, owner, and removal condition; an unexplained ID here turns the
-# gate into decoration.
-ignore = []
+# Every waiver needs a documented reason, bounded runtime scope, owner, and
+# removal condition; an unexplained ID here turns the gate into decoration.
+# Keep this list in step with `.cargo/audit.toml`, which cargo-audit reads.
+ignore = [
+    # RUSTSEC-2026-0543: chrono is unmaintained (informational, `patched = []`).
+    # It is not a vulnerability: no affected function or code path exists to
+    # avoid. Why it stays for now:
+    #   * `worker` hard-depends on chrono in every release up to the latest
+    #     (0.9.0), so the Cloudflare Worker cannot drop it whatever we do.
+    #   * Our own use is `Utc::now()`, unix-second conversion and RFC 3339
+    #     formatting/parsing. But `policy::pricing::{lookup_at, rates_at,
+    #     price_at, price_usage_at}` take `chrono::DateTime<Utc>` in the
+    #     published 2.x API, so swapping to jiff/time is a semver-major change.
+    # Scope: `[bans]` below only lets chrono in as a direct dependency of this
+    # crate or of `worker`; any new path to it still fails the gate.
+    # Owner: gateway maintainers. Remove when workers-rs drops chrono AND the
+    # next major release moves the pricing API off `DateTime<Utc>`.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; required by worker (latest 0.9.0) and by the published 2.x pricing API; no vulnerable code path" },
+]
 
 [licenses]
 # Explicit allow-list derived from the actual dependency tree, not a template.
@@ -86,6 +101,15 @@ allow = ["CDLA-Permissive-2.0"]
 crate = "colored"
 allow = ["MPL-2.0"]
 
+# zstd-sys (behind tower-http/reqwest response compression) declares
+# `BSD-3-Clause AND BSD-2-Clause` from 2.1.x: the bundled legacy-format
+# decoders in zstd/lib/legacy/ are 2-clause BSD (see its LICENSE.BSD-2-Clause).
+# Permissive, attribution only, same family as BSD-3-Clause already allowed.
+# Scoped to this crate so a new BSD-2-Clause dependency is still reviewed.
+[[licenses.exceptions]]
+crate = "zstd-sys"
+allow = ["BSD-2-Clause"]
+
 [bans]
 # Duplicate versions are a warning, not an error: with a tree this size a
 # transitive bump routinely lands two majors of the same crate, and failing on
@@ -97,6 +121,12 @@ wildcards = "deny"
 # Prefer the highest version when the same crate appears twice, so the warning
 # above points at the laggard.
 highlight = "all"
+# Fence for the RUSTSEC-2026-0543 waiver above: chrono may only be a direct
+# dependency of this crate or of `worker`. A new crate that pulls it in fails
+# here instead of riding on the advisory ignore.
+deny = [
+    { crate = "chrono", wrappers = ["noveum-ai-gateway", "worker"], reason = "unmaintained (RUSTSEC-2026-0543); only allowed where the advisory waiver is argued" },
+]
 
 [sources]
 # Every dependency currently resolves to crates.io (verified against

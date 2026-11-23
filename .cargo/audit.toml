@@ -1,0 +1,7 @@
+# cargo-audit configuration. Keep `ignore` identical to `[advisories].ignore`
+# in deny.toml, where each waiver's reason, scope, owner and removal condition
+# are written down.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0543", # chrono unmaintained; see deny.toml
+]

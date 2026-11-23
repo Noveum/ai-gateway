@@ -119,8 +119,9 @@ jobs:
           cargo install cargo-deny --version "${CARGO_DENY_VERSION}" --locked
 
       # `--deny warnings` is what stops this from silently passing: cargo-audit
-      # exits 0 on unmaintained/unsound findings by default. There are no
-      # advisory exemptions; any finding fails the job.
+      # exits 0 on unmaintained/unsound findings by default. Any finding fails
+      # the job except the waivers in .cargo/audit.toml, which mirror the
+      # argued `[advisories].ignore` entries in deny.toml.
       - name: cargo audit
         run: cargo audit --deny warnings
 
