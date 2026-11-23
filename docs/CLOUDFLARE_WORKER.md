@@ -125,7 +125,9 @@ The Workers Builds image has no Rust toolchain. With `WORKERS_CI` set,
 `wasm32-unknown-unknown` target and `worker-build` 0.8.5, then runs
 `worker-build --release`. `wrangler deploy` re-runs the same script through
 `[build] command`; it sources `~/.cargo/env` because the deploy step is a new
-shell. Only `main` builds; other branches have no trigger. Secrets set with
+shell. Only `main` builds: "Enable Preview builds" is off for this Worker, so
+branches and pull requests never upload preview versions to the production
+service (see `preview_urls = false` in `wrangler.toml`). Secrets set with
 `wrangler secret put` are kept across these deploys.
 
 A merge to `main` therefore skips the staged upload, zero-percent override and
