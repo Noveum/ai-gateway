@@ -12,8 +12,9 @@ can be agreed first.
   with prompt-data minimization and explicit retention controls.
 - Generate Rust and platform pricing tables from `pricing/catalog.json` instead
   of maintaining hand-written mirrors.
-- Add Workers KV or another reviewed source for globally distributed stateless
-  policy bundles; Worker v2.0.x reads vars/secrets, not KV.
+- ~~Add Workers KV or another reviewed source for globally distributed stateless
+  policy bundles~~ — implemented via optional `NOVEUM_GUARD_POLICIES_KV` binding
+  (see [Cloudflare Worker operations](CLOUDFLARE_WORKER.md)).
 - Add Bedrock tool/multimodal conversion and source-Region-aware strict pricing
   before expanding strict admission beyond the documented Claude surface.
 - Design streaming output-phase policy enforcement without losing backpressure

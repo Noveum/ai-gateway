@@ -105,7 +105,7 @@ supplied per request. Platform-managed Nova Guard does require a scoped
 | Server runtime | `workerd` isolate | Tokio + Axum |
 | Bedrock signing | Pure Rust `sha2` + `hmac`; accepts optional session token | Native AWS SDK signer; accepts optional session token |
 | Caller tenancy | Dedicated project only; `NOVEUM_GUARD_TENANCY=shared` is refused with 503 | Dedicated or shared, with tenant derived from `x-noveum-api-key` |
-| Local policy source | Inline Worker var/secret; filesystem paths are unavailable | Inline JSON or file |
+| Local policy source | Optional Workers KV (`NOVEUM_GUARD_POLICIES_KV`, key `nova-guard-policies`) and/or inline Worker var/secret; filesystem paths are unavailable | Inline JSON or file |
 | Stateful inline policy | Inline `cost_cap` / `rate_limit` is refused with 503 because it has no backend | Without platform state, stateful rules fail open and warn |
 | Platform state | Dedicated policy fetch, project/org counters, admission, settlement | Dedicated or per-derived-tenant clients |
 | Deployment-wide cost-mode override | Not implemented; each policy's `enforcementMode` decides | `NOVEUM_GUARD_COST_ENFORCEMENT=strict\|advisory` |
