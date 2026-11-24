@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pushes to `main` now deploy the Cloudflare Worker through Workers Builds:
   `npm run build` installs Rust and worker-build 0.8.5 in the build image, and
   Wrangler is pinned to 4.120.0 in `package.json` (#38).
+- Wrangler bumped from 4.120.0 to 4.160.1, which clears the high-severity
+  `npm audit` findings in its bundled undici, sharp and miniflare. Build and
+  deploy tooling only; the Worker's compatibility date stays `2026-08-01`.
+  Node 22.12 or later is now required.
 - GHCR release metadata now gives the immutable Cargo-version tag higher
   priority than `latest`, so `org.opencontainers.image.version` identifies the
   release instead of the moving alias. Unprivileged build validation now runs

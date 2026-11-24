@@ -183,8 +183,8 @@ The repository and CI use a coherent Worker toolchain:
 |---|---|
 | `worker`, `worker-macros`, `worker-sys` crates | `0.8.5` in `Cargo.lock` |
 | `worker-build` | `0.8.5` |
-| Wrangler | `4.120.0` |
-| Node.js in CI | `22` |
+| Wrangler | `4.160.1` |
+| Node.js in CI | `24` |
 | Crate MSRV | Rust `1.94.1` |
 | Docker builder | Rust `1.96` |
 | Worker compatibility date | `2026-08-01` |
@@ -197,7 +197,7 @@ than an arbitrary global `worker-build` or Wrangler installation:
 rustup target add wasm32-unknown-unknown
 cargo install worker-build --version 0.8.5 --locked --force
 worker-build --release
-npx --yes wrangler@4.120.0 deploy --dry-run
+npx --yes wrangler@4.160.1 deploy --dry-run
 ```
 
 The compatibility date and Wrangler version should be reviewed together when
@@ -216,7 +216,7 @@ cargo test --locked --test novaguard_platform
 cargo test --locked --test policy_integration
 cargo check --locked --target wasm32-unknown-unknown --no-default-features --lib
 worker-build --release
-npx --yes wrangler@4.120.0 deploy --dry-run
+npx --yes wrangler@4.160.1 deploy --dry-run
 scripts/novaguard_worker_e2e.sh
 git diff --check
 ```
@@ -238,7 +238,7 @@ roadmap](TODO.md). That roadmap is not a release promise.
 
 - [Cloudflare Workers Rust support](https://developers.cloudflare.com/workers/languages/rust/)
 - [workers-rs v0.8.5 release](https://github.com/cloudflare/workers-rs/releases/tag/v0.8.5)
-- [Wrangler 4.120.0 release](https://github.com/cloudflare/workers-sdk/releases/tag/wrangler%404.120.0)
+- [Wrangler 4.160.1 release](https://github.com/cloudflare/workers-sdk/releases/tag/wrangler%404.160.1)
 - [Wrangler installation and updates](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
 - [Worker compatibility dates](https://developers.cloudflare.com/workers/configuration/compatibility-dates/)
 - [Workers platform limits](https://developers.cloudflare.com/workers/platform/limits/)

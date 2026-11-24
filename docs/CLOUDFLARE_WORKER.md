@@ -16,13 +16,13 @@ transport and tenancy differences are called out below.
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install worker-build --version 0.8.5 --locked --force
-node --version                       # Wrangler 4.120.0 requires Node >= 22
+node --version                       # Wrangler 4.160.1 requires Node >= 22.12
 # (optional, for smaller bundles) install binaryen so `wasm-opt` is on PATH,
 # then set `wasm-opt = true` in [package.metadata.wasm-pack.profile.release].
 ```
 
 CI and Workers Builds pin `worker-build` to `0.8.5` (`scripts/cf_worker_build.sh`)
-and Wrangler to `4.120.0` (`package.json` + `package-lock.json`); use the same
+and Wrangler to `4.160.1` (`package.json` + `package-lock.json`); use the same
 versions locally. `npm ci` installs that Wrangler, and `npx wrangler` then uses
 it. An older global `worker-build` can emit a different directory layout even
 when the Rust code is valid, so the build script refuses any other version. See
@@ -42,7 +42,7 @@ npm run build        # scripts/cf_worker_build.sh → worker-build --release
 `wrangler dev` runs the Worker in `workerd` (the real runtime) on localhost:
 
 ```bash
-npx --yes wrangler@4.120.0 dev --port 8787
+npx --yes wrangler@4.160.1 dev --port 8787
 ```
 
 Then exercise it exactly like the native gateway. A v2.0.1 source build reports
@@ -164,10 +164,10 @@ fixed project is the only tenant this domain serves.
 ### 2. Upload without production traffic
 
 ```bash
-npx --yes wrangler@4.120.0 versions upload \
+npx --yes wrangler@4.160.1 versions upload \
   --tag v2.0.1-candidate \
   --message "Noveum AI Gateway v2.0.1 candidate"
-npx --yes wrangler@4.120.0 versions list --json
+npx --yes wrangler@4.160.1 versions list --json
 ```
 
 Record the candidate version ID, export it in the operator shell, and inspect
@@ -175,7 +175,7 @@ it before creating a deployment:
 
 ```bash
 : "${CANDIDATE_VERSION_ID:?export the uploaded candidate version ID}"
-npx --yes wrangler@4.120.0 versions view "$CANDIDATE_VERSION_ID"
+npx --yes wrangler@4.160.1 versions view "$CANDIDATE_VERSION_ID"
 ```
 
 The checked-in `preview_urls = false` deliberately
@@ -197,8 +197,8 @@ ordinary traffic to it:
 ```bash
 : "${PREVIOUS_VERSION_ID:?export the recorded stable version ID}"
 : "${CANDIDATE_VERSION_ID:?export the uploaded candidate version ID}"
-npx --yes wrangler@4.120.0 deployments list
-npx --yes wrangler@4.120.0 versions deploy \
+npx --yes wrangler@4.160.1 deployments list
+npx --yes wrangler@4.160.1 versions deploy \
   "${PREVIOUS_VERSION_ID}@100%" "${CANDIDATE_VERSION_ID}@0%" \
   --message "Attach v2.0.1 for targeted smoke" -y
 
@@ -224,11 +224,11 @@ observe, then promote the candidate to 100%:
 ```bash
 : "${PREVIOUS_VERSION_ID:?export the recorded stable version ID}"
 : "${CANDIDATE_VERSION_ID:?export the uploaded candidate version ID}"
-npx --yes wrangler@4.120.0 versions deploy \
+npx --yes wrangler@4.160.1 versions deploy \
   "${PREVIOUS_VERSION_ID}@90%" "${CANDIDATE_VERSION_ID}@10%" \
   --message "Canary v2.0.1" -y
 
-npx --yes wrangler@4.120.0 versions deploy \
+npx --yes wrangler@4.160.1 versions deploy \
   "${CANDIDATE_VERSION_ID}@100%" \
   --message "Promote v2.0.1" -y
 ```
@@ -239,7 +239,7 @@ real production route and watch errors during the observation window:
 
 ```bash
 curl --fail --silent https://gate.noveum.ai/health
-npx --yes wrangler@4.120.0 tail --status error
+npx --yes wrangler@4.160.1 tail --status error
 ```
 
 ### 4. Roll back
@@ -249,7 +249,7 @@ Use the exact stable version recorded before promotion:
 
 ```bash
 : "${PREVIOUS_VERSION_ID:?export the recorded stable version ID}"
-npx --yes wrangler@4.120.0 rollback "$PREVIOUS_VERSION_ID" \
+npx --yes wrangler@4.160.1 rollback "$PREVIOUS_VERSION_ID" \
   --message "Rollback failed gateway deployment"
 ```
 
@@ -423,11 +423,11 @@ identifier is not itself confidential:
 
 ```bash
 : "${NOVEUM_BRIDGE_SECRETS_FILE:?export the secure JSON file path}"
-npx --yes wrangler@4.120.0 versions secret bulk \
+npx --yes wrangler@4.160.1 versions secret bulk \
   "$NOVEUM_BRIDGE_SECRETS_FILE" \
   --tag novaguard-dedicated-enable \
   --message "Stage dedicated Nova Guard bridge"
-npx --yes wrangler@4.120.0 versions list --json
+npx --yes wrangler@4.160.1 versions list --json
 ```
 
 `NOVEUM_API_KEY` must be a **secret**, never a `[vars]` entry: `[vars]` is
@@ -454,7 +454,7 @@ curl -i $GW/v1/chat/completions -H "x-provider: openai" \
 
 Then check the project's usage in the Noveum dashboard: a completed request
 appears with real token counts (not the `max_tokens` estimate).
-`npx --yes wrangler@4.120.0 tail` streams the Worker's `console_*` lines, which
+`npx --yes wrangler@4.160.1 tail` streams the Worker's `console_*` lines, which
 name every admission block, fail-closed decision, and abandoned settlement.
 
 **When something is wrong**
@@ -474,7 +474,7 @@ name every admission block, fail-closed decision, and abandoned settlement.
 
 Make the change atomic **to production traffic** by creating only undeployed
 versions until the final transparent version has been inspected. Wrangler
-4.120.0 preserves secrets during `versions upload`, while each
+4.160.1 preserves secrets during `versions upload`, while each
 `versions secret delete` command creates another undeployed version from the
 latest version, as described in Cloudflare's
 [secret-management reference](https://developers.cloudflare.com/workers/configuration/secrets/#delete-secrets-from-your-project).
@@ -488,25 +488,25 @@ the secrets. Do not assign traffic to this intermediate version. Then delete
 each secret from the latest undeployed version:
 
 ```bash
-npx --yes wrangler@4.120.0 versions upload \
+npx --yes wrangler@4.160.1 versions upload \
   --strict \
   --tag novaguard-remove-config \
   --message "Stage Nova Guard bridge variable removal"
-npx --yes wrangler@4.120.0 versions list --json
+npx --yes wrangler@4.160.1 versions list --json
 : "${CONFIG_VERSION_ID:?export the just-uploaded configuration version ID}"
-npx --yes wrangler@4.120.0 versions view "$CONFIG_VERSION_ID"
+npx --yes wrangler@4.160.1 versions view "$CONFIG_VERSION_ID"
 
 # Run each delete only when `versions view` identifies that name as a secret.
-npx --yes wrangler@4.120.0 versions secret delete NOVEUM_API_KEY \
+npx --yes wrangler@4.160.1 versions secret delete NOVEUM_API_KEY \
   --tag novaguard-remove-api-key \
   --message "Stage Nova Guard API-key removal"
-npx --yes wrangler@4.120.0 versions secret delete NOVEUM_GUARD_PROJECT_ID \
+npx --yes wrangler@4.160.1 versions secret delete NOVEUM_GUARD_PROJECT_ID \
   --tag novaguard-remove-project \
   --message "Stage Nova Guard project-secret removal"
 
-npx --yes wrangler@4.120.0 versions list --json
+npx --yes wrangler@4.160.1 versions list --json
 : "${FINAL_VERSION_ID:?export the final removal version ID from the list}"
-npx --yes wrangler@4.120.0 versions view "$FINAL_VERSION_ID"
+npx --yes wrangler@4.160.1 versions view "$FINAL_VERSION_ID"
 ```
 
 If a binding is not a secret in the inspected intermediate version, skip its
