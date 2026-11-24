@@ -14,12 +14,12 @@
 # overrides.
 #
 # Usage:  scripts/novaguard_worker_e2e.sh
-# Env:    WRANGLER_VERSION (default 4.120.0), GATEWAY_PORT (8787),
+# Env:    WRANGLER_VERSION (default 4.160.1), GATEWAY_PORT (8787),
 #         MOCK_PORT (8899), CONCURRENT_CLIENTS (default 16; 12/16/20),
 #         NODE_BIN_DIR (a dir to prepend to PATH for node>=22)
 set -uo pipefail
 
-WRANGLER_VERSION="${WRANGLER_VERSION:-4.120.0}"
+WRANGLER_VERSION="${WRANGLER_VERSION:-4.160.1}"
 GATEWAY_PORT="${GATEWAY_PORT:-8787}"
 MOCK_PORT="${MOCK_PORT:-8899}"
 CONCURRENT_CLIENTS="${CONCURRENT_CLIENTS:-16}"
@@ -476,7 +476,7 @@ cache_race_request() {
 }
 
 command -v node >/dev/null || { echo "node not on PATH (set NODE_BIN_DIR)" >&2; exit 1; }
-case "$(node --version)" in v1[0-9].*|v2[01].*) echo "wrangler $WRANGLER_VERSION needs node >= 22, have $(node --version). Set NODE_BIN_DIR." >&2; exit 1;; esac
+case "$(node --version)" in v1[0-9].*|v2[01].*|v22.[0-9].*|v22.1[01].*) echo "wrangler $WRANGLER_VERSION needs node >= 22.12, have $(node --version). Set NODE_BIN_DIR." >&2; exit 1;; esac
 
 # ---------------------------------------------------------------------------
 say "Phase 1 -- allowed: admit, tee a real stream, settle at the TRUE usage"

@@ -47,7 +47,7 @@ Use the pinned toolchain documented in
 rustup target add wasm32-unknown-unknown
 cargo check --locked --target wasm32-unknown-unknown --no-default-features --lib
 worker-build --release
-npx --yes wrangler@4.120.0 deploy --dry-run
+npx --yes wrangler@4.160.1 deploy --dry-run
 scripts/novaguard_worker_e2e.sh
 ```
 

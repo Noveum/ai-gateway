@@ -20,11 +20,13 @@ preview_urls = false
 # older `build/worker/shim.mjs` still exists but is only a re-export alias that
 # worker-build keeps for backwards compatibility, so point at the real thing.
 main = "build/index.js"
-# Bumped from "2024-11-01". Pinned to the compatibility date of the workerd
-# bundled with the wrangler version package.json pins (wrangler 4.120.0 → workerd
-# 1.20260801.1); a later date would out-run the local runtime and make
-# `wrangler dev` disagree with production. Raise this and the pinned wrangler
-# version together, never one alone.
+# Bumped from "2024-11-01". Must not be later than the compatibility date of
+# the workerd bundled with the wrangler version package.json pins (wrangler
+# 4.160.1 → workerd 1.20261110.1), or it would out-run the local runtime and
+# make `wrangler dev` disagree with production. It was set to match wrangler
+# 4.120.0 (workerd 1.20260801.1) and deliberately stayed put when wrangler was
+# bumped for security fixes, so that bump changed no runtime behaviour. Raising
+# the date changes production semantics: do it as its own reviewed change.
 compatibility_date = "2026-08-01"
 
 [build]

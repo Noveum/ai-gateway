@@ -8,8 +8,8 @@ implementation.
 ## Set up
 
 The minimum supported Rust version is 1.94.1. Worker changes also require Node
-22+, the `wasm32-unknown-unknown` target, pinned `worker-build 0.8.5`, and
-Wrangler 4.120.0.
+22.12+, the `wasm32-unknown-unknown` target, pinned `worker-build 0.8.5`, and
+Wrangler 4.160.1.
 
 ```bash
 git clone https://github.com/Noveum/ai-gateway.git
